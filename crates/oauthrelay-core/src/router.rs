@@ -1001,7 +1001,12 @@ async fn authenticate(
                 Err(())
             }
         }
-        ClientAuth::PrivateKeyJwt { client_id, jwks } => {
+        ClientAuth::PrivateKeyJwt {
+            client_id,
+            issuer,
+            subject,
+            jwks,
+        } => {
             if form.client_assertion_type.as_deref()
                 != Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
                 || form.client_id.as_deref() != Some(client_id)
@@ -1009,7 +1014,15 @@ async fn authenticate(
                 return Err(());
             }
             let assertion = form.client_assertion.as_deref().ok_or(())?;
-            verify_private_key_jwt(state, relay, client_id, jwks, assertion).await
+            verify_private_key_jwt(
+                state,
+                relay,
+                issuer.as_deref().unwrap_or(client_id),
+                subject.as_deref().unwrap_or(client_id),
+                jwks.as_ref(),
+                assertion,
+            )
+            .await
         }
     }
 }
@@ -1017,13 +1030,33 @@ async fn authenticate(
 async fn verify_private_key_jwt(
     state: &AppState,
     relay: &Relay,
-    client_id: &str,
-    source: &ClientJwks,
+    issuer: &str,
+    subject: &str,
+    source: Option<&ClientJwks>,
     assertion: &str,
 ) -> Result<(), ()> {
     let value = match source {
-        ClientJwks::Inline(value) => value.clone(),
-        ClientJwks::Url(url) => cached_json(state, url, JWKS_TTL).await.map_err(|_| ())?,
+        Some(ClientJwks::Inline(value)) => value.clone(),
+        Some(ClientJwks::Url(url)) => cached_json(state, url, JWKS_TTL).await.map_err(|_| ())?,
+        None => {
+            let url = Url::parse(issuer).map_err(|_| ())?;
+            if !crate::model::valid_discovery_url(&url) {
+                return Err(());
+            }
+            let doc = cached_json(state, &discovery_url(&url), DISCOVERY_TTL)
+                .await
+                .map_err(|_| ())?;
+            if doc.get("issuer").and_then(Value::as_str) != Some(issuer) {
+                return Err(());
+            }
+            let jwks_url = url_field(&doc, "jwks_uri").ok_or(())?;
+            if !crate::model::valid_discovery_url(&jwks_url) {
+                return Err(());
+            }
+            cached_json(state, &jwks_url, JWKS_TTL)
+                .await
+                .map_err(|_| ())?
+        }
     };
     let set: JwkSet = serde_json::from_value(value).map_err(|_| ())?;
     let header = decode_header(assertion).map_err(|_| ())?;
@@ -1053,13 +1086,21 @@ async fn verify_private_key_jwt(
     let key = DecodingKey::from_jwk(jwk).map_err(|_| ())?;
     let mut validation = Validation::new(header.alg);
     validation.validate_aud = false;
+    validation.validate_nbf = true;
     let claims = decode::<Value>(assertion, &key, &validation)
         .map_err(|_| ())?
         .claims;
-    if claims.get("iss").and_then(Value::as_str) != Some(client_id)
-        || claims.get("sub").and_then(Value::as_str) != Some(client_id)
+    if claims.get("iss").and_then(Value::as_str) != Some(issuer)
+        || claims.get("sub").and_then(Value::as_str) != Some(subject)
     {
         return Err(());
+    }
+    for name in ["iat", "nbf"] {
+        if let Some(time) = claims.get(name) {
+            if time.as_u64().ok_or(())? > unix_now().saturating_add(validation.leeway) {
+                return Err(());
+            }
+        }
     }
     let audience = token_url(&state.cfg.public_url, &relay.key).to_string();
     let aud_ok = claims.get("aud").is_some_and(|aud| match aud {

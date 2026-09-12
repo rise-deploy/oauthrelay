@@ -182,9 +182,22 @@ clientAuthentication:
 
 ### PrivateKeyJwt
 
-The relying party sends an RFC 7523 client assertion. Configure exactly one of `jwksUrl` (an
-absolute HTTP(S) URL) or `jwks` (an inline public JWKS object with a non-empty `keys` array). The assertion issuer and subject must equal `clientId`,
-and its audience must equal the relay token endpoint.
+The relying party sends a signed JWT in `client_assertion`, with
+`client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and
+`client_id` equal to the configured `clientId`. The assertion's `iss` and `sub` must match
+`issuer` and `subject`, each defaulting to `clientId`. Matching is exact, including trailing
+slashes. The `aud` claim must contain the relay token endpoint URL, as a string or an array.
+A valid signature and `exp` are required. When present, `iat` and `nbf` must be numeric timestamps
+no later than the current time, allowing 60 seconds of clock skew for time checks.
+
+Configure `jwksUrl` (an absolute HTTP(S) URL), `jwks` (an inline public JWKS object with a
+non-empty `keys` array), or `issuer` for OIDC discovery. `jwks` and `jwksUrl` are mutually
+exclusive. An explicit key source can accompany `issuer`; it takes precedence over discovery.
+Without either key source, oauthrelay fetches `{issuer}/.well-known/openid-configuration`,
+requires its `issuer` to match exactly, and uses its `jwks_uri`. Discovery uses only the configured
+issuer. Issuer and discovered JWKS URLs require HTTPS, with HTTP permitted on IP loopback for
+local development; user information, queries, and fragments are forbidden. Metadata is cached
+for one hour and keys for ten minutes.
 
 ```yaml
 clientAuthentication:
@@ -211,6 +224,72 @@ clientAuthentication:
 
 Inline keys use typed RSA (`n`, `e`), EC (`crv`, `x`, `y`, with P-256 or P-384), or OKP
 (`crv: Ed25519`, `x`) public key material and standard optional JWK metadata.
+
+### Kubernetes service-account authentication
+
+A workload can authenticate using a projected service-account token:
+
+```yaml
+clientAuthentication:
+  type: PrivateKeyJwt
+  clientId: worker
+  issuer: https://cluster-issuer.example.com
+  subject: system:serviceaccount:workloads:worker
+```
+
+Set `issuer` to the exact `iss` of your cluster's tokens. The subject selects both the namespace
+and the service account. `clientId` remains the OAuth client ID sent by the application.
+This is workload federation using the client-assertion transport; configuring a subject different
+from `clientId` extends the [RFC 7523 client authentication profile](https://www.rfc-editor.org/rfc/rfc7523.html#section-3),
+which requires the subject to be the client ID.
+
+The issuer's discovery and JWKS endpoints must be reachable by oauthrelay without HTTP credentials,
+with certificates trusted by its HTTP client. Enabling the Kubernetes configuration provider does
+not attach its API credentials or cluster CA to these requests. For a private Kubernetes API,
+you can configure `issuer` with explicit inline `jwks` obtained by an administrator using
+`kubectl get --raw /openid/v1/jwks`; keep those public keys current when the cluster rotates them.
+See [Kubernetes issuer discovery](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#service-account-issuer-discovery)
+for publishing discovery and public keys to relying parties.
+
+Project a token with the **relay token endpoint as its audience**. For a relay named `worker`
+served at `https://relay.example.com`, the workload Pod spec includes:
+
+```yaml
+serviceAccountName: worker
+containers:
+  - name: worker
+    image: your-worker-image
+    volumeMounts:
+      - name: oauthrelay-token
+        mountPath: /var/run/secrets/oauthrelay
+        readOnly: true
+volumes:
+  - name: oauthrelay-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: token
+            audience: https://relay.example.com/relay/worker/token
+            expirationSeconds: 3600
+```
+
+Create the `worker` ServiceAccount and Pod in namespace `workloads`. Read the token file on each
+request so the application picks up kubelet rotation. For example, a refresh request uses:
+
+```sh
+curl --fail-with-body https://relay.example.com/relay/worker/token \
+  --data-urlencode grant_type=refresh_token \
+  --data-urlencode client_id=worker \
+  --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+  --data-urlencode client_assertion@/var/run/secrets/oauthrelay/token \
+  --data-urlencode refresh_token@/path/to/upstream-refresh-token
+```
+
+This authenticates the existing authorization-code and refresh-token flows; it does not create
+a client-credentials grant. The default Kubernetes API token has a different audience and is
+rejected. Matching projected tokens may be reused until expiry. Verification checks the JWT
+offline and does not perform TokenReview or check whether a bound Pod or ServiceAccount still
+exists. Deleting those objects does not immediately revoke a token at oauthrelay.
 
 ## Secret values
 

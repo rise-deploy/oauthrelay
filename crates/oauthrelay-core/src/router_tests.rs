@@ -1523,7 +1523,9 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
     });
     let auth = ClientAuth::PrivateKeyJwt {
         client_id: "jwt-application".into(),
-        jwks: ClientJwks::Inline(jwks),
+        issuer: None,
+        subject: None,
+        jwks: Some(ClientJwks::Inline(jwks)),
     };
     let (app, _, task) = setup("jwt", auth, KeyStrategy::SingleSegment).await;
     let code = authorization_code(&app, "jwt", None).await;
@@ -1561,4 +1563,263 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
         StatusCode::CREATED
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn workload_jwt_enforces_identity_audience_and_validity_for_every_key_source() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let signing_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+    let jwks = json!({"keys": [{"kty":"RSA", "kid":"cluster-key", "alg":"RS256",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let doc = json!({"issuer":issuer, "jwks_uri":format!("{issuer}/keys")});
+    let discovery_hits = Arc::new(AtomicUsize::new(0));
+    let hits = discovery_hits.clone();
+    let keys = jwks.clone();
+    let idp = Router::new()
+        .route(
+            "/cluster/.well-known/openid-configuration",
+            get(move || {
+                let doc = doc.clone();
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(doc)
+                }
+            }),
+        )
+        .route(
+            "/cluster/keys",
+            get(move || {
+                let keys = keys.clone();
+                async move { Json(keys) }
+            }),
+        );
+    let issuer_task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("cluster-key".into());
+    let claims = json!({"iss":issuer, "sub":"system:serviceaccount:workloads:worker",
+        "aud":["https://relay.example/relay/jwt/token"], "exp":unix_now()+3600,
+        "iat":unix_now(), "nbf":unix_now(), "jti":"reusable-projected-token"});
+    for source in [
+        Some(ClientJwks::Inline(jwks)),
+        Some(ClientJwks::Url(
+            Url::parse(&format!("{issuer}/keys")).unwrap(),
+        )),
+        None,
+    ] {
+        let auth = ClientAuth::PrivateKeyJwt {
+            client_id: "worker-client".into(),
+            issuer: Some(issuer.clone()),
+            subject: Some("system:serviceaccount:workloads:worker".into()),
+            jwks: source,
+        };
+        let (app, _, task, capture) = setup_with_capture(
+            "jwt",
+            auth,
+            KeyStrategy::SingleSegment,
+            None,
+            EndpointConfiguration::Explicit,
+        )
+        .await;
+        let valid = encode(&header, &claims, &signing_key).unwrap();
+        let code = authorization_code(&app, "jwt", None).await;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", "https://app.example/callback"),
+            ("client_id", "worker-client"),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", valid.as_str()),
+        ])
+        .unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &form).await.status(),
+            StatusCode::CREATED
+        );
+        let refresh_form = |assertion: &str, client_id: &str| {
+            serde_urlencoded::to_string([
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "upstream-refresh"),
+                ("client_id", client_id),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", assertion),
+            ])
+            .unwrap()
+        };
+        // Projected tokens remain usable across requests until the kubelet rotates them.
+        for _ in 0..2 {
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&valid, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+        }
+        let forwarded = capture.token.lock().unwrap().len();
+        for (claim, value) in [
+            ("iss", json!("https://another-cluster.example")),
+            ("iss", json!(format!("{issuer}/"))),
+            ("sub", json!("system:serviceaccount:other:worker")),
+            ("sub", json!("system:serviceaccount:workloads:other")),
+            ("sub", json!(["system:serviceaccount:workloads:worker"])),
+            ("aud", json!(["https://kubernetes.default.svc"])),
+            ("aud", json!("https://relay.example/relay/other/token")),
+            ("exp", json!(unix_now() - 120)),
+            ("exp", json!("tomorrow")),
+            ("nbf", json!(unix_now() + 120)),
+            ("nbf", json!("tomorrow")),
+            ("iat", json!(unix_now() + 120)),
+            ("iat", json!("now")),
+        ] {
+            let mut invalid = claims.clone();
+            invalid[claim] = value;
+            let assertion = encode(&header, &invalid, &signing_key).unwrap();
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "invalid {claim}: {invalid}"
+            );
+        }
+        for claim in ["iss", "sub", "aud", "exp"] {
+            let mut invalid = claims.clone();
+            invalid.as_object_mut().unwrap().remove(claim);
+            let assertion = encode(&header, &invalid, &signing_key).unwrap();
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "missing {claim}"
+            );
+        }
+        assert_eq!(
+            post_token(&app, "jwt", &refresh_form(&valid, "other-client"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut unknown_key = header.clone();
+        unknown_key.kid = Some("unknown-key".into());
+        let assertion = encode(&unknown_key, &claims, &signing_key).unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let assertion = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"untrusted"),
+        )
+        .unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut parts: Vec<_> = valid.split('.').map(str::to_owned).collect();
+        let replacement = if parts[2].starts_with('A') { "B" } else { "A" };
+        parts[2].replace_range(..1, replacement);
+        assert_eq!(
+            post_token(
+                &app,
+                "jwt",
+                &refresh_form(&parts.join("."), "worker-client")
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            capture.token.lock().unwrap().len(),
+            forwarded,
+            "rejected assertions never reach the upstream"
+        );
+        task.abort();
+    }
+    assert_eq!(
+        discovery_hits.load(Ordering::SeqCst),
+        1,
+        "only issuer discovery fetches metadata, cached across requests"
+    );
+    issuer_task.abort();
+}
+
+#[tokio::test]
+async fn workload_jwt_rejects_invalid_discovery_metadata() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let document = Arc::new(StdMutex::new(Value::Null));
+    let response = document.clone();
+    let idp = Router::new().route(
+        "/cluster/.well-known/openid-configuration",
+        get(move || {
+            let response = response.clone();
+            async move { Json(response.lock().unwrap().clone()) }
+        }),
+    );
+    let issuer_task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let claims = json!({"iss":issuer,"sub":"worker","aud":"https://relay.example/relay/jwt/token","exp":unix_now()+300});
+    let assertion = encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    for metadata in [
+        json!({"issuer":"https://untrusted.example","jwks_uri":format!("{issuer}/keys")}),
+        json!({"issuer":format!("{issuer}/"),"jwks_uri":format!("{issuer}/keys")}),
+        json!({"jwks_uri":format!("{issuer}/keys")}),
+        json!({"issuer":issuer}),
+        json!({"issuer":issuer,"jwks_uri":"http://untrusted.example/keys"}),
+        json!({"issuer":issuer,"jwks_uri":"file:///keys"}),
+        json!({"issuer":issuer,"jwks_uri":format!("{issuer}/missing-keys")}),
+    ] {
+        *document.lock().unwrap() = metadata.clone();
+        let (app, _, task) = setup(
+            "jwt",
+            ClientAuth::PrivateKeyJwt {
+                client_id: "worker".into(),
+                issuer: Some(issuer.clone()),
+                subject: None,
+                jwks: None,
+            },
+            KeyStrategy::SingleSegment,
+        )
+        .await;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "refresh"),
+            ("client_id", "worker"),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", assertion.as_str()),
+        ])
+        .unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &form).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{metadata}"
+        );
+        task.abort();
+    }
+    issuer_task.abort();
 }

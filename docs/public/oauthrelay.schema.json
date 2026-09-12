@@ -129,20 +129,30 @@
           ]
         },
         {
-          "description": "Require an RFC 7523 client assertion verified by a JWKS object or URL.",
+          "description": "Require a signed client assertion, optionally from a federated workload issuer.",
           "type": "object",
           "properties": {
             "clientId": {
-              "description": "Client identifier required as assertion issuer and subject.",
+              "description": "Client identifier required in the token request; default assertion issuer and subject.",
               "type": "string"
             },
+            "issuer": {
+              "description": "Exact assertion issuer. HTTPS URL (HTTP allowed on loopback); defaults to clientId.\nSupplies OIDC discovery when neither jwks nor jwksUrl is configured.",
+              "type": "string",
+              "minLength": 1
+            },
             "jwks": {
-              "description": "Inline public keys. Exactly one of jwks and jwksUrl is required.",
+              "description": "Inline public keys. Mutually exclusive with jwksUrl; omit both to discover from issuer.",
               "$ref": "#/$defs/PublicJwkSet"
             },
             "jwksUrl": {
-              "description": "Absolute HTTP(S) JWKS URL. Exactly one of jwks and jwksUrl is required.",
+              "description": "Absolute HTTP(S) JWKS URL. Mutually exclusive with jwks; omit both to discover from issuer.",
               "type": "string"
+            },
+            "subject": {
+              "description": "Exact assertion subject, such as system:serviceaccount:namespace:name; defaults to clientId.",
+              "type": "string",
+              "minLength": 1
             },
             "type": {
               "type": "string",
@@ -152,13 +162,42 @@
           "additionalProperties": false,
           "oneOf": [
             {
+              "not": {
+                "required": [
+                  "jwksUrl"
+                ]
+              },
               "required": [
                 "jwks"
               ]
             },
             {
+              "not": {
+                "required": [
+                  "jwks"
+                ]
+              },
               "required": [
                 "jwksUrl"
+              ]
+            },
+            {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "jwks"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "jwksUrl"
+                    ]
+                  }
+                ]
+              },
+              "required": [
+                "issuer"
               ]
             }
           ],

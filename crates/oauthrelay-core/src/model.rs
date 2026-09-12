@@ -172,7 +172,12 @@ pub enum ClientAuth {
     },
     PrivateKeyJwt {
         client_id: String,
-        jwks: ClientJwks,
+        #[serde(default)]
+        issuer: Option<String>,
+        #[serde(default)]
+        subject: Option<String>,
+        #[serde(default)]
+        jwks: Option<ClientJwks>,
     },
 }
 
@@ -318,24 +323,54 @@ impl Relay {
                 Err("clientAuthentication.clientId must not be empty".into())
             }
             ClientAuth::PrivateKeyJwt {
-                jwks: ClientJwks::Url(url),
+                issuer,
+                subject,
+                jwks,
                 ..
-            } if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() => {
-                Err("clientAuthentication.jwks must be an absolute http(s) URL".into())
-            }
-            ClientAuth::PrivateKeyJwt {
-                jwks: ClientJwks::Inline(value),
-                ..
-            } if !value
-                .get("keys")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|keys| !keys.is_empty()) =>
-            {
-                Err("clientAuthentication.jwks must contain a non-empty keys array".into())
+            } => {
+                if let Some(issuer) = issuer {
+                    let url = Url::parse(issuer)
+                        .map_err(|_| "clientAuthentication.issuer must be an absolute HTTPS URL")?;
+                    if !valid_discovery_url(&url) {
+                        return Err("clientAuthentication.issuer must use HTTPS (HTTP on loopback) without user information, query, or fragment".into());
+                    }
+                }
+                if subject.as_ref().is_some_and(|value| value.is_empty()) {
+                    return Err("clientAuthentication.subject must not be empty".into());
+                }
+                match jwks {
+                    None if issuer.is_none() => {
+                        Err("clientAuthentication requires jwks or issuer discovery".into())
+                    }
+                    Some(ClientJwks::Url(url))
+                        if !matches!(url.scheme(), "http" | "https")
+                            || url.host_str().is_none() =>
+                    {
+                        Err("clientAuthentication.jwks must be an absolute http(s) URL".into())
+                    }
+                    Some(ClientJwks::Inline(value))
+                        if !value
+                            .get("keys")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|keys| !keys.is_empty()) =>
+                    {
+                        Err("clientAuthentication.jwks must contain a non-empty keys array".into())
+                    }
+                    _ => Ok(()),
+                }
             }
             _ => Ok(()),
         }
     }
+}
+
+pub(crate) fn valid_discovery_url(url: &Url) -> bool {
+    (url.scheme() == "https" || (url.scheme() == "http" && is_ip_loopback(url)))
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 fn validate_exact_uri(value: &str) -> Result<(), String> {

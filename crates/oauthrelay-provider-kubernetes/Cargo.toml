@@ -23,6 +23,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
+serde_urlencoded.workspace = true
 serde_yaml.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true

@@ -435,10 +435,16 @@ spec:
                         - clientSecret
                     - not:
                         required:
+                        - issuer
+                    - not:
+                        required:
                         - jwks
                     - not:
                         required:
                         - jwksUrl
+                    - not:
+                        required:
+                        - subject
                     properties:
                       type:
                         enum:
@@ -455,10 +461,16 @@ spec:
                         - clientSecret
                     - not:
                         required:
+                        - issuer
+                    - not:
+                        required:
                         - jwks
                     - not:
                         required:
                         - jwksUrl
+                    - not:
+                        required:
+                        - subject
                     properties:
                       type:
                         enum:
@@ -469,10 +481,16 @@ spec:
                   - allOf:
                     - not:
                         required:
+                        - issuer
+                    - not:
+                        required:
                         - jwks
                     - not:
                         required:
                         - jwksUrl
+                    - not:
+                        required:
+                        - subject
                     properties:
                       clientId: {}
                       clientSecret:
@@ -797,12 +815,28 @@ spec:
                         required:
                         - clientSecret
                     oneOf:
-                    - required:
+                    - not:
+                        required:
+                        - jwksUrl
+                      required:
                       - jwks
-                    - required:
+                    - not:
+                        required:
+                        - jwks
+                      required:
                       - jwksUrl
+                    - not:
+                        anyOf:
+                        - required:
+                          - jwks
+                        - required:
+                          - jwksUrl
+                      required:
+                      - issuer
                     properties:
                       clientId: {}
+                      issuer:
+                        minLength: 1
                       jwks:
                         properties:
                           keys:
@@ -899,6 +933,8 @@ spec:
                         required:
                         - keys
                       jwksUrl: {}
+                      subject:
+                        minLength: 1
                       type:
                         enum:
                         - PrivateKeyJwt
@@ -1244,8 +1280,16 @@ spec:
                             type: object
                         type: object
                     type: object
+                  issuer:
+                    description: |-
+                      Exact assertion issuer. HTTPS URL (HTTP allowed on loopback); defaults to clientId.
+                      Supplies OIDC discovery when neither jwks nor jwksUrl is configured.
+                    minLength: 1
+                    type: string
                   jwks:
-                    description: Inline public keys. Exactly one of jwks and jwksUrl is required.
+                    description: >-
+                      Inline public keys. Mutually exclusive with jwksUrl; omit both to discover from
+                      issuer.
                     properties:
                       keys:
                         items:
@@ -1369,7 +1413,15 @@ spec:
                     - keys
                     type: object
                   jwksUrl:
-                    description: Absolute HTTP(S) JWKS URL. Exactly one of jwks and jwksUrl is required.
+                    description: >-
+                      Absolute HTTP(S) JWKS URL. Mutually exclusive with jwks; omit both to discover
+                      from issuer.
+                    type: string
+                  subject:
+                    description: >-
+                      Exact assertion subject, such as system:serviceaccount:namespace:name; defaults
+                      to clientId.
+                    minLength: 1
                     type: string
                   type:
                     type: string
