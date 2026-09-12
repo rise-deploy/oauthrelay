@@ -27,6 +27,10 @@ description = "Build the documentation site"
 dir = "docs"
 run = "npm ci && npm run build"
 
+[tasks.release]
+description = "Update the version, commit, tag, push, and create a GitHub release"
+run = "bash scripts/release.sh"
+
 [tasks.schema]
 description = "Generate the oauthrelay configuration schema"
 run = "cargo run -q -p oauthrelay -- schema > docs/public/oauthrelay.schema.json"

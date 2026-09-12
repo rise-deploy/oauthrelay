@@ -76,6 +76,15 @@ Serve the documentation locally with:
 mise run docs:serve
 ```
 
+Release a version from a clean working tree (requires the authenticated `gh` CLI):
+
+```console
+mise run release 0.4.0
+```
+
+The task updates the workspace version and lockfile, runs `cargo check`, commits, creates an
+annotated `v<version>` tag, pushes to `origin`, and creates a GitHub release with generated notes.
+
 The regular test suite uses in-process OAuth/OIDC fixtures. `mise run e2e` runs the standalone
 binary through a complete authorization-code and refresh flow against a pinned Dex container. No
 test contacts Google or Amazon Cognito. `mise run kubernetes:test` validates generated CRDs and
