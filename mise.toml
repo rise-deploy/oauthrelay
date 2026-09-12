@@ -65,11 +65,11 @@ run = "node --test scripts/*.test.mjs"
 
 [tasks.crds]
 description = "Generate the Kubernetes CRDs from Rust types"
-run = "cargo run -q -p oauthrelay --no-default-features --features kubernetes -- crds > docs/public/oauthrelay.crds.yaml"
+run = "cargo run -q -p oauthrelay --no-default-features --features kubernetes -- crds > deploy/oauthrelay.crds.yaml"
 
 [tasks."crds:check"]
 description = "Check the generated Kubernetes CRDs"
-run = "cargo run -q -p oauthrelay --no-default-features --features kubernetes -- crds | diff -u docs/public/oauthrelay.crds.yaml -"
+run = "cargo run -q -p oauthrelay --no-default-features --features kubernetes -- crds | diff -u deploy/oauthrelay.crds.yaml -"
 
 [tasks."kubernetes:test"]
 description = "Validate CRDs and provider behavior in a disposable Kind cluster"

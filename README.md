@@ -56,7 +56,7 @@ The executable publishes its configuration contract directly:
 
 ```console
 oauthrelay schema > oauthrelay.schema.json
-oauthrelay crds > oauthrelay.crds.yaml
+oauthrelay crds > deploy/oauthrelay.crds.yaml
 ```
 
 ## Development

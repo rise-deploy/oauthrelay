@@ -34,7 +34,10 @@ kubectl wait --for=condition=Established --timeout=60s \
 ```
 
 The command requires no credentials or runtime environment variables. The
-[generated CRD bundle](/oauthrelay/oauthrelay.crds.yaml) is also published with this documentation.
+[generated CRD bundle](https://github.com/rise-deploy/oauthrelay/blob/develop/deploy/oauthrelay.crds.yaml)
+is committed under `deploy/`. From a repository checkout, install it with
+`kubectl apply --server-side -f deploy/oauthrelay.crds.yaml`. Regenerate it with `mise run crds`;
+`mise run crds:check` checks that it matches the Rust definitions.
 The definitions and their structural schemas come from Rust types and `schemars`. CI checks
 regeneration for drift and validates them against a Kubernetes 1.35 API server.
 

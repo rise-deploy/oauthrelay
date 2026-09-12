@@ -20,7 +20,7 @@ def main():
             run("kind", "create", "cluster", "--name", name, "--image", "kindest/node:v1.35.0",
                 "--kubeconfig", config, "--wait", "120s", timeout=300)
             kubectl = ["kubectl", "--kubeconfig", config, "--request-timeout=30s"]
-            run(*kubectl, "apply", "--server-side", "-f", "docs/public/oauthrelay.crds.yaml")
+            run(*kubectl, "apply", "--server-side", "-f", "deploy/oauthrelay.crds.yaml")
             run(*kubectl, "wait", "--for=condition=Established", "--timeout=60s",
                 "crd/upstreams.oauthrelay.dev", "crd/relays.oauthrelay.dev")
             env = dict(os.environ, RUSTC_WRAPPER="", OAUTHRELAY_KUBERNETES_TEST_KUBECONFIG=config)

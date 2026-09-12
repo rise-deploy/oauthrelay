@@ -155,8 +155,10 @@ scope tokens, and dangling references reject the candidate snapshot.
 `oauthrelay schema` prints a JSON Schema generated from the Rust configuration types.
 
 `oauthrelay crds` prints the namespaced Upstream and Relay CRDs generated from shared Rust
-configuration types with structural schema validation. `metadata.namespace` is optional in
-File/SSM documents and ignored by those providers. PrivateKeyJwt config requires exactly one of
+configuration types with structural schema validation. The generated bundle is committed at
+`deploy/oauthrelay.crds.yaml`, and CI checks it with `mise run crds:check`.
+
+`metadata.namespace` is optional in File/SSM documents and ignored by those providers. PrivateKeyJwt config requires exactly one of
 `jwksUrl` or typed inline `jwks`.
 
 ## Kubernetes provider
