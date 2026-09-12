@@ -62,7 +62,7 @@ redirect policy.
   secret.
 - `Public`: no client credential; S256 PKCE is mandatory.
 - `ClientSecret`: a relay-specific client ID and secret are compared in constant time.
-- `PrivateKeyJwt`: an RFC 7523 assertion is verified against inline JWKS or a JWKS URL.
+- `PrivateKeyJwt`: a signed client assertion is verified against inline JWKS, a JWKS URL, or configured issuer discovery. `issuer` and `subject` are exact claim constraints, each defaulting to `clientId`; `client_id` must still match `clientId`. `audience` is an optional non-empty exact audience constraint, defaulting to the relay token endpoint URL; the JWT must contain it as a string or array element. Expiration is required, and optional `iat`/`nbf` timestamps are checked with 60 seconds of skew. Configured workload subjects may differ from the OAuth client ID. Tokens are reusable until expiry; verification does not call Kubernetes TokenReview.
 
 `ResourceResolver` resolves relays and upstreams independently for every request. `Registry`
 implements the resolver with an atomically swapped `ProviderSnapshot` containing both maps.
@@ -158,8 +158,15 @@ scope tokens, and dangling references reject the candidate snapshot.
 configuration types with structural schema validation. The generated bundle is committed at
 `deploy/oauthrelay.crds.yaml`, and CI checks it with `mise run crds:check`.
 
-`metadata.namespace` is optional in File/SSM documents and ignored by those providers. PrivateKeyJwt config requires exactly one of
-`jwksUrl` or typed inline `jwks`.
+`metadata.namespace` is optional in File/SSM documents and ignored by those providers. PrivateKeyJwt
+accepts either `jwksUrl` or typed inline `jwks`, or discovers keys from an explicit `issuer` when
+both are omitted. Discovery metadata must identify that exact issuer. Issuer and discovered JWKS
+URLs use HTTPS (HTTP is allowed on IP loopback), without user information, queries, or fragments.
+Discovery requests do not inherit Kubernetes API credentials or the cluster CA. Client assertion
+discovery and JWKS fetches reject redirects, use a separate cache and HTTP client, and have a
+ten-second deadline. Unknown signing key IDs trigger one serialized JWKS refresh per URL;
+forced refreshes and failed fetch retries are limited to once per thirty seconds. A failed refresh
+retains known keys until their normal cache expiry.
 
 ## Kubernetes provider
 

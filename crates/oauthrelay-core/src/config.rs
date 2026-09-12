@@ -219,23 +219,44 @@ pub enum ClientAuthentication {
         #[serde(rename = "clientSecret")]
         client_secret: SecretValue,
     },
-    /// Require an RFC 7523 client assertion verified by a JWKS object or URL.
+    /// Require a signed client assertion, optionally from a federated workload issuer.
     PrivateKeyJwt {
-        /// Client identifier required as assertion issuer and subject.
+        /// Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.
+        /// Requires a replay cache shared by all serving instances; false permits reusable workload JWTs.
+        #[serde(
+            default,
+            rename = "requireSingleUse",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        require_single_use: bool,
+        /// Client identifier required in the token request; default assertion issuer and subject.
         #[serde(rename = "clientId")]
         client_id: String,
-        /// Inline public keys. Exactly one of jwks and jwksUrl is required.
+        /// Exact assertion issuer. HTTPS URL (HTTP allowed on loopback); defaults to clientId.
+        /// Supplies OIDC discovery when neither jwks nor jwksUrl is configured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String", length(min = 1))]
+        issuer: Option<String>,
+        /// Exact assertion subject, such as system:serviceaccount:namespace:name; defaults to clientId.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String", length(min = 1))]
+        subject: Option<String>,
+        /// Exact required assertion audience; defaults to the relay token endpoint URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String", length(min = 1))]
+        audience: Option<String>,
+        /// Inline public keys. Mutually exclusive with jwksUrl; omit both to discover from issuer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(with = "PublicJwkSet")]
         jwks: Option<PublicJwkSet>,
-        /// Absolute HTTP(S) JWKS URL. Exactly one of jwks and jwksUrl is required.
+        /// Absolute HTTP(S) JWKS URL. Mutually exclusive with jwks; omit both to discover from issuer.
         #[serde(default, rename = "jwksUrl", skip_serializing_if = "Option::is_none")]
         #[schemars(with = "String")]
         jwks_url: Option<String>,
     },
 }
 
-/// Schema alternatives enforce the same exclusive JWKS source as compilation.
+/// Require one explicit key source, or issuer discovery when neither is supplied.
 fn require_jwks_source(schema: &mut schemars::Schema) {
     if let Some(variants) = schema
         .get_mut("oneOf")
@@ -247,8 +268,11 @@ fn require_jwks_source(schema: &mut schemars::Schema) {
                 .and_then(|p| p.get("jwksUrl"))
                 .is_some()
             {
-                variant["oneOf"] =
-                    serde_json::json!([{"required":["jwks"]}, {"required":["jwksUrl"]}]);
+                variant["oneOf"] = serde_json::json!([
+                    {"required":["jwks"], "not":{"required":["jwksUrl"]}},
+                    {"required":["jwksUrl"], "not":{"required":["jwks"]}},
+                    {"required":["issuer"], "not":{"anyOf":[{"required":["jwks"]},{"required":["jwksUrl"]}]}}
+                ]);
             }
         }
     }
@@ -415,22 +439,31 @@ pub async fn compile_resources(
                     })?,
             },
             ClientAuthentication::PrivateKeyJwt {
+                require_single_use,
                 client_id,
+                issuer,
+                subject,
+                audience,
                 jwks,
                 jwks_url,
             } => ClientAuth::PrivateKeyJwt {
+                require_single_use,
                 client_id,
                 jwks: match (jwks, jwks_url) {
-                    (None, Some(value)) => ClientJwks::Url(
+                    (None, Some(value)) => Some(ClientJwks::Url(
                         Url::parse(&value).context("spec.clientAuthentication.jwksUrl")?,
-                    ),
-                    (Some(jwks), None) => ClientJwks::Inline(serde_json::to_value(jwks)?),
+                    )),
+                    (Some(jwks), None) => Some(ClientJwks::Inline(serde_json::to_value(jwks)?)),
+                    (None, None) if issuer.is_some() => None,
                     _ => {
                         return Err(anyhow!(
-                            "Relay/{key}: PrivateKeyJwt requires exactly one of jwks and jwksUrl"
+                            "Relay/{key}: PrivateKeyJwt requires exactly one of jwks and jwksUrl, or issuer discovery with neither"
                         ))
                     }
                 },
+                issuer,
+                subject,
+                audience,
             },
         };
         let redirect_policy = resource
@@ -725,6 +758,75 @@ mod tests {
             r#"{"secretsManager":{"secretId":"oauthrelay/google"}}"#
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn compiles_workload_identity_and_rejects_invalid_trust_configuration() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let issuer = "https://cluster.example";
+        let subject = "system:serviceaccount:workloads:worker";
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"jwksUrl":"https://keys.example/jwks"}),
+            serde_json::json!({"jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
+        ] {
+            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay","requireSingleUse":true});
+            auth.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "secret".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!()
+            };
+            relay.spec.client_authentication = serde_json::from_value(auth).unwrap();
+            let compiled = compile_resources(resources, &secrets).await.unwrap();
+            let ClientAuth::PrivateKeyJwt {
+                require_single_use,
+                issuer: actual_issuer,
+                subject: actual_subject,
+                audience: actual_audience,
+                ..
+            } = &compiled.relays.values().next().unwrap().client_auth
+            else {
+                unreachable!()
+            };
+            assert!(*require_single_use);
+            assert_eq!(actual_issuer.as_deref(), Some(issuer));
+            assert_eq!(actual_subject.as_deref(), Some(subject));
+            assert_eq!(actual_audience.as_deref(), Some("api://oauthrelay"));
+        }
+        for extra in [
+            serde_json::json!({"issuer":""}),
+            serde_json::json!({"issuer":"cluster.example"}),
+            serde_json::json!({"issuer":"http://cluster.example"}),
+            serde_json::json!({"issuer":"https://user@cluster.example"}),
+            serde_json::json!({"issuer":"https://cluster.example?query"}),
+            serde_json::json!({"issuer":"https://cluster.example#fragment"}),
+            serde_json::json!({"subject":""}),
+            serde_json::json!({"audience":""}),
+            serde_json::json!({"issuer":null}),
+            serde_json::json!({"jwksUrl":"https://keys.example/jwks","jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
+        ] {
+            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay"});
+            auth.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "secret".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!()
+            };
+            relay.spec.client_authentication = serde_json::from_value(auth.clone()).unwrap();
+            assert!(
+                compile_resources(resources, &secrets).await.is_err(),
+                "{auth}"
+            );
+        }
     }
 
     #[tokio::test]

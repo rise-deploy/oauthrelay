@@ -177,6 +177,9 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         json!({"type":"ClientSecret","clientId":"app","clientSecret":{"value":"secret"}}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwksUrl":"https://app.example/jwks"}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwks":inline}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","subject":"system:serviceaccount:workloads:worker","audience":"api://oauthrelay"}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","subject":"system:serviceaccount:workloads:worker","jwks":inline}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","jwksUrl":"https://keys.example/jwks"}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwks":{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"},{"kty":"OKP","crv":"Ed25519","x":"x"}]}}),
     ] {
         let expected = relay("valid", auth);
@@ -198,6 +201,13 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         json!({"type":"ClientSecret","clientId":"app"}),
         json!({"type":"Public","clientId":"unexpected"}),
         json!({"type":"PrivateKeyJwt","clientId":"app"}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","subject":"worker"}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":null}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":""}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","subject":""}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","audience":""}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","audience":["api://oauthrelay"]}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","jwksUrl":"https://keys.example/jwks","jwks":inline}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwks":null}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwksUrl":null}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwks":"https://app.example/jwks"}),
@@ -261,4 +271,181 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn service_account_token_authenticates_through_a_relay_cr() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use oauthrelay_core::{router, KeyStrategy, RelayConfig, XChaChaSealer};
+    use tower::ServiceExt;
+
+    let path = std::env::var("OAUTHRELAY_KUBERNETES_TEST_KUBECONFIG").unwrap();
+    let config = Config::from_custom_kubeconfig(
+        kube::config::Kubeconfig::read_from(path).unwrap(),
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let admin = Client::try_from(config).unwrap();
+    let discovery: Value = admin
+        .request(
+            Request::get("/.well-known/openid-configuration")
+                .body(vec![])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let jwks: Value = admin
+        .request(Request::get("/openid/v1/jwks").body(vec![]).unwrap())
+        .await
+        .unwrap();
+    let namespace = "jwt-workloads";
+    Api::<Namespace>::all(admin.clone())
+        .create(
+            &PostParams::default(),
+            &Namespace {
+                metadata: ObjectMeta {
+                    name: Some(namespace.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let sas = Api::<ServiceAccount>::namespaced(admin.clone(), namespace);
+    for name in ["worker", "other"] {
+        sas.create(
+            &PostParams::default(),
+            &ServiceAccount {
+                metadata: ObjectMeta {
+                    name: Some(name.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_app = Router::new().route(
+        "/token",
+        post(|| async {
+            (
+                StatusCode::ACCEPTED,
+                r#"{"access_token":"upstream-access","token_type":"Bearer"}"#,
+            )
+        }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+    let upstream: Upstream = serde_json::from_value(json!({
+        "apiVersion":"oauthrelay.dev/v1alpha1","kind":"Upstream","metadata":{"name":"issuer","namespace":namespace},
+        "spec":{"issuerUrl":upstream_url,"endpoints":{"authorization":format!("{upstream_url}/authorize"),"token":format!("{upstream_url}/token")},
+        "oauthClient":{"clientId":"upstream","clientSecret":{"value":"test-secret"}}}
+    })).unwrap();
+    Api::<Upstream>::namespaced(admin.clone(), namespace)
+        .create(&PostParams::default(), &upstream)
+        .await
+        .unwrap();
+    let mut resource = relay(
+        "worker",
+        json!({"type":"PrivateKeyJwt","clientId":"worker-client",
+        "issuer":discovery["issuer"],"subject":format!("system:serviceaccount:{namespace}:worker"),"audience":"api://oauthrelay","jwks":jwks}),
+    );
+    resource["metadata"]["namespace"] = json!(namespace);
+    Api::<Relay>::namespaced(admin.clone(), namespace)
+        .create(
+            &PostParams::default(),
+            &serde_json::from_value(resource).unwrap(),
+        )
+        .await
+        .unwrap();
+    let resources = KubernetesProvider::new(admin.clone(), namespace, Duration::from_secs(60))
+        .unwrap()
+        .load()
+        .await
+        .unwrap();
+    let audience = "api://oauthrelay";
+    let app = router(
+        Arc::new(resources),
+        RelayConfig {
+            public_url: "https://relay.example/".parse().unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
+            replay_cache: None,
+            http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
+            allow_localhost_loopback: false,
+        },
+        KeyStrategy::SingleSegment,
+    );
+    for (name, token_audience, expected) in [
+        ("worker", audience, StatusCode::ACCEPTED),
+        ("other", audience, StatusCode::UNAUTHORIZED),
+        (
+            "worker",
+            "https://relay.example/relay/worker/token",
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "worker",
+            "https://kubernetes.default.svc",
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let token = sas
+            .create_token_request(
+                name,
+                &PostParams::default(),
+                &TokenRequest {
+                    spec: TokenRequestSpec {
+                        audiences: vec![token_audience.into()],
+                        expiration_seconds: Some(600),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .token;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "upstream-refresh"),
+            ("client_id", "worker-client"),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", token.as_str()),
+        ])
+        .unwrap();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/relay/worker/token")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(form.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "service account {name}, audience {token_audience}"
+            );
+        }
+    }
+    task.abort();
 }

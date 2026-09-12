@@ -139,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
             sealer,
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::builder().build()?,
+            client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
+                reqwest::Client::builder(),
+            )?,
             allow_localhost_loopback: bool_env("OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK", false)?,
         },
         KeyStrategy::SingleSegment,

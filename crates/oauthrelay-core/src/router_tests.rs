@@ -335,6 +335,7 @@ async fn setup_signed_profile(
             sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
         },
         KeyStrategy::SingleSegment,
@@ -421,6 +422,7 @@ async fn setup_with_capture(
             sealer: sealer.clone(),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
         },
         strategy,
@@ -476,6 +478,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
             replay_cache: None,
             http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
         },
         KeyStrategy::SingleSegment,
@@ -1522,8 +1525,12 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
         }]
     });
     let auth = ClientAuth::PrivateKeyJwt {
+        require_single_use: true,
         client_id: "jwt-application".into(),
-        jwks: ClientJwks::Inline(jwks),
+        issuer: None,
+        subject: None,
+        audience: None,
+        jwks: Some(ClientJwks::Inline(jwks)),
     };
     let (app, _, task) = setup("jwt", auth, KeyStrategy::SingleSegment).await;
     let code = authorization_code(&app, "jwt", None).await;
@@ -1560,5 +1567,737 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
         post_token(&app, "jwt", &form).await.status(),
         StatusCode::CREATED
     );
+    let replay = post_token(&app, "jwt", &form).await;
+    let body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+    assert_eq!(body["error"], "invalid_client");
+    task.abort();
+}
+
+#[tokio::test]
+async fn workload_jwt_enforces_identity_audience_and_validity_for_every_key_source() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let signing_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+    let jwks = json!({"keys": [{"kty":"RSA", "kid":"cluster-key", "alg":"RS256",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let doc = json!({"issuer":issuer, "jwks_uri":format!("{issuer}/keys")});
+    let discovery_hits = Arc::new(AtomicUsize::new(0));
+    let hits = discovery_hits.clone();
+    let keys = jwks.clone();
+    let idp = Router::new()
+        .route(
+            "/cluster/.well-known/openid-configuration",
+            get(move || {
+                let doc = doc.clone();
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(doc)
+                }
+            }),
+        )
+        .route(
+            "/cluster/keys",
+            get(move || {
+                let keys = keys.clone();
+                async move { Json(keys) }
+            }),
+        );
+    let issuer_task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("cluster-key".into());
+    let claims = json!({"iss":issuer, "sub":"system:serviceaccount:workloads:worker",
+        "aud":["https://relay.example/relay/jwt/token"], "exp":unix_now()+3600,
+        "iat":unix_now(), "nbf":unix_now(), "jti":"reusable-projected-token"});
+    for (source, configured_audience) in [
+        (Some(ClientJwks::Inline(jwks)), None),
+        (
+            Some(ClientJwks::Url(
+                Url::parse(&format!("{issuer}/keys")).unwrap(),
+            )),
+            Some("api://oauthrelay"),
+        ),
+        (None, Some("api://oauthrelay")),
+    ] {
+        let audience = configured_audience.unwrap_or("https://relay.example/relay/jwt/token");
+        let mut claims = claims.clone();
+        claims["aud"] = json!([audience]);
+        let auth = ClientAuth::PrivateKeyJwt {
+            require_single_use: false,
+            client_id: "worker-client".into(),
+            issuer: Some(issuer.clone()),
+            subject: Some("system:serviceaccount:workloads:worker".into()),
+            audience: configured_audience.map(str::to_owned),
+            jwks: source,
+        };
+        let (app, _, task, capture) = setup_with_capture(
+            "jwt",
+            auth,
+            KeyStrategy::SingleSegment,
+            None,
+            EndpointConfiguration::Explicit,
+        )
+        .await;
+        let valid = encode(&header, &claims, &signing_key).unwrap();
+        let code = authorization_code(&app, "jwt", None).await;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", "https://app.example/callback"),
+            ("client_id", "worker-client"),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", valid.as_str()),
+        ])
+        .unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &form).await.status(),
+            StatusCode::CREATED
+        );
+        let refresh_form = |assertion: &str, client_id: &str| {
+            serde_urlencoded::to_string([
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "upstream-refresh"),
+                ("client_id", client_id),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", assertion),
+            ])
+            .unwrap()
+        };
+        // Projected tokens remain usable across requests until the kubelet rotates them.
+        for _ in 0..2 {
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&valid, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+        }
+        for aud in [json!(audience), json!(["another-audience", audience])] {
+            let mut claims = claims.clone();
+            claims["aud"] = aud;
+            let assertion = encode(&header, &claims, &signing_key).unwrap();
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+        }
+        let forwarded = capture.token.lock().unwrap().len();
+        for (claim, value) in [
+            (
+                "aud",
+                json!(if configured_audience.is_some() {
+                    "https://relay.example/relay/jwt/token"
+                } else {
+                    "api://oauthrelay"
+                }),
+            ),
+            ("aud", json!("")),
+            ("aud", json!([])),
+            ("aud", Value::Null),
+            ("iss", json!("https://another-cluster.example")),
+            ("iss", json!(format!("{issuer}/"))),
+            ("sub", json!("system:serviceaccount:other:worker")),
+            ("sub", json!("system:serviceaccount:workloads:other")),
+            ("sub", json!(["system:serviceaccount:workloads:worker"])),
+            ("aud", json!(["https://kubernetes.default.svc"])),
+            ("aud", json!("https://relay.example/relay/other/token")),
+            ("exp", json!(unix_now() - 120)),
+            ("exp", json!("tomorrow")),
+            ("nbf", json!(unix_now() + 120)),
+            ("nbf", json!("tomorrow")),
+            ("iat", json!(unix_now() + 120)),
+            ("iat", json!("now")),
+        ] {
+            let mut invalid = claims.clone();
+            invalid[claim] = value;
+            let assertion = encode(&header, &invalid, &signing_key).unwrap();
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "invalid {claim}: {invalid}"
+            );
+        }
+        for claim in ["iss", "sub", "aud", "exp"] {
+            let mut invalid = claims.clone();
+            invalid.as_object_mut().unwrap().remove(claim);
+            let assertion = encode(&header, &invalid, &signing_key).unwrap();
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "missing {claim}"
+            );
+        }
+        assert_eq!(
+            post_token(&app, "jwt", &refresh_form(&valid, "other-client"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut unknown_key = header.clone();
+        unknown_key.kid = Some("unknown-key".into());
+        let assertion = encode(&unknown_key, &claims, &signing_key).unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let assertion = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"untrusted"),
+        )
+        .unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut parts: Vec<_> = valid.split('.').map(str::to_owned).collect();
+        let replacement = if parts[2].starts_with('A') { "B" } else { "A" };
+        parts[2].replace_range(..1, replacement);
+        assert_eq!(
+            post_token(
+                &app,
+                "jwt",
+                &refresh_form(&parts.join("."), "worker-client")
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            capture.token.lock().unwrap().len(),
+            forwarded,
+            "rejected assertions never reach the upstream"
+        );
+        task.abort();
+    }
+    assert_eq!(
+        discovery_hits.load(Ordering::SeqCst),
+        1,
+        "only issuer discovery fetches metadata, cached across requests"
+    );
+    issuer_task.abort();
+}
+
+#[tokio::test]
+async fn workload_jwt_rejects_invalid_discovery_metadata() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let document = Arc::new(StdMutex::new(Value::Null));
+    let response = document.clone();
+    let idp = Router::new().route(
+        "/cluster/.well-known/openid-configuration",
+        get(move || {
+            let response = response.clone();
+            async move { Json(response.lock().unwrap().clone()) }
+        }),
+    );
+    let issuer_task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let claims = json!({"iss":issuer,"sub":"worker","aud":"https://relay.example/relay/jwt/token","exp":unix_now()+300});
+    let assertion = encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    for metadata in [
+        json!({"issuer":"https://untrusted.example","jwks_uri":format!("{issuer}/keys")}),
+        json!({"issuer":format!("{issuer}/"),"jwks_uri":format!("{issuer}/keys")}),
+        json!({"jwks_uri":format!("{issuer}/keys")}),
+        json!({"issuer":issuer}),
+        json!({"issuer":issuer,"jwks_uri":"http://untrusted.example/keys"}),
+        json!({"issuer":issuer,"jwks_uri":"file:///keys"}),
+        json!({"issuer":issuer,"jwks_uri":format!("{issuer}/missing-keys")}),
+    ] {
+        *document.lock().unwrap() = metadata.clone();
+        let (app, _, task) = setup(
+            "jwt",
+            ClientAuth::PrivateKeyJwt {
+                require_single_use: false,
+                client_id: "worker".into(),
+                issuer: Some(issuer.clone()),
+                subject: None,
+                audience: None,
+                jwks: None,
+            },
+            KeyStrategy::SingleSegment,
+        )
+        .await;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "refresh"),
+            ("client_id", "worker"),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", assertion.as_str()),
+        ])
+        .unwrap();
+        assert_eq!(
+            post_token(&app, "jwt", &form).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{metadata}"
+        );
+        task.abort();
+    }
+    issuer_task.abort();
+}
+
+#[tokio::test]
+async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+    let source = ClientJwks::Inline(json!({"keys": [{"kty":"RSA",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]}));
+    let cache = Arc::new(MemoryReplayCache::default());
+    let make_state = |replay_cache| AppState {
+        resolver: Arc::new(ProviderSnapshot::default()),
+        cfg: Arc::new(RelayConfig {
+            public_url: "https://relay.example/".parse().unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
+            replay_cache,
+            http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
+            allow_localhost_loopback: false,
+        }),
+        keys: KeyStrategy::SingleSegment,
+        cache: Arc::new(Mutex::new(HashMap::new())),
+        assertion_cache: Arc::default(),
+    };
+    let state = make_state(Some(cache.clone() as Arc<dyn ReplayCache>));
+    let other_instance = make_state(Some(cache));
+    let no_cache = make_state(None);
+    let now = unix_now();
+    let claims = json!({"iss":"client", "sub":"client", "aud":"relay",
+        "iat":now, "exp":now + 300, "jti":"request-1"});
+    let sign = |claims: &Value| encode(&Header::new(Algorithm::RS256), claims, &key).unwrap();
+    for (field, value) in [
+        ("iat", Value::Null),
+        ("jti", Value::Null),
+        ("jti", json!("")),
+        ("jti", json!(123)),
+        ("exp", json!(now + 301)),
+        ("exp", json!(now)),
+        ("iat", json!(now + 120)),
+        ("aud", json!("other")),
+    ] {
+        let mut invalid = claims.clone();
+        invalid[field] = value;
+        assert!(
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                "client",
+                "client",
+                Some(&source),
+                &sign(&invalid),
+                true
+            )
+            .await
+            .is_err(),
+            "{field}"
+        );
+    }
+    let assertion = sign(&claims);
+    assert!(verify_private_key_jwt(
+        &no_cache,
+        "relay",
+        "client",
+        "client",
+        Some(&source),
+        &assertion,
+        true
+    )
+    .await
+    .is_err());
+    let (first, second) = tokio::join!(
+        verify_private_key_jwt(
+            &state,
+            "relay",
+            "client",
+            "client",
+            Some(&source),
+            &assertion,
+            true
+        ),
+        verify_private_key_jwt(
+            &other_instance,
+            "relay",
+            "client",
+            "client",
+            Some(&source),
+            &assertion,
+            true
+        ),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let mut fresh = claims.clone();
+    fresh["jti"] = json!("request-2");
+    assert!(verify_private_key_jwt(
+        &state,
+        "relay",
+        "client",
+        "client",
+        Some(&source),
+        &sign(&fresh),
+        true
+    )
+    .await
+    .is_ok());
+    // Workload assertions remain reusable without a replay cache or per-request claims.
+    let mut workload = claims.clone();
+    workload.as_object_mut().unwrap().remove("jti");
+    workload.as_object_mut().unwrap().remove("iat");
+    workload["exp"] = json!(now + 3600);
+    for _ in 0..2 {
+        assert!(verify_private_key_jwt(
+            &no_cache,
+            "relay",
+            "client",
+            "client",
+            Some(&source),
+            &sign(&workload),
+            false
+        )
+        .await
+        .is_ok());
+    }
+}
+
+fn assertion_test_state() -> AppState {
+    AppState {
+        resolver: Arc::new(ProviderSnapshot::default()),
+        cfg: Arc::new(RelayConfig {
+            public_url: "https://relay.example/".parse().unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
+            replay_cache: None,
+            http: reqwest::Client::new(),
+            // Even a caller-supplied redirect policy cannot enable redirects for trust data.
+            client_assertion_http: ClientAssertionHttpClient::new(
+                reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)),
+            )
+            .unwrap(),
+            allow_localhost_loopback: false,
+        }),
+        keys: KeyStrategy::SingleSegment,
+        cache: Arc::default(),
+        assertion_cache: Arc::default(),
+    }
+}
+
+#[tokio::test]
+async fn client_assertion_discovery_and_jwks_reject_redirects() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let jwks = json!({"keys":[{"kty":"RSA",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let doc = json!({"issuer":issuer, "jwks_uri":format!("{issuer}/keys")});
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let hits = target_hits.clone();
+    let discovery = doc.clone();
+    let idp = Router::new()
+        .route(
+            "/cluster/.well-known/openid-configuration",
+            get(move || {
+                let discovery = discovery.clone();
+                async move { Json(discovery) }
+            }),
+        )
+        .route(
+            "/redirect/.well-known/openid-configuration",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(
+                        header::LOCATION,
+                        "/cluster/.well-known/openid-configuration",
+                    )],
+                )
+            }),
+        )
+        .route(
+            "/cluster/keys",
+            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/target-keys")]) }),
+        )
+        .route(
+            "/target-keys",
+            get(move || {
+                let jwks = jwks.clone();
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(jwks)
+                }
+            }),
+        );
+    let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let state = assertion_test_state();
+    let claims = json!({"iss":issuer,"sub":"worker","aud":"relay","exp":unix_now()+3600});
+    let assertion = encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    for source in [
+        None,
+        Some(ClientJwks::Url(
+            Url::parse(&format!("{issuer}/keys")).unwrap(),
+        )),
+    ] {
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &assertion,
+            false
+        )
+        .await
+        .is_err());
+    }
+    let redirect_discovery =
+        Url::parse(&issuer.replace("/cluster", "/redirect/.well-known/openid-configuration"))
+            .unwrap();
+    assert!(cached_json_with_client(
+        &state.assertion_cache.metadata,
+        &state.cfg.client_assertion_http.0,
+        &redirect_discovery,
+        DISCOVERY_TTL
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        target_hits.load(Ordering::SeqCst),
+        0,
+        "redirect target must never supply trusted keys"
+    );
+    assert!(!state
+        .assertion_cache
+        .metadata
+        .lock()
+        .await
+        .contains_key(redirect_discovery.as_str()));
+    let keys_url = Url::parse(&format!("{issuer}/keys")).unwrap();
+    cached_json(&state, &keys_url, JWKS_TTL).await.unwrap();
+    assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    assert!(
+        verify_private_key_jwt(&state, "relay", &issuer, "worker", None, &assertion, false)
+            .await
+            .is_err(),
+        "upstream cache entries cannot supply assertion trust keys"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+    let keys = Arc::new(StdMutex::new(json!({"keys":[{"kty":"RSA","kid":"old",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]})));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let keys_url = Url::parse(&format!("{issuer}/keys")).unwrap();
+    let doc = json!({"issuer":issuer,"jwks_uri":keys_url});
+    let served_keys = keys.clone();
+    let requests = hits.clone();
+    let fail = failing.clone();
+    let idp = Router::new()
+        .route(
+            "/cluster/.well-known/openid-configuration",
+            get(move || {
+                let doc = doc.clone();
+                async move { Json(doc) }
+            }),
+        )
+        .route(
+            "/cluster/keys",
+            get(move || {
+                let keys = served_keys.clone();
+                let hits = requests.clone();
+                let fail = fail.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if fail.load(Ordering::SeqCst) {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        Json(keys.lock().unwrap().clone()).into_response()
+                    }
+                }
+            }),
+        );
+    let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let claims = json!({"iss":issuer,"sub":"worker","aud":"relay","exp":unix_now()+3600});
+    let sign = |kid: &str| {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        encode(&header, &claims, &key).unwrap()
+    };
+    // Both issuer-discovered keys and explicit remote JWKS use the refresh policy.
+    for source in [None, Some(ClientJwks::Url(keys_url.clone()))] {
+        keys.lock().unwrap()["keys"][0]["kid"] = json!("old");
+        failing.store(false, Ordering::SeqCst);
+        let state = assertion_test_state();
+        let initial_hits = hits.load(Ordering::SeqCst);
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("old"),
+            false
+        )
+        .await
+        .is_ok());
+        keys.lock().unwrap()["keys"][0]["kid"] = json!("new");
+        let rotated = sign("new");
+        let (a, b, c) = tokio::join!(
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            ),
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            ),
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            ),
+        );
+        assert!(a.is_ok() && b.is_ok() && c.is_ok());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            initial_hits + 2,
+            "rotation requires exactly one extra fetch"
+        );
+        for kid in ["unknown-1", "unknown-2", "unknown-3"] {
+            assert!(verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &sign(kid),
+                false
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            initial_hits + 2,
+            "unknown kids share a per-URL cooldown"
+        );
+        let entry = state.assertion_cache.jwks.lock().await[keys_url.as_str()].clone();
+        entry.lock().await.retry_after = None;
+        failing.store(true, Ordering::SeqCst);
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("missing"),
+            false
+        )
+        .await
+        .is_err());
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("missing-again"),
+            false
+        )
+        .await
+        .is_err());
+        assert!(
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            )
+            .await
+            .is_ok(),
+            "a failed refresh preserves fresh known keys"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            initial_hits + 3,
+            "failed refreshes are throttled"
+        );
+        failing.store(false, Ordering::SeqCst);
+        keys.lock().unwrap()["keys"][0]["kid"] = json!("recovered");
+        entry.lock().await.retry_after = None;
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("recovered"),
+            false
+        )
+        .await
+        .is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), initial_hits + 4);
+    }
     task.abort();
 }

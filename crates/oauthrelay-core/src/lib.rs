@@ -12,6 +12,7 @@
 //!     sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
 //!     replay_cache: None,
 //!     http: reqwest::Client::new(),
+//!     client_assertion_http: Default::default(),
 //!     allow_localhost_loopback: false,
 //! };
 //! let app = router(Arc::new(resources), config, KeyStrategy::TwoSegment);

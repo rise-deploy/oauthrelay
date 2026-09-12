@@ -30,7 +30,7 @@ configuration; Amazon Cognito is one example.
 ## Capabilities
 
 - Authorization-code flow with independent upstream S256 PKCE.
-- Public, shared-secret, upstream-client, and RFC 7523 `private_key_jwt` relay authentication.
+- Public, shared-secret, upstream-client, and `private_key_jwt` relay authentication, including issuer/subject constraints for workload tokens.
 - Exact URI, HTTPS-origin, and variable-port loopback redirect policies with sealed state/code envelopes.
 - Transparent authorization, token, refresh, discovery metadata, and JWKS routing.
 - Relay-specific exact matching of verified upstream ID-token claims.

@@ -85,6 +85,15 @@ and Kubernetes `secretKeyRef`. Kubernetes resources have no base directory for r
 AWS clients are initialized only when an AWS source is resolved. Anyone able to configure CRs
 can select these sources using the running process's credentials and filesystem access.
 
+## Workload authentication
+
+A workload can use a projected Kubernetes service-account token to authenticate at a relay
+without a static client secret. Configure `PrivateKeyJwt` with the cluster issuer and the exact
+service-account subject, and project a token whose audience matches `clientAuthentication.audience`
+(the relay token URL by default). See
+[Kubernetes service-account authentication](/oauthrelay/configuration/#kubernetes-service-account-authentication)
+for issuer accessibility requirements and a complete token projection example.
+
 ## Updates and errors
 
 The provider watches both resource kinds and Secret metadata. It fetches values only for

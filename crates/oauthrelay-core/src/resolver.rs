@@ -60,6 +60,8 @@ pub trait ConfigProvider: Send + Sync + 'static {
 
 #[async_trait]
 pub trait ReplayCache: Send + Sync + 'static {
+    /// Atomically record an absent ID for the full TTL; return false if already present.
+    /// Share durable storage across serving instances when enforcing deployment-wide single use.
     async fn first_use(&self, id: &str, ttl: Duration) -> Result<bool, CacheError>;
 }
 

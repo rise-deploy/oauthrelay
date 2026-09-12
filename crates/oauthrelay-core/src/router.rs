@@ -25,13 +25,35 @@ const FLOW_TTL: u64 = 10 * 60;
 const CODE_TTL: u64 = 5 * 60;
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
+const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const ID_TOKEN_CLOCK_SKEW: u64 = 60;
+
+/// HTTP transport for client assertion trust metadata and keys. Redirects are rejected.
+/// The builder permits custom TLS roots without weakening the redirect policy or request deadline.
+pub struct ClientAssertionHttpClient(reqwest::Client);
+
+impl ClientAssertionHttpClient {
+    pub fn new(builder: reqwest::ClientBuilder) -> Result<Self, reqwest::Error> {
+        builder
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map(Self)
+    }
+}
+
+impl Default for ClientAssertionHttpClient {
+    fn default() -> Self {
+        Self::new(reqwest::Client::builder()).expect("default client assertion HTTP client")
+    }
+}
 
 pub struct RelayConfig {
     pub public_url: Url,
     pub sealer: Arc<dyn Sealer>,
     pub replay_cache: Option<Arc<dyn ReplayCache>>,
     pub http: reqwest::Client,
+    pub client_assertion_http: ClientAssertionHttpClient,
     pub allow_localhost_loopback: bool,
 }
 
@@ -50,6 +72,19 @@ struct AppState {
     cfg: Arc<RelayConfig>,
     keys: KeyStrategy,
     cache: Arc<Mutex<HashMap<String, CachedJson>>>,
+    assertion_cache: Arc<ClientAssertionCache>,
+}
+
+#[derive(Default)]
+struct ClientAssertionCache {
+    metadata: Mutex<HashMap<String, CachedJson>>,
+    jwks: Mutex<HashMap<String, Arc<Mutex<CachedClientJwks>>>>,
+}
+
+#[derive(Default)]
+struct CachedClientJwks {
+    current: Option<(std::time::Instant, JwkSet)>,
+    retry_after: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -136,6 +171,7 @@ pub fn router(resolver: Arc<dyn ResourceResolver>, cfg: RelayConfig, keys: KeySt
         cfg: Arc::new(cfg),
         keys,
         cache: Arc::new(Mutex::new(HashMap::new())),
+        assertion_cache: Arc::default(),
     };
     Router::new().route(&route, any(dispatch)).with_state(state)
 }
@@ -1001,7 +1037,14 @@ async fn authenticate(
                 Err(())
             }
         }
-        ClientAuth::PrivateKeyJwt { client_id, jwks } => {
+        ClientAuth::PrivateKeyJwt {
+            require_single_use,
+            client_id,
+            issuer,
+            subject,
+            audience,
+            jwks,
+        } => {
             if form.client_assertion_type.as_deref()
                 != Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
                 || form.client_id.as_deref() != Some(client_id)
@@ -1009,23 +1052,32 @@ async fn authenticate(
                 return Err(());
             }
             let assertion = form.client_assertion.as_deref().ok_or(())?;
-            verify_private_key_jwt(state, relay, client_id, jwks, assertion).await
+            let audience = audience
+                .clone()
+                .unwrap_or_else(|| token_url(&state.cfg.public_url, &relay.key).to_string());
+            verify_private_key_jwt(
+                state,
+                &audience,
+                issuer.as_deref().unwrap_or(client_id),
+                subject.as_deref().unwrap_or(client_id),
+                jwks.as_ref(),
+                assertion,
+                *require_single_use,
+            )
+            .await
         }
     }
 }
 
 async fn verify_private_key_jwt(
     state: &AppState,
-    relay: &Relay,
-    client_id: &str,
-    source: &ClientJwks,
+    audience: &str,
+    issuer: &str,
+    subject: &str,
+    source: Option<&ClientJwks>,
     assertion: &str,
+    require_single_use: bool,
 ) -> Result<(), ()> {
-    let value = match source {
-        ClientJwks::Inline(value) => value.clone(),
-        ClientJwks::Url(url) => cached_json(state, url, JWKS_TTL).await.map_err(|_| ())?,
-    };
-    let set: JwkSet = serde_json::from_value(value).map_err(|_| ())?;
     let header = decode_header(assertion).map_err(|_| ())?;
     if !matches!(
         header.alg,
@@ -1041,11 +1093,46 @@ async fn verify_private_key_jwt(
     ) {
         return Err(());
     }
+    let remote_url = match source {
+        Some(ClientJwks::Inline(_)) => None,
+        Some(ClientJwks::Url(url)) => Some(url.clone()),
+        None => {
+            let url = Url::parse(issuer).map_err(|_| ())?;
+            if !crate::model::valid_discovery_url(&url) {
+                return Err(());
+            }
+            let doc = cached_json_with_client(
+                &state.assertion_cache.metadata,
+                &state.cfg.client_assertion_http.0,
+                &discovery_url(&url),
+                DISCOVERY_TTL,
+            )
+            .await
+            .map_err(|_| ())?;
+            if doc.get("issuer").and_then(Value::as_str) != Some(issuer) {
+                return Err(());
+            }
+            let url = url_field(&doc, "jwks_uri").ok_or(())?;
+            if !crate::model::valid_discovery_url(&url) {
+                return Err(());
+            }
+            Some(url)
+        }
+    };
+    let mut set: JwkSet = match (source, remote_url.as_ref()) {
+        (_, Some(url)) => client_assertion_jwks(state, url, None).await?,
+        (Some(ClientJwks::Inline(value)), None) => {
+            serde_json::from_value(value.clone()).map_err(|_| ())?
+        }
+        _ => return Err(()),
+    };
+    if let (Some(url), Some(kid)) = (remote_url.as_ref(), header.kid.as_deref()) {
+        if set.find(kid).is_none() {
+            set = client_assertion_jwks(state, url, Some(kid)).await?;
+        }
+    }
     let jwk = match header.kid.as_deref() {
-        Some(kid) => set
-            .keys
-            .iter()
-            .find(|key| key.common.key_id.as_deref() == Some(kid)),
+        Some(kid) => set.find(kid),
         None if set.keys.len() == 1 => set.keys.first(),
         _ => None,
     }
@@ -1053,21 +1140,61 @@ async fn verify_private_key_jwt(
     let key = DecodingKey::from_jwk(jwk).map_err(|_| ())?;
     let mut validation = Validation::new(header.alg);
     validation.validate_aud = false;
+    validation.validate_nbf = true;
     let claims = decode::<Value>(assertion, &key, &validation)
         .map_err(|_| ())?
         .claims;
-    if claims.get("iss").and_then(Value::as_str) != Some(client_id)
-        || claims.get("sub").and_then(Value::as_str) != Some(client_id)
+    if claims.get("iss").and_then(Value::as_str) != Some(issuer)
+        || claims.get("sub").and_then(Value::as_str) != Some(subject)
     {
         return Err(());
     }
-    let audience = token_url(&state.cfg.public_url, &relay.key).to_string();
+    for name in ["iat", "nbf"] {
+        if let Some(time) = claims.get(name) {
+            if time.as_u64().ok_or(())? > unix_now().saturating_add(validation.leeway) {
+                return Err(());
+            }
+        }
+    }
     let aud_ok = claims.get("aud").is_some_and(|aud| match aud {
-        Value::String(value) => value == &audience,
-        Value::Array(values) => values.iter().any(|value| value.as_str() == Some(&audience)),
+        Value::String(value) => value == audience,
+        Value::Array(values) => values.iter().any(|value| value.as_str() == Some(audience)),
         _ => false,
     });
-    aud_ok.then_some(()).ok_or(())
+    if !aud_ok {
+        return Err(());
+    }
+    if require_single_use {
+        let issued_at = claims.get("iat").and_then(Value::as_u64).ok_or(())?;
+        let expires_at = claims.get("exp").and_then(Value::as_u64).ok_or(())?;
+        let jti = claims
+            .get("jti")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(())?;
+        if expires_at <= issued_at || expires_at - issued_at > 300 {
+            return Err(());
+        }
+        let cache = state.cfg.replay_cache.as_ref().ok_or(())?;
+        let identity = serde_json::to_vec(&(issuer, subject, audience, jti)).map_err(|_| ())?;
+        let id = format!(
+            "client-assertion:{}",
+            URL_SAFE_NO_PAD.encode(Sha256::digest(identity))
+        );
+        // Retain through the entire acceptance window, including expiration clock skew.
+        let ttl = expires_at
+            .saturating_add(validation.leeway)
+            .saturating_sub(unix_now())
+            .saturating_add(1);
+        if !cache
+            .first_use(&id, Duration::from_secs(ttl))
+            .await
+            .map_err(|_| ())?
+        {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Response {
@@ -1187,19 +1314,77 @@ fn url_field(doc: &Value, name: &str) -> Option<Url> {
         .and_then(|value| Url::parse(value).ok())
 }
 
+/// Serialize fetches per JWKS URL and throttle forced refreshes and failed fetch retries.
+async fn client_assertion_jwks(
+    state: &AppState,
+    url: &Url,
+    missing_kid: Option<&str>,
+) -> Result<JwkSet, ()> {
+    let entry = state
+        .assertion_cache
+        .jwks
+        .lock()
+        .await
+        .entry(url.to_string())
+        .or_default()
+        .clone();
+    let mut entry = entry.lock().await;
+    let current = entry
+        .current
+        .as_ref()
+        .filter(|(fetched, _)| fetched.elapsed() < JWKS_TTL);
+    if let Some((_, set)) = current {
+        if missing_kid.is_none_or(|kid| set.find(kid).is_some()) {
+            return Ok(set.clone());
+        }
+    }
+    if entry
+        .retry_after
+        .is_some_and(|deadline| deadline > std::time::Instant::now())
+    {
+        return current.map(|(_, set)| set.clone()).ok_or(());
+    }
+    let forced = current.is_some();
+    entry.retry_after = Some(std::time::Instant::now() + JWKS_REFRESH_COOLDOWN);
+    let response = state
+        .cfg
+        .client_assertion_http
+        .0
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if !response.status().is_success() {
+        return Err(());
+    }
+    let set: JwkSet = response.json().await.map_err(|_| ())?;
+    entry.current = Some((std::time::Instant::now(), set.clone()));
+    if !forced {
+        entry.retry_after = None;
+    }
+    Ok(set)
+}
+
 async fn cached_json(state: &AppState, url: &Url, ttl: Duration) -> Result<Value, StatusCode> {
+    cached_json_with_client(&state.cache, &state.cfg.http, url, ttl).await
+}
+
+async fn cached_json_with_client(
+    cache: &Mutex<HashMap<String, CachedJson>>,
+    http: &reqwest::Client,
+    url: &Url,
+    ttl: Duration,
+) -> Result<Value, StatusCode> {
     let key = url.to_string();
     {
-        let cache = state.cache.lock().await;
+        let cache = cache.lock().await;
         if let Some(entry) = cache.get(&key) {
             if entry.fetched.elapsed() < ttl {
                 return Ok(entry.value.clone());
             }
         }
     }
-    let response = state
-        .cfg
-        .http
+    let response = http
         .get(url.clone())
         .send()
         .await
@@ -1208,7 +1393,7 @@ async fn cached_json(state: &AppState, url: &Url, ttl: Duration) -> Result<Value
         return Err(StatusCode::BAD_GATEWAY);
     }
     let value: Value = response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    state.cache.lock().await.insert(
+    cache.lock().await.insert(
         key,
         CachedJson {
             fetched: std::time::Instant::now(),

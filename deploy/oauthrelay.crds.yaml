@@ -429,16 +429,28 @@ spec:
                   - allOf:
                     - not:
                         required:
+                        - audience
+                    - not:
+                        required:
                         - clientId
                     - not:
                         required:
                         - clientSecret
                     - not:
                         required:
+                        - issuer
+                    - not:
+                        required:
                         - jwks
                     - not:
                         required:
                         - jwksUrl
+                    - not:
+                        required:
+                        - requireSingleUse
+                    - not:
+                        required:
+                        - subject
                     properties:
                       type:
                         enum:
@@ -449,16 +461,28 @@ spec:
                   - allOf:
                     - not:
                         required:
+                        - audience
+                    - not:
+                        required:
                         - clientId
                     - not:
                         required:
                         - clientSecret
                     - not:
                         required:
+                        - issuer
+                    - not:
+                        required:
                         - jwks
                     - not:
                         required:
                         - jwksUrl
+                    - not:
+                        required:
+                        - requireSingleUse
+                    - not:
+                        required:
+                        - subject
                     properties:
                       type:
                         enum:
@@ -469,10 +493,22 @@ spec:
                   - allOf:
                     - not:
                         required:
+                        - audience
+                    - not:
+                        required:
+                        - issuer
+                    - not:
+                        required:
                         - jwks
                     - not:
                         required:
                         - jwksUrl
+                    - not:
+                        required:
+                        - requireSingleUse
+                    - not:
+                        required:
+                        - subject
                     properties:
                       clientId: {}
                       clientSecret:
@@ -797,12 +833,30 @@ spec:
                         required:
                         - clientSecret
                     oneOf:
-                    - required:
+                    - not:
+                        required:
+                        - jwksUrl
+                      required:
                       - jwks
-                    - required:
+                    - not:
+                        required:
+                        - jwks
+                      required:
                       - jwksUrl
+                    - not:
+                        anyOf:
+                        - required:
+                          - jwks
+                        - required:
+                          - jwksUrl
+                      required:
+                      - issuer
                     properties:
+                      audience:
+                        minLength: 1
                       clientId: {}
+                      issuer:
+                        minLength: 1
                       jwks:
                         properties:
                           keys:
@@ -899,6 +953,9 @@ spec:
                         required:
                         - keys
                       jwksUrl: {}
+                      requireSingleUse: {}
+                      subject:
+                        minLength: 1
                       type:
                         enum:
                         - PrivateKeyJwt
@@ -906,6 +963,10 @@ spec:
                     - clientId
                     - type
                 properties:
+                  audience:
+                    description: Exact required assertion audience; defaults to the relay token endpoint URL.
+                    minLength: 1
+                    type: string
                   clientId:
                     description: Relay-specific downstream client identifier.
                     type: string
@@ -1244,8 +1305,16 @@ spec:
                             type: object
                         type: object
                     type: object
+                  issuer:
+                    description: |-
+                      Exact assertion issuer. HTTPS URL (HTTP allowed on loopback); defaults to clientId.
+                      Supplies OIDC discovery when neither jwks nor jwksUrl is configured.
+                    minLength: 1
+                    type: string
                   jwks:
-                    description: Inline public keys. Exactly one of jwks and jwksUrl is required.
+                    description: >-
+                      Inline public keys. Mutually exclusive with jwksUrl; omit both to discover from
+                      issuer.
                     properties:
                       keys:
                         items:
@@ -1369,7 +1438,20 @@ spec:
                     - keys
                     type: object
                   jwksUrl:
-                    description: Absolute HTTP(S) JWKS URL. Exactly one of jwks and jwksUrl is required.
+                    description: >-
+                      Absolute HTTP(S) JWKS URL. Mutually exclusive with jwks; omit both to discover
+                      from issuer.
+                    type: string
+                  requireSingleUse:
+                    description: |-
+                      Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.
+                      Requires a replay cache shared by all serving instances; false permits reusable workload JWTs.
+                    type: boolean
+                  subject:
+                    description: >-
+                      Exact assertion subject, such as system:serviceaccount:namespace:name; defaults
+                      to clientId.
+                    minLength: 1
                     type: string
                   type:
                     type: string
