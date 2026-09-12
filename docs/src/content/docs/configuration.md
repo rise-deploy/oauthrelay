@@ -182,8 +182,8 @@ clientAuthentication:
 
 ### PrivateKeyJwt
 
-The relying party sends an RFC 7523 client assertion. `jwks` is either an HTTPS URL or an inline
-JWKS object with a non-empty `keys` array. The assertion issuer and subject must equal `clientId`,
+The relying party sends an RFC 7523 client assertion. Configure exactly one of `jwksUrl` (an
+absolute HTTP(S) URL) or `jwks` (an inline public JWKS object with a non-empty `keys` array). The assertion issuer and subject must equal `clientId`,
 and its audience must equal the relay token endpoint.
 
 ```yaml
@@ -199,6 +199,18 @@ clientAuthentication:
         n: base64url-modulus
         e: AQAB
 ```
+
+For remote keys, use:
+
+```yaml
+clientAuthentication:
+  type: PrivateKeyJwt
+  clientId: relying-party
+  jwksUrl: https://app.example.com/.well-known/jwks.json
+```
+
+Inline keys use typed RSA (`n`, `e`), EC (`crv`, `x`, `y`, with P-256 or P-384), or OKP
+(`crv: Ed25519`, `x`) public key material and standard optional JWK metadata.
 
 ## Secret values
 
@@ -244,9 +256,10 @@ Resource discovery and secret resolution are separate concerns:
 | --- | --- |
 | [File](/oauthrelay/reference/file-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
 | [AWS SSM](/oauthrelay/reference/ssm-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
+| [Kubernetes](/oauthrelay/reference/kubernetes-provider/) | All sources above and `valueFrom.secretKeyRef: { name, key }` |
 
-Both providers use the same resolver implementation. Relative `file.path` values resolve from a
-File provider resource document's directory. SSM resource documents have no filesystem base, so
+All providers use the same resolver implementation. Relative `file.path` values resolve from a
+File provider resource document's directory. SSM and Kubernetes resource documents have no filesystem base, so
 their `file.path` values must be absolute. AWS-prefixed sources require AWS resolution in the
 embedding; the standalone binary includes it through the default `aws` feature.
 
@@ -265,3 +278,11 @@ The schema describes one resource document; a File provider configuration is a Y
 those documents. The published [oauthrelay JSON Schema](/oauthrelay/oauthrelay.schema.json) includes
 field descriptions, strict unions, and the exact API version. CI checks that it remains synchronized
 with the Rust types.
+
+
+## Kubernetes namespaces
+
+Resources accept optional `metadata.namespace`. File and SSM ignore it. The Kubernetes provider
+consumes one configured namespace and resolves upstream and Secret references within it. See the
+[Kubernetes provider reference](/oauthrelay/reference/kubernetes-provider/) for installation,
+CRD generation, watches, and RBAC.

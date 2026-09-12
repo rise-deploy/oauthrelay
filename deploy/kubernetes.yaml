@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oauthrelay
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oauthrelay
+  namespace: oauthrelay
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oauthrelay
+  namespace: oauthrelay
+rules:
+  - apiGroups: [oauthrelay.dev]
+    resources: [upstreams, relays]
+    verbs: [list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oauthrelay
+  namespace: oauthrelay
+subjects:
+  - kind: ServiceAccount
+    name: oauthrelay
+    namespace: oauthrelay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oauthrelay
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauthrelay
+  namespace: oauthrelay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauthrelay
+  template:
+    metadata:
+      labels:
+        app: oauthrelay
+    spec:
+      serviceAccountName: oauthrelay
+      containers:
+        - name: oauthrelay
+          image: ghcr.io/rise-deploy/oauthrelay:sha-REPLACE_WITH_BUILD_SHA
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: OAUTHRELAY_PROVIDER_KUBERNETES
+              value: "true"
+            - name: OAUTHRELAY_PUBLIC_URL
+              value: https://auth.example.com
+            - name: OAUTHRELAY_SEAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oauthrelay-runtime
+                  key: seal-key
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauthrelay
+  namespace: oauthrelay
+spec:
+  selector:
+    app: oauthrelay
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

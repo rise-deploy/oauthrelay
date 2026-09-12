@@ -70,6 +70,7 @@ jobs:
       - name: Test workspace and documentation examples
         run: cargo test --workspace --all-features
       - run: mise run schema:check
+      - run: mise run crds:check
 
   e2e:
     if: github.event.action != 'labeled' || github.event.label.name == 'preview'
@@ -81,6 +82,21 @@ jobs:
         with:
           max-cache-size-mb: "10240"
       - run: mise run e2e
+
+  kubernetes:
+    if: github.event.action != 'labeled' || github.event.label.name == 'preview'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - name: Mount Cargo build cache
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: cargo-target-kubernetes-rust-1-97-1-${{ runner.arch }}
+          path: target
+      - run: mise run crds:check
+      - run: mise run kubernetes:test
 
   image:
     if: github.event.action != 'labeled' || github.event.label.name == 'preview'

@@ -35,6 +35,7 @@ configuration; Amazon Cognito is one example.
 - Transparent authorization, token, refresh, discovery metadata, and JWKS routing.
 - Relay-specific exact matching of verified upstream ID-token claims.
 - Multi-document File configuration with local or AWS-backed secret references.
+- Namespaced Kubernetes custom resources, live watches, and Kubernetes Secret references.
 - AWS SSM resource discovery with SSM `SecureString` and Secrets Manager `jsonKey` references.
 - Invocation-driven Lambda configuration refresh with a 60-second default TTL.
 - Multi-architecture images at `ghcr.io/rise-deploy/oauthrelay`.
@@ -46,6 +47,7 @@ configuration; Amazon Cognito is one example.
 - [Cognito relay to Google](https://rise-deploy.github.io/oauthrelay/guides/cognito-google-relay/)
 - [Configuration reference](https://rise-deploy.github.io/oauthrelay/configuration/)
 - [File provider](https://rise-deploy.github.io/oauthrelay/reference/file-provider/)
+- [Kubernetes provider](https://rise-deploy.github.io/oauthrelay/reference/kubernetes-provider/)
 - [AWS SSM provider](https://rise-deploy.github.io/oauthrelay/reference/ssm-provider/)
 - [Runtime and deployment](https://rise-deploy.github.io/oauthrelay/reference/runtime/)
 - [HTTP endpoints](https://rise-deploy.github.io/oauthrelay/reference/http-endpoints/)
@@ -54,6 +56,7 @@ The executable publishes its configuration contract directly:
 
 ```console
 oauthrelay schema > oauthrelay.schema.json
+oauthrelay crds > deploy/oauthrelay.crds.yaml
 ```
 
 ## Development
@@ -64,6 +67,7 @@ oauthrelay schema > oauthrelay.schema.json
 mise install
 mise run check
 mise run e2e
+mise run kubernetes:test
 ```
 
 Serve the documentation locally with:
@@ -74,7 +78,8 @@ mise run docs:serve
 
 The regular test suite uses in-process OAuth/OIDC fixtures. `mise run e2e` runs the standalone
 binary through a complete authorization-code and refresh flow against a pinned Dex container. No
-test contacts Google or Amazon Cognito.
+test contacts Google or Amazon Cognito. `mise run kubernetes:test` validates generated CRDs and
+namespace-scoped configuration watches in a disposable Kind cluster.
 
 The workspace contains:
 
@@ -83,6 +88,7 @@ crates/oauthrelay-core/          protocol engine and embeddable router
 crates/oauthrelay-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
 crates/oauthrelay-provider-file/ File configuration provider
 crates/oauthrelay-provider-ssm/  AWS SSM and Secrets Manager provider
+crates/oauthrelay-provider-kubernetes/ Namespaced Kubernetes provider
 crates/oauthrelay/               standalone native and Lambda runtime
 ```
 

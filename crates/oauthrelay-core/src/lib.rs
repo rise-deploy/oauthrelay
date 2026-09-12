@@ -19,12 +19,14 @@
 //! ```
 
 mod config;
+mod jwks;
 mod model;
 mod resolver;
 mod router;
 mod seal;
 
 pub use config::*;
+pub use jwks::*;
 pub use model::*;
 pub use resolver::*;
 pub use router::*;

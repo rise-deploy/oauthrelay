@@ -21,6 +21,7 @@ crates/
   oauthrelay-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
   oauthrelay-provider-file/ multi-document YAML provider and composable secret resolution
   oauthrelay-provider-ssm/  SSM resource discovery and AWS secret backend
+  oauthrelay-provider-kubernetes/ Namespaced CR discovery and Kubernetes Secret backend
   oauthrelay/               provider wiring, native server, Lambda runtime, schema CLI
 ```
 
@@ -152,6 +153,27 @@ Unknown fields, kinds, API versions, duplicate identities, invalid URLs, invalid
 scope tokens, and dangling references reject the candidate snapshot.
 
 `oauthrelay schema` prints a JSON Schema generated from the Rust configuration types.
+
+`oauthrelay crds` prints the namespaced Upstream and Relay CRDs generated from shared Rust
+configuration types with structural schema validation. The generated bundle is committed at
+`deploy/oauthrelay.crds.yaml`, and CI checks it with `mise run crds:check`.
+
+`metadata.namespace` is optional in File/SSM documents and ignored by those providers. PrivateKeyJwt config requires exactly one of
+`jwksUrl` or typed inline `jwks`.
+
+## Kubernetes provider
+
+`OAUTHRELAY_PROVIDER_KUBERNETES=true` enables discovery within one namespace. The namespace comes
+from `OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE`, the pod namespace, or the local kubeconfig context.
+References remain local to that namespace and public URL keys remain name-only. Runtime RBAC is
+read-only and namespaced; CRD installation is an explicit deployment operation.
+
+CR and Secret metadata watches trigger complete validated snapshot publication. Initial lists
+and relists are staged until complete; watches reconnect with backoff. Referenced Secret values
+are fetched on compilation. All standard secret sources are available, plus
+`valueFrom.secretKeyRef: { name, key }`. Periodic refresh defaults to 60 seconds through
+`OAUTHRELAY_PROVIDER_KUBERNETES_REFRESH`. Initial synchronization has a 60-second deadline;
+subsequent errors retain the last valid snapshot. Provider precedence is File, SSM, Kubernetes.
 
 ## Secret sources
 

@@ -107,6 +107,15 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&resource_schema())?);
         return Ok(());
     }
+    if env::args().nth(1).as_deref() == Some("crds") {
+        #[cfg(feature = "kubernetes")]
+        {
+            print!("{}", oauthrelay_provider_kubernetes::crds_yaml()?);
+            return Ok(());
+        }
+        #[cfg(not(feature = "kubernetes"))]
+        return Err(anyhow!("crds requires the oauthrelay kubernetes feature"));
+    }
     init_tracing();
     let public_url = required_url("OAUTHRELAY_PUBLIC_URL")?;
     let current = seal_key("OAUTHRELAY_SEAL_KEY", true)?.expect("required key");
@@ -115,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     let providers = configured_providers().await?;
     if providers.is_empty() {
         return Err(anyhow!(
-            "at least one provider is required; set OAUTHRELAY_PROVIDER_FILE or OAUTHRELAY_PROVIDER_SSM_PREFIX"
+            "at least one provider is required; set OAUTHRELAY_PROVIDER_FILE, OAUTHRELAY_PROVIDER_SSM_PREFIX, or OAUTHRELAY_PROVIDER_KUBERNETES=true"
         ));
     }
     let registry = Arc::new(Registry::default());
@@ -227,6 +236,42 @@ async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> 
     if ssm_prefix.is_some() {
         return Err(anyhow!(
             "OAUTHRELAY_PROVIDER_SSM_PREFIX requires the oauthrelay aws feature"
+        ));
+    }
+    if bool_env("OAUTHRELAY_PROVIDER_KUBERNETES", false)? {
+        #[cfg(feature = "kubernetes")]
+        {
+            use oauthrelay_provider_kubernetes::{
+                select_namespace, KubernetesProvider, DEFAULT_REFRESH_INTERVAL,
+            };
+            let config = if env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+                kube::Config::incluster().context("load in-cluster Kubernetes credentials")?
+            } else {
+                kube::Config::from_kubeconfig(&Default::default())
+                    .await
+                    .context("load Kubernetes kubeconfig")?
+            };
+            let namespace = select_namespace(
+                env::var("OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE")
+                    .ok()
+                    .as_deref(),
+                &config.default_namespace,
+            )?;
+            let provider = KubernetesProvider::new(
+                kube::Client::try_from(config)?,
+                namespace,
+                duration_env(
+                    "OAUTHRELAY_PROVIDER_KUBERNETES_REFRESH",
+                    DEFAULT_REFRESH_INTERVAL,
+                )?,
+            )?;
+            #[cfg(feature = "aws")]
+            let provider = provider.with_aws_secrets(Arc::new(LazyAwsSecretResolver::default()));
+            providers.push(Arc::new(provider));
+        }
+        #[cfg(not(feature = "kubernetes"))]
+        return Err(anyhow!(
+            "OAUTHRELAY_PROVIDER_KUBERNETES requires the oauthrelay kubernetes feature"
         ));
     }
     Ok(providers)

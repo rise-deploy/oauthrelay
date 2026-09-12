@@ -335,8 +335,10 @@ impl<C: SsmClient, S: SecretsManagerClient> SecretResolver for AwsSecretResolver
                         })?,
                 }
             }
-            SecretSource::Env { .. } | SecretSource::File { .. } => {
-                return Err(anyhow!("local values are not AWS secret sources"))
+            SecretSource::Env { .. }
+            | SecretSource::File { .. }
+            | SecretSource::SecretKeyRef { .. } => {
+                return Err(anyhow!("source is not an AWS secret source"))
             }
         };
         Ok(SecretString::new(value))

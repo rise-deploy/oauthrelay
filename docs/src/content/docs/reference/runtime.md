@@ -6,6 +6,10 @@ description: Configure oauthrelay native, container, and AWS Lambda execution.
 The `oauthrelay` executable uses the same Axum router in native server and AWS Lambda modes. It loads
 every configured provider before serving traffic.
 
+The default build includes the `kubernetes` feature. Set `OAUTHRELAY_PROVIDER_KUBERNETES=true`
+to consume namespaced custom resources; see the [Kubernetes provider](/oauthrelay/reference/kubernetes-provider/)
+for namespace selection, refresh settings, CRD installation, and deployment examples.
+
 ## Environment variables
 
 | Variable | Required | Default | Meaning |
@@ -18,24 +22,27 @@ every configured provider before serving traffic.
 | `OAUTHRELAY_PROVIDER_FILE_POLL` | no | `30s` | File and referenced-secret reload interval. |
 | `OAUTHRELAY_PROVIDER_SSM_PREFIX` | one provider required | disabled | Absolute SSM root ending in `/`. |
 | `OAUTHRELAY_PROVIDER_SSM_POLL` | no | `60s` | Native SSM reload interval. |
+| `OAUTHRELAY_PROVIDER_KUBERNETES` | one provider required | `false` | Enable namespaced Kubernetes CR discovery. |
+| `OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE` | no | pod or kubeconfig namespace | Single namespace consumed by the Kubernetes provider. |
+| `OAUTHRELAY_PROVIDER_KUBERNETES_REFRESH` | no | `60s` | Secret refresh and failed-compilation retry interval. |
 | `OAUTHRELAY_LAMBDA_CONFIG_TTL` | no | `60s` | Maximum Lambda snapshot age before invocation-driven refresh. |
 | `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` | no | `false` | Treat `localhost` as an alias for configured IP-literal loopback redirect matchers. |
 | `OAUTHRELAY_LOG` | no | `info` | `tracing` filter. |
 
 Durations require an explicit unit such as `30s`, `5m`, or `1h` and must be greater than zero.
 The localhost compatibility value must be `true` or `false`.
-When both providers are enabled, File is evaluated before SSM for collision precedence.
+Provider collision precedence is File, SSM, then Kubernetes.
 
 ## Build features
 
-The standalone crate enables `aws` and `lambda` by default. `aws` supplies SSM resource discovery
-and AWS secret resolution for both File and SSM providers. A native File-only build without AWS
+The standalone crate enables `aws`, `lambda`, and `kubernetes` by default. `aws` supplies SSM resource
+discovery and AWS secret resolution for all providers. A native File-only build without AWS
 SDK dependencies uses `--no-default-features`; in that build, File resources can use inline,
 environment, and file secrets, while AWS secret references fail configuration validation.
 
 ## Native server
 
-Native mode binds `OAUTHRELAY_LISTEN`, reloads providers on their polling intervals, and shuts down
+Native mode binds `OAUTHRELAY_LISTEN`, runs provider watches and periodic refreshes, and shuts down
 on SIGTERM or SIGINT. It exposes:
 
 - `GET /healthz` for process liveness.
