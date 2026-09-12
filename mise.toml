@@ -2,6 +2,8 @@
 actionlint = "1.7.12"
 aws-cli = "2.36.24"
 docker-cli = "29.7.2"
+kind = "0.33.0"
+kubectl = "1.35.0"
 node = "24.19.0"
 rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 shellcheck = "0.11.0"
@@ -15,6 +17,7 @@ run = [
   "mise run features:check",
   "cargo test --workspace --all-features",
   "mise run schema:check",
+  "mise run crds:check",
   "mise run scripts:test",
   "mise run docs",
 ]
@@ -38,6 +41,9 @@ run = [
   "cargo check -p oauthrelay --no-default-features",
   "cargo check -p oauthrelay --no-default-features --features aws",
   "cargo check -p oauthrelay --no-default-features --features lambda",
+  "cargo check -p oauthrelay --no-default-features --features kubernetes",
+  "cargo check -p oauthrelay --no-default-features --features kubernetes,aws",
+  "cargo check -p oauthrelay --no-default-features --features kubernetes,lambda",
 ]
 
 [tasks."docs:serve"]
@@ -56,3 +62,15 @@ run = "node scripts/aws-google-relay-e2e.mjs"
 [tasks."scripts:test"]
 description = "Run orchestration script tests"
 run = "node --test scripts/*.test.mjs"
+
+[tasks.crds]
+description = "Generate the Kubernetes CRDs from Rust types"
+run = "cargo run -q -p oauthrelay --no-default-features --features kubernetes -- crds > docs/public/oauthrelay.crds.yaml"
+
+[tasks."crds:check"]
+description = "Check the generated Kubernetes CRDs"
+run = "cargo run -q -p oauthrelay --no-default-features --features kubernetes -- crds | diff -u docs/public/oauthrelay.crds.yaml -"
+
+[tasks."kubernetes:test"]
+description = "Validate CRDs and provider behavior in a disposable Kind cluster"
+run = "python3 tests/kubernetes/run.py"

@@ -27,6 +27,7 @@ pub struct StandardSecretResolver {
     base_directory: Option<PathBuf>,
     local: Arc<dyn LocalSecrets>,
     aws: Option<Arc<dyn SecretResolver>>,
+    kubernetes: Option<Arc<dyn SecretResolver>>,
 }
 
 impl StandardSecretResolver {
@@ -36,12 +37,19 @@ impl StandardSecretResolver {
             base_directory,
             local: Arc::new(SystemLocalSecrets),
             aws: None,
+            kubernetes: None,
         }
     }
 
     /// Supplies environment and filesystem access.
     pub fn with_local_secrets(mut self, local: Arc<dyn LocalSecrets>) -> Self {
         self.local = local;
+        self
+    }
+
+    /// Supplies namespace-scoped Kubernetes Secret resolution.
+    pub fn with_kubernetes_secrets(mut self, resolver: Arc<dyn SecretResolver>) -> Self {
+        self.kubernetes = Some(resolver);
         self
     }
 
@@ -60,6 +68,14 @@ impl SecretResolver for StandardSecretResolver {
 
     async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString> {
         let value = match source {
+            SecretSource::SecretKeyRef { .. } => {
+                return self
+                    .kubernetes
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Kubernetes secret resolution is not configured"))?
+                    .resolve_source(source)
+                    .await;
+            }
             SecretSource::Env { name } => self.local.environment(name)?,
             SecretSource::File { path } => {
                 let path = PathBuf::from(path);

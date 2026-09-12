@@ -36,6 +36,7 @@ export default defineConfig({
             { label: 'Configuration', slug: 'configuration' },
             { label: 'File provider', slug: 'reference/file-provider' },
             { label: 'AWS SSM provider', slug: 'reference/ssm-provider' },
+            { label: 'Kubernetes provider', slug: 'reference/kubernetes-provider' },
             { label: 'Runtime and deployment', slug: 'reference/runtime' },
             { label: 'HTTP endpoints', slug: 'reference/http-endpoints' },
           ],

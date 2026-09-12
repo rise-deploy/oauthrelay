@@ -8,7 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["aws", "lambda"]
+default = ["aws", "lambda", "kubernetes"]
+kubernetes = ["dep:kube", "dep:oauthrelay-provider-kubernetes"]
 aws = [
   "dep:async-trait",
   "dep:aws-config",
@@ -20,6 +21,8 @@ aws = [
 lambda = ["dep:lambda_http"]
 
 [dependencies]
+kube = { workspace = true, optional = true }
+oauthrelay-provider-kubernetes = { path = "../oauthrelay-provider-kubernetes", optional = true }
 anyhow.workspace = true
 async-trait = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }

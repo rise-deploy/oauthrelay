@@ -1,11 +1,11 @@
 use crate::{
-    ClientAuth, ClientJwks, ProviderSnapshot, RedirectMatcher, Relay, ResourceKey, SecretString,
-    Upstream,
+    ClientAuth, ClientJwks, ProviderSnapshot, PublicJwkSet, RedirectMatcher, Relay, ResourceKey,
+    SecretString, Upstream,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -17,7 +17,7 @@ pub fn resource_schema() -> schemars::Schema {
     schemars::schema_for!(ResourceDocument)
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind")]
 /// A versioned oauthrelay configuration resource.
 pub enum ResourceDocument {
@@ -43,7 +43,7 @@ impl ResourceDocument {
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// An external OAuth/OIDC provider connection.
 pub struct UpstreamResource {
@@ -56,7 +56,7 @@ pub struct UpstreamResource {
     pub spec: UpstreamResourceSpec,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// A transparent relay that applies downstream policy to one upstream.
 pub struct RelayResource {
@@ -69,7 +69,7 @@ pub struct RelayResource {
     pub spec: RelayResourceSpec,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 /// Supported configuration API versions.
 pub enum ApiVersion {
     /// Initial upstream and relay resource API.
@@ -77,15 +77,18 @@ pub enum ApiVersion {
     V1Alpha1,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Common resource identity fields.
 pub struct Metadata {
+    /// Kubernetes namespace; ignored by File and SSM resource discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`.
     pub name: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// External issuer, optional explicit endpoints, and provider OAuth client.
 pub struct UpstreamResourceSpec {
@@ -98,7 +101,7 @@ pub struct UpstreamResourceSpec {
     pub oauth_client: OAuthClient,
 }
 
-#[derive(Default, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Optional explicit provider endpoints.
 pub struct UpstreamEndpoints {
@@ -113,7 +116,7 @@ pub struct UpstreamEndpoints {
     pub jwks: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// OAuth client registered with the external provider.
 pub struct OAuthClient {
@@ -123,7 +126,7 @@ pub struct OAuthClient {
     pub client_secret: SecretValue,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Transparent-relay policy and upstream reference.
 pub struct RelayResourceSpec {
@@ -142,7 +145,7 @@ pub struct RelayResourceSpec {
     pub redirect_policy: Vec<RedirectPolicyEntry>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Reference to another resource of the expected kind.
 pub struct ResourceReference {
@@ -150,7 +153,7 @@ pub struct ResourceReference {
     pub name: String,
 }
 
-#[derive(Default, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Scopes applied to upstream authorization and refresh requests.
 pub struct ScopePolicy {
@@ -162,7 +165,7 @@ pub struct ScopePolicy {
     pub allowed: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 /// One explicit application redirect matcher.
 pub enum RedirectPolicyEntry {
@@ -174,7 +177,7 @@ pub enum RedirectPolicyEntry {
     Loopback(LoopbackRedirectPolicy),
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Exact redirect URI matcher.
 pub struct UriRedirectPolicy {
@@ -182,7 +185,7 @@ pub struct UriRedirectPolicy {
     uri: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// HTTPS origin matcher.
 pub struct OriginRedirectPolicy {
@@ -190,7 +193,7 @@ pub struct OriginRedirectPolicy {
     origin: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Variable-port loopback matcher.
 pub struct LoopbackRedirectPolicy {
@@ -198,8 +201,9 @@ pub struct LoopbackRedirectPolicy {
     loopback: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type", deny_unknown_fields)]
+#[schemars(transform = require_jwks_source)]
 /// Authentication accepted from a relying party at the relay token endpoint.
 pub enum ClientAuthentication {
     /// Require the referenced upstream's OAuth client ID and secret.
@@ -220,12 +224,37 @@ pub enum ClientAuthentication {
         /// Client identifier required as assertion issuer and subject.
         #[serde(rename = "clientId")]
         client_id: String,
-        /// Inline JWKS object or absolute HTTP(S) JWKS URL.
-        jwks: serde_json::Value,
+        /// Inline public keys. Exactly one of jwks and jwksUrl is required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "PublicJwkSet")]
+        jwks: Option<PublicJwkSet>,
+        /// Absolute HTTP(S) JWKS URL. Exactly one of jwks and jwksUrl is required.
+        #[serde(default, rename = "jwksUrl", skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String")]
+        jwks_url: Option<String>,
     },
 }
 
-#[derive(Deserialize, JsonSchema)]
+/// Schema alternatives enforce the same exclusive JWKS source as compilation.
+fn require_jwks_source(schema: &mut schemars::Schema) {
+    if let Some(variants) = schema
+        .get_mut("oneOf")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for variant in variants {
+            if variant
+                .get("properties")
+                .and_then(|p| p.get("jwksUrl"))
+                .is_some()
+            {
+                variant["oneOf"] =
+                    serde_json::json!([{"required":["jwks"]}, {"required":["jwksUrl"]}]);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 /// A secret supplied either inline or through exactly one external source.
 pub enum SecretValue {
@@ -235,20 +264,26 @@ pub enum SecretValue {
     ValueFrom(ReferencedSecret),
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-/// Inline secret representation supported by the File provider.
+/// Literal secret representation.
 pub struct InlineSecret {
     /// Literal secret value.
     value: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// External secret reference.
 pub struct ReferencedSecret {
     /// Exactly one provider-specific secret source.
     value_from: SecretSource,
+}
+
+impl std::fmt::Debug for InlineSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InlineSecret([REDACTED])")
+    }
 }
 
 impl SecretValue {
@@ -267,26 +302,33 @@ impl SecretValue {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// Secret sources understood by the File and AWS SSM providers.
+/// Secret sources resolved by configured provider backends.
 pub enum SecretSource {
-    /// Environment variable resolved by the File provider.
+    /// Environment variable in the oauthrelay process.
     Env {
         /// Environment variable name.
         name: String,
     },
-    /// Local file resolved by the File provider.
+    /// Local file accessible to the oauthrelay process.
     File {
         /// Absolute path or path relative to the resource file.
         path: String,
     },
-    /// Exact SSM SecureString parameter resolved by the AWS SSM provider.
+    /// Exact AWS SSM SecureString parameter.
     AwsSsmParameter {
         /// Absolute SSM parameter name.
         name: String,
     },
-    /// AWS Secrets Manager SecretString resolved by the AWS SSM provider.
+    /// Secret key resolved within the Kubernetes provider namespace.
+    SecretKeyRef {
+        /// Secret resource name.
+        name: String,
+        /// Key in the Secret data map.
+        key: String,
+    },
+    /// AWS Secrets Manager SecretString.
     AwsSecretsManager {
         /// Secret name or ARN passed to Secrets Manager GetSecretValue.
         #[serde(rename = "secretId")]
@@ -372,13 +414,22 @@ pub async fn compile_resources(
                         format!("Relay/{key} spec.clientAuthentication.clientSecret")
                     })?,
             },
-            ClientAuthentication::PrivateKeyJwt { client_id, jwks } => ClientAuth::PrivateKeyJwt {
+            ClientAuthentication::PrivateKeyJwt {
                 client_id,
-                jwks: match jwks {
-                    serde_json::Value::String(value) => ClientJwks::Url(
-                        Url::parse(&value).context("spec.clientAuthentication.jwks URL")?,
+                jwks,
+                jwks_url,
+            } => ClientAuth::PrivateKeyJwt {
+                client_id,
+                jwks: match (jwks, jwks_url) {
+                    (None, Some(value)) => ClientJwks::Url(
+                        Url::parse(&value).context("spec.clientAuthentication.jwksUrl")?,
                     ),
-                    value => ClientJwks::Inline(value),
+                    (Some(jwks), None) => ClientJwks::Inline(serde_json::to_value(jwks)?),
+                    _ => {
+                        return Err(anyhow!(
+                            "Relay/{key}: PrivateKeyJwt requires exactly one of jwks and jwksUrl"
+                        ))
+                    }
                 },
             },
         };
@@ -484,6 +535,7 @@ mod tests {
             ResourceDocument::Upstream(UpstreamResource {
                 api_version: ApiVersion::V1Alpha1,
                 metadata: Metadata {
+                    namespace: None,
                     name: "google".into(),
                 },
                 spec: UpstreamResourceSpec {
@@ -498,6 +550,7 @@ mod tests {
             ResourceDocument::Relay(RelayResource {
                 api_version: ApiVersion::V1Alpha1,
                 metadata: Metadata {
+                    namespace: None,
                     name: "cognito".into(),
                 },
                 spec: RelayResourceSpec {
@@ -672,5 +725,101 @@ mod tests {
             r#"{"secretsManager":{"secretId":"oauthrelay/google"}}"#
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn compilation_requires_one_jwks_source_and_ignores_namespace_identity() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        for auth in [
+            serde_json::json!({"type":"PrivateKeyJwt","clientId":"app"}),
+            serde_json::json!({"type":"PrivateKeyJwt","clientId":"app","jwksUrl":"https://app.example/jwks","jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
+        ] {
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "secret".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!()
+            };
+            relay.spec.client_authentication = serde_json::from_value(auth).unwrap();
+            assert!(format!(
+                "{:#}",
+                compile_resources(resources, &secrets).await.unwrap_err()
+            )
+            .contains("exactly one"));
+        }
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let ResourceDocument::Upstream(upstream) = &mut resources[0] else {
+            unreachable!()
+        };
+        upstream.metadata.namespace = Some("first".into());
+        let mut duplicate = upstream.clone();
+        duplicate.metadata.namespace = Some("second".into());
+        assert!(compile_resources(resources.clone(), &secrets).await.is_ok());
+        resources.push(ResourceDocument::Upstream(duplicate));
+        assert!(compile_resources(resources, &secrets)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate Upstream"));
+    }
+}
+
+#[cfg(test)]
+mod kubernetes_configuration_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn namespaces_are_optional_and_do_not_change_file_identities() {
+        for namespace in [None, Some("team")] {
+            let metadata: Metadata =
+                serde_json::from_value(json!({"name":"issuer", "namespace":namespace})).unwrap();
+            assert_eq!(metadata.name, "issuer");
+            assert_eq!(metadata.namespace.as_deref(), namespace);
+        }
+    }
+
+    #[test]
+    fn private_key_jwt_accepts_exactly_one_typed_key_source() {
+        let base = json!({"type":"PrivateKeyJwt", "clientId":"app"});
+        for source in [
+            json!({"jwksUrl":"https://app.example/jwks"}),
+            json!({"jwks":{"keys":[{"kty":"RSA", "n":"AQAB", "e":"AQAB", "kid":"rsa"}]}}),
+            json!({"jwks":{"keys":[{"kty":"EC", "crv":"P-256", "x":"abc", "y":"def"}]}}),
+            json!({"jwks":{"keys":[{"kty":"OKP", "crv":"Ed25519", "x":"abc"}]}}),
+        ] {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(source.as_object().unwrap().clone());
+            let parsed: ClientAuthentication = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        }
+        for source in [
+            json!({"jwks":"https://app.example/jwks"}),
+            json!({"jwks":{"keys":[{"kty":"RSA", "n":"a"}]}}),
+            json!({"jwks":{"keys":[{"kty":"EC", "crv":"invalid", "x":"a", "y":"b"}]}}),
+        ] {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(source.as_object().unwrap().clone());
+            assert!(
+                serde_json::from_value::<ClientAuthentication>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_debug_output_is_redacted() {
+        let source: SecretValue = serde_json::from_value(json!({"value":"do-not-log"})).unwrap();
+        assert!(!format!("{source:?}").contains("do-not-log"));
     }
 }

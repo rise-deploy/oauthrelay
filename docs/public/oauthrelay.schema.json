@@ -137,7 +137,12 @@
               "type": "string"
             },
             "jwks": {
-              "description": "Inline JWKS object or absolute HTTP(S) JWKS URL."
+              "description": "Inline public keys. Exactly one of jwks and jwksUrl is required.",
+              "$ref": "#/$defs/PublicJwkSet"
+            },
+            "jwksUrl": {
+              "description": "Absolute HTTP(S) JWKS URL. Exactly one of jwks and jwksUrl is required.",
+              "type": "string"
             },
             "type": {
               "type": "string",
@@ -145,16 +150,34 @@
             }
           },
           "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "jwks"
+              ]
+            },
+            {
+              "required": [
+                "jwksUrl"
+              ]
+            }
+          ],
           "required": [
             "type",
-            "clientId",
-            "jwks"
+            "clientId"
           ]
         }
       ]
     },
+    "EcCurve": {
+      "type": "string",
+      "enum": [
+        "P-256",
+        "P-384"
+      ]
+    },
     "InlineSecret": {
-      "description": "Inline secret representation supported by the File provider.",
+      "description": "Literal secret representation.",
       "type": "object",
       "properties": {
         "value": {
@@ -188,6 +211,13 @@
         "name": {
           "description": "URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`.",
           "type": "string"
+        },
+        "namespace": {
+          "description": "Kubernetes namespace; ignored by File and SSM resource discovery.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,
@@ -214,6 +244,12 @@
         "clientSecret"
       ]
     },
+    "OkpCurve": {
+      "type": "string",
+      "enum": [
+        "Ed25519"
+      ]
+    },
     "OriginRedirectPolicy": {
       "description": "HTTPS origin matcher.",
       "type": "object",
@@ -226,6 +262,257 @@
       "additionalProperties": false,
       "required": [
         "origin"
+      ]
+    },
+    "PublicJwk": {
+      "description": "Public key material for the asymmetric algorithms accepted by oauthrelay.",
+      "oneOf": [
+        {
+          "description": "Standard optional JWK metadata. Key material is carried by the key type.",
+          "type": "object",
+          "properties": {
+            "alg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "e": {
+              "type": "string"
+            },
+            "key_ops": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "kid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kty": {
+              "type": "string",
+              "const": "RSA"
+            },
+            "n": {
+              "type": "string"
+            },
+            "use": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5c": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "x5t": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5t#S256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5u": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kty",
+            "n",
+            "e"
+          ]
+        },
+        {
+          "description": "Standard optional JWK metadata. Key material is carried by the key type.",
+          "type": "object",
+          "properties": {
+            "alg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "crv": {
+              "$ref": "#/$defs/EcCurve"
+            },
+            "key_ops": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "kid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kty": {
+              "type": "string",
+              "const": "EC"
+            },
+            "use": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x": {
+              "type": "string"
+            },
+            "x5c": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "x5t": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5t#S256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5u": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "y": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kty",
+            "crv",
+            "x",
+            "y"
+          ]
+        },
+        {
+          "description": "Standard optional JWK metadata. Key material is carried by the key type.",
+          "type": "object",
+          "properties": {
+            "alg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "crv": {
+              "$ref": "#/$defs/OkpCurve"
+            },
+            "key_ops": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "kid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kty": {
+              "type": "string",
+              "const": "OKP"
+            },
+            "use": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x": {
+              "type": "string"
+            },
+            "x5c": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "x5t": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5t#S256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5u": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kty",
+            "crv",
+            "x"
+          ]
+        }
+      ]
+    },
+    "PublicJwkSet": {
+      "description": "Public JSON Web Key Set used to verify client assertions.",
+      "type": "object",
+      "properties": {
+        "keys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicJwk"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "keys"
       ]
     },
     "RedirectPolicyEntry": {
@@ -285,7 +572,11 @@
         },
         "scopes": {
           "description": "Default and allowed upstream scopes.",
-          "$ref": "#/$defs/ScopePolicy"
+          "$ref": "#/$defs/ScopePolicy",
+          "default": {
+            "allowed": null,
+            "default": []
+          }
         },
         "upstreamRef": {
           "description": "Upstream used for authorization and token exchange.",
@@ -340,10 +631,10 @@
       "additionalProperties": false
     },
     "SecretSource": {
-      "description": "Secret sources understood by the File and AWS SSM providers.",
+      "description": "Secret sources resolved by configured provider backends.",
       "oneOf": [
         {
-          "description": "Environment variable resolved by the File provider.",
+          "description": "Environment variable in the oauthrelay process.",
           "type": "object",
           "properties": {
             "env": {
@@ -366,7 +657,7 @@
           ]
         },
         {
-          "description": "Local file resolved by the File provider.",
+          "description": "Local file accessible to the oauthrelay process.",
           "type": "object",
           "properties": {
             "file": {
@@ -389,7 +680,7 @@
           ]
         },
         {
-          "description": "Exact SSM SecureString parameter resolved by the AWS SSM provider.",
+          "description": "Exact AWS SSM SecureString parameter.",
           "type": "object",
           "properties": {
             "awsSsmParameter": {
@@ -412,7 +703,35 @@
           ]
         },
         {
-          "description": "AWS Secrets Manager SecretString resolved by the AWS SSM provider.",
+          "description": "Secret key resolved within the Kubernetes provider namespace.",
+          "type": "object",
+          "properties": {
+            "secretKeyRef": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "description": "Key in the Secret data map.",
+                  "type": "string"
+                },
+                "name": {
+                  "description": "Secret resource name.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "key"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "secretKeyRef"
+          ]
+        },
+        {
+          "description": "AWS Secrets Manager SecretString.",
           "type": "object",
           "properties": {
             "awsSecretsManager": {
@@ -494,7 +813,12 @@
       "properties": {
         "endpoints": {
           "description": "Explicit provider endpoints. Omitted endpoints are resolved through issuer discovery.",
-          "$ref": "#/$defs/UpstreamEndpoints"
+          "$ref": "#/$defs/UpstreamEndpoints",
+          "default": {
+            "authorization": null,
+            "jwks": null,
+            "token": null
+          }
         },
         "issuerUrl": {
           "description": "Absolute HTTP(S) issuer URL used for discovery and transparent token trust.",
