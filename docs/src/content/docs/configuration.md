@@ -192,6 +192,19 @@ value replaces that default; it does not add an alternative accepted audience.
 A valid signature and `exp` are required. When present, `iat` and `nbf` must be numeric timestamps
 no later than the current time, allowing 60 seconds of clock skew for time checks.
 
+`requireSingleUse` defaults to `false`, allowing projected Kubernetes service-account tokens
+and other workload JWTs to be reused until expiry. Clients that sign a fresh assertion for each
+request can set `requireSingleUse: true`. This requires an integer `iat`, a non-empty string `jti`,
+and `exp` greater than `iat` by at most 300 seconds. Every request, including retries, needs a
+fresh `jti`. Replay identity is scoped to the configured issuer, subject, and audience; key rotation
+does not reset it. Assertions are recorded only after validation and retained through expiration
+plus clock skew. A missing or failing replay cache rejects authentication.
+
+The standalone server's replay cache is in memory: protection covers one process lifetime.
+Multiple replicas, Lambda instances, and restarts require an embedded deployment supplying a
+shared durable `ReplayCache` with atomic `first_use` operations to enforce single use across them.
+`requireSingleUse` authenticates the request; it does not sender-constrain upstream access tokens.
+
 Configure `jwksUrl` (an absolute HTTP(S) URL), `jwks` (an inline public JWKS object with a
 non-empty `keys` array), or `issuer` for OIDC discovery. `jwks` and `jwksUrl` are mutually
 exclusive. An explicit key source can accompany `issuer`; it takes precedence over discovery.

@@ -171,6 +171,8 @@ pub enum ClientAuth {
         client_secret: SecretString,
     },
     PrivateKeyJwt {
+        #[serde(default)]
+        require_single_use: bool,
         client_id: String,
         #[serde(default)]
         issuer: Option<String>,

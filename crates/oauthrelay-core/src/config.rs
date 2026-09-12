@@ -221,6 +221,14 @@ pub enum ClientAuthentication {
     },
     /// Require a signed client assertion, optionally from a federated workload issuer.
     PrivateKeyJwt {
+        /// Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.
+        /// Requires a replay cache shared by all serving instances; false permits reusable workload JWTs.
+        #[serde(
+            default,
+            rename = "requireSingleUse",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        require_single_use: bool,
         /// Client identifier required in the token request; default assertion issuer and subject.
         #[serde(rename = "clientId")]
         client_id: String,
@@ -431,6 +439,7 @@ pub async fn compile_resources(
                     })?,
             },
             ClientAuthentication::PrivateKeyJwt {
+                require_single_use,
                 client_id,
                 issuer,
                 subject,
@@ -438,6 +447,7 @@ pub async fn compile_resources(
                 jwks,
                 jwks_url,
             } => ClientAuth::PrivateKeyJwt {
+                require_single_use,
                 client_id,
                 jwks: match (jwks, jwks_url) {
                     (None, Some(value)) => Some(ClientJwks::Url(
@@ -762,7 +772,7 @@ mod tests {
             serde_json::json!({"jwksUrl":"https://keys.example/jwks"}),
             serde_json::json!({"jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
         ] {
-            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay"});
+            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay","requireSingleUse":true});
             auth.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
@@ -775,6 +785,7 @@ mod tests {
             relay.spec.client_authentication = serde_json::from_value(auth).unwrap();
             let compiled = compile_resources(resources, &secrets).await.unwrap();
             let ClientAuth::PrivateKeyJwt {
+                require_single_use,
                 issuer: actual_issuer,
                 subject: actual_subject,
                 audience: actual_audience,
@@ -783,6 +794,7 @@ mod tests {
             else {
                 unreachable!()
             };
+            assert!(*require_single_use);
             assert_eq!(actual_issuer.as_deref(), Some(issuer));
             assert_eq!(actual_subject.as_deref(), Some(subject));
             assert_eq!(actual_audience.as_deref(), Some("api://oauthrelay"));

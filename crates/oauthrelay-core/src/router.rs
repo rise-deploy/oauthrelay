@@ -1002,6 +1002,7 @@ async fn authenticate(
             }
         }
         ClientAuth::PrivateKeyJwt {
+            require_single_use,
             client_id,
             issuer,
             subject,
@@ -1025,6 +1026,7 @@ async fn authenticate(
                 subject.as_deref().unwrap_or(client_id),
                 jwks.as_ref(),
                 assertion,
+                *require_single_use,
             )
             .await
         }
@@ -1038,6 +1040,7 @@ async fn verify_private_key_jwt(
     subject: &str,
     source: Option<&ClientJwks>,
     assertion: &str,
+    require_single_use: bool,
 ) -> Result<(), ()> {
     let value = match source {
         Some(ClientJwks::Inline(value)) => value.clone(),
@@ -1111,7 +1114,40 @@ async fn verify_private_key_jwt(
         Value::Array(values) => values.iter().any(|value| value.as_str() == Some(audience)),
         _ => false,
     });
-    aud_ok.then_some(()).ok_or(())
+    if !aud_ok {
+        return Err(());
+    }
+    if require_single_use {
+        let issued_at = claims.get("iat").and_then(Value::as_u64).ok_or(())?;
+        let expires_at = claims.get("exp").and_then(Value::as_u64).ok_or(())?;
+        let jti = claims
+            .get("jti")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(())?;
+        if expires_at <= issued_at || expires_at - issued_at > 300 {
+            return Err(());
+        }
+        let cache = state.cfg.replay_cache.as_ref().ok_or(())?;
+        let identity = serde_json::to_vec(&(issuer, subject, audience, jti)).map_err(|_| ())?;
+        let id = format!(
+            "client-assertion:{}",
+            URL_SAFE_NO_PAD.encode(Sha256::digest(identity))
+        );
+        // Retain through the entire acceptance window, including expiration clock skew.
+        let ttl = expires_at
+            .saturating_add(validation.leeway)
+            .saturating_sub(unix_now())
+            .saturating_add(1);
+        if !cache
+            .first_use(&id, Duration::from_secs(ttl))
+            .await
+            .map_err(|_| ())?
+        {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Response {

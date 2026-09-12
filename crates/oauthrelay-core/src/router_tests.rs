@@ -1522,6 +1522,7 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
         }]
     });
     let auth = ClientAuth::PrivateKeyJwt {
+        require_single_use: true,
         client_id: "jwt-application".into(),
         issuer: None,
         subject: None,
@@ -1563,6 +1564,9 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
         post_token(&app, "jwt", &form).await.status(),
         StatusCode::CREATED
     );
+    let replay = post_token(&app, "jwt", &form).await;
+    let body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+    assert_eq!(body["error"], "invalid_client");
     task.abort();
 }
 
@@ -1619,6 +1623,7 @@ async fn workload_jwt_enforces_identity_audience_and_validity_for_every_key_sour
         let mut claims = claims.clone();
         claims["aud"] = json!([audience]);
         let auth = ClientAuth::PrivateKeyJwt {
+            require_single_use: false,
             client_id: "worker-client".into(),
             issuer: Some(issuer.clone()),
             subject: Some("system:serviceaccount:workloads:worker".into()),
@@ -1825,6 +1830,7 @@ async fn workload_jwt_rejects_invalid_discovery_metadata() {
         let (app, _, task) = setup(
             "jwt",
             ClientAuth::PrivateKeyJwt {
+                require_single_use: false,
                 client_id: "worker".into(),
                 issuer: Some(issuer.clone()),
                 subject: None,
@@ -1853,4 +1859,125 @@ async fn workload_jwt_rejects_invalid_discovery_metadata() {
         task.abort();
     }
     issuer_task.abort();
+}
+
+#[tokio::test]
+async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+    let source = ClientJwks::Inline(json!({"keys": [{"kty":"RSA",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]}));
+    let cache = Arc::new(MemoryReplayCache::default());
+    let make_state = |replay_cache| AppState {
+        resolver: Arc::new(ProviderSnapshot::default()),
+        cfg: Arc::new(RelayConfig {
+            public_url: "https://relay.example/".parse().unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
+            replay_cache,
+            http: reqwest::Client::new(),
+            allow_localhost_loopback: false,
+        }),
+        keys: KeyStrategy::SingleSegment,
+        cache: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let state = make_state(Some(cache.clone() as Arc<dyn ReplayCache>));
+    let other_instance = make_state(Some(cache));
+    let no_cache = make_state(None);
+    let now = unix_now();
+    let claims = json!({"iss":"client", "sub":"client", "aud":"relay",
+        "iat":now, "exp":now + 300, "jti":"request-1"});
+    let sign = |claims: &Value| encode(&Header::new(Algorithm::RS256), claims, &key).unwrap();
+    for (field, value) in [
+        ("iat", Value::Null),
+        ("jti", Value::Null),
+        ("jti", json!("")),
+        ("jti", json!(123)),
+        ("exp", json!(now + 301)),
+        ("exp", json!(now)),
+        ("iat", json!(now + 120)),
+        ("aud", json!("other")),
+    ] {
+        let mut invalid = claims.clone();
+        invalid[field] = value;
+        assert!(
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                "client",
+                "client",
+                Some(&source),
+                &sign(&invalid),
+                true
+            )
+            .await
+            .is_err(),
+            "{field}"
+        );
+    }
+    let assertion = sign(&claims);
+    assert!(verify_private_key_jwt(
+        &no_cache,
+        "relay",
+        "client",
+        "client",
+        Some(&source),
+        &assertion,
+        true
+    )
+    .await
+    .is_err());
+    let (first, second) = tokio::join!(
+        verify_private_key_jwt(
+            &state,
+            "relay",
+            "client",
+            "client",
+            Some(&source),
+            &assertion,
+            true
+        ),
+        verify_private_key_jwt(
+            &other_instance,
+            "relay",
+            "client",
+            "client",
+            Some(&source),
+            &assertion,
+            true
+        ),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let mut fresh = claims.clone();
+    fresh["jti"] = json!("request-2");
+    assert!(verify_private_key_jwt(
+        &state,
+        "relay",
+        "client",
+        "client",
+        Some(&source),
+        &sign(&fresh),
+        true
+    )
+    .await
+    .is_ok());
+    // Workload assertions remain reusable without a replay cache or per-request claims.
+    let mut workload = claims.clone();
+    workload.as_object_mut().unwrap().remove("jti");
+    workload.as_object_mut().unwrap().remove("iat");
+    workload["exp"] = json!(now + 3600);
+    for _ in 0..2 {
+        assert!(verify_private_key_jwt(
+            &no_cache,
+            "relay",
+            "client",
+            "client",
+            Some(&source),
+            &sign(&workload),
+            false
+        )
+        .await
+        .is_ok());
+    }
 }

@@ -447,6 +447,9 @@ spec:
                         - jwksUrl
                     - not:
                         required:
+                        - requireSingleUse
+                    - not:
+                        required:
                         - subject
                     properties:
                       type:
@@ -476,6 +479,9 @@ spec:
                         - jwksUrl
                     - not:
                         required:
+                        - requireSingleUse
+                    - not:
+                        required:
                         - subject
                     properties:
                       type:
@@ -497,6 +503,9 @@ spec:
                     - not:
                         required:
                         - jwksUrl
+                    - not:
+                        required:
+                        - requireSingleUse
                     - not:
                         required:
                         - subject
@@ -944,6 +953,7 @@ spec:
                         required:
                         - keys
                       jwksUrl: {}
+                      requireSingleUse: {}
                       subject:
                         minLength: 1
                       type:
@@ -1432,6 +1442,11 @@ spec:
                       Absolute HTTP(S) JWKS URL. Mutually exclusive with jwks; omit both to discover
                       from issuer.
                     type: string
+                  requireSingleUse:
+                    description: |-
+                      Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.
+                      Requires a replay cache shared by all serving instances; false permits reusable workload JWTs.
+                    type: boolean
                   subject:
                     description: >-
                       Exact assertion subject, such as system:serviceaccount:namespace:name; defaults
