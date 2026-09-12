@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "oauthrelay"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "oauthrelay-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "oauthrelay-provider-file"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "oauthrelay-provider-kubernetes"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "oauthrelay-provider-ssm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "oauthrelay-secret-resolver"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
