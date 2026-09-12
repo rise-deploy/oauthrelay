@@ -162,7 +162,11 @@ configuration types with structural schema validation. The generated bundle is c
 accepts either `jwksUrl` or typed inline `jwks`, or discovers keys from an explicit `issuer` when
 both are omitted. Discovery metadata must identify that exact issuer. Issuer and discovered JWKS
 URLs use HTTPS (HTTP is allowed on IP loopback), without user information, queries, or fragments.
-Discovery requests do not inherit Kubernetes API credentials or the cluster CA.
+Discovery requests do not inherit Kubernetes API credentials or the cluster CA. Client assertion
+discovery and JWKS fetches reject redirects, use a separate cache and HTTP client, and have a
+ten-second deadline. Unknown signing key IDs trigger one serialized JWKS refresh per URL;
+forced refreshes and failed fetch retries are limited to once per thirty seconds. A failed refresh
+retains known keys until their normal cache expiry.
 
 ## Kubernetes provider
 

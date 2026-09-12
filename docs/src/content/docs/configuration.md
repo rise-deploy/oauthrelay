@@ -211,8 +211,17 @@ exclusive. An explicit key source can accompany `issuer`; it takes precedence ov
 Without either key source, oauthrelay fetches `{issuer}/.well-known/openid-configuration`,
 requires its `issuer` to match exactly, and uses its `jwks_uri`. Discovery uses only the configured
 issuer. Issuer and discovered JWKS URLs require HTTPS, with HTTP permitted on IP loopback for
-local development; user information, queries, and fragments are forbidden. Metadata is cached
-for one hour and keys for ten minutes.
+local development; user information, queries, and fragments are forbidden. Discovery and JWKS
+requests reject redirects and have a ten-second deadline. They use a separate HTTP client and
+cache from upstream requests. Metadata is cached for one hour and keys for ten minutes.
+An unknown `kid` triggers a JWKS refresh; concurrent requests share one fetch. Forced refreshes
+and failed fetch retries have a thirty-second cooldown per URL. A failed refresh preserves
+previously fetched keys until their normal cache expiry.
+
+Rust embedders configure trust-fetch TLS roots through
+`ClientAssertionHttpClient::new(reqwest::ClientBuilder)` and supply the result as
+`RelayConfig.client_assertion_http`. Its constructor enforces the redirect policy and deadline.
+The `RelayConfig.http` client controls upstream traffic independently.
 
 ```yaml
 clientAuthentication:

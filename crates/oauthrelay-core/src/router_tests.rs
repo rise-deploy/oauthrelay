@@ -335,6 +335,7 @@ async fn setup_signed_profile(
             sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
         },
         KeyStrategy::SingleSegment,
@@ -421,6 +422,7 @@ async fn setup_with_capture(
             sealer: sealer.clone(),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
         },
         strategy,
@@ -476,6 +478,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
             replay_cache: None,
             http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
         },
         KeyStrategy::SingleSegment,
@@ -1877,10 +1880,12 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
             sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
             replay_cache,
             http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
         }),
         keys: KeyStrategy::SingleSegment,
         cache: Arc::new(Mutex::new(HashMap::new())),
+        assertion_cache: Arc::default(),
     };
     let state = make_state(Some(cache.clone() as Arc<dyn ReplayCache>));
     let other_instance = make_state(Some(cache));
@@ -1980,4 +1985,319 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
         .await
         .is_ok());
     }
+}
+
+fn assertion_test_state() -> AppState {
+    AppState {
+        resolver: Arc::new(ProviderSnapshot::default()),
+        cfg: Arc::new(RelayConfig {
+            public_url: "https://relay.example/".parse().unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
+            replay_cache: None,
+            http: reqwest::Client::new(),
+            // Even a caller-supplied redirect policy cannot enable redirects for trust data.
+            client_assertion_http: ClientAssertionHttpClient::new(
+                reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)),
+            )
+            .unwrap(),
+            allow_localhost_loopback: false,
+        }),
+        keys: KeyStrategy::SingleSegment,
+        cache: Arc::default(),
+        assertion_cache: Arc::default(),
+    }
+}
+
+#[tokio::test]
+async fn client_assertion_discovery_and_jwks_reject_redirects() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let jwks = json!({"keys":[{"kty":"RSA",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let doc = json!({"issuer":issuer, "jwks_uri":format!("{issuer}/keys")});
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let hits = target_hits.clone();
+    let discovery = doc.clone();
+    let idp = Router::new()
+        .route(
+            "/cluster/.well-known/openid-configuration",
+            get(move || {
+                let discovery = discovery.clone();
+                async move { Json(discovery) }
+            }),
+        )
+        .route(
+            "/redirect/.well-known/openid-configuration",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(
+                        header::LOCATION,
+                        "/cluster/.well-known/openid-configuration",
+                    )],
+                )
+            }),
+        )
+        .route(
+            "/cluster/keys",
+            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/target-keys")]) }),
+        )
+        .route(
+            "/target-keys",
+            get(move || {
+                let jwks = jwks.clone();
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(jwks)
+                }
+            }),
+        );
+    let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let state = assertion_test_state();
+    let claims = json!({"iss":issuer,"sub":"worker","aud":"relay","exp":unix_now()+3600});
+    let assertion = encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    for source in [
+        None,
+        Some(ClientJwks::Url(
+            Url::parse(&format!("{issuer}/keys")).unwrap(),
+        )),
+    ] {
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &assertion,
+            false
+        )
+        .await
+        .is_err());
+    }
+    let redirect_discovery =
+        Url::parse(&issuer.replace("/cluster", "/redirect/.well-known/openid-configuration"))
+            .unwrap();
+    assert!(cached_json_with_client(
+        &state.assertion_cache.metadata,
+        &state.cfg.client_assertion_http.0,
+        &redirect_discovery,
+        DISCOVERY_TTL
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        target_hits.load(Ordering::SeqCst),
+        0,
+        "redirect target must never supply trusted keys"
+    );
+    assert!(!state
+        .assertion_cache
+        .metadata
+        .lock()
+        .await
+        .contains_key(redirect_discovery.as_str()));
+    let keys_url = Url::parse(&format!("{issuer}/keys")).unwrap();
+    cached_json(&state, &keys_url, JWKS_TTL).await.unwrap();
+    assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    assert!(
+        verify_private_key_jwt(&state, "relay", &issuer, "worker", None, &assertion, false)
+            .await
+            .is_err(),
+        "upstream cache entries cannot supply assertion trust keys"
+    );
+    assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+    let keys = Arc::new(StdMutex::new(json!({"keys":[{"kty":"RSA","kid":"old",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]})));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let keys_url = Url::parse(&format!("{issuer}/keys")).unwrap();
+    let doc = json!({"issuer":issuer,"jwks_uri":keys_url});
+    let served_keys = keys.clone();
+    let requests = hits.clone();
+    let fail = failing.clone();
+    let idp = Router::new()
+        .route(
+            "/cluster/.well-known/openid-configuration",
+            get(move || {
+                let doc = doc.clone();
+                async move { Json(doc) }
+            }),
+        )
+        .route(
+            "/cluster/keys",
+            get(move || {
+                let keys = served_keys.clone();
+                let hits = requests.clone();
+                let fail = fail.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if fail.load(Ordering::SeqCst) {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        Json(keys.lock().unwrap().clone()).into_response()
+                    }
+                }
+            }),
+        );
+    let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let claims = json!({"iss":issuer,"sub":"worker","aud":"relay","exp":unix_now()+3600});
+    let sign = |kid: &str| {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        encode(&header, &claims, &key).unwrap()
+    };
+    // Both issuer-discovered keys and explicit remote JWKS use the refresh policy.
+    for source in [None, Some(ClientJwks::Url(keys_url.clone()))] {
+        keys.lock().unwrap()["keys"][0]["kid"] = json!("old");
+        failing.store(false, Ordering::SeqCst);
+        let state = assertion_test_state();
+        let initial_hits = hits.load(Ordering::SeqCst);
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("old"),
+            false
+        )
+        .await
+        .is_ok());
+        keys.lock().unwrap()["keys"][0]["kid"] = json!("new");
+        let rotated = sign("new");
+        let (a, b, c) = tokio::join!(
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            ),
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            ),
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            ),
+        );
+        assert!(a.is_ok() && b.is_ok() && c.is_ok());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            initial_hits + 2,
+            "rotation requires exactly one extra fetch"
+        );
+        for kid in ["unknown-1", "unknown-2", "unknown-3"] {
+            assert!(verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &sign(kid),
+                false
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            initial_hits + 2,
+            "unknown kids share a per-URL cooldown"
+        );
+        let entry = state.assertion_cache.jwks.lock().await[keys_url.as_str()].clone();
+        entry.lock().await.retry_after = None;
+        failing.store(true, Ordering::SeqCst);
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("missing"),
+            false
+        )
+        .await
+        .is_err());
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("missing-again"),
+            false
+        )
+        .await
+        .is_err());
+        assert!(
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &rotated,
+                false
+            )
+            .await
+            .is_ok(),
+            "a failed refresh preserves fresh known keys"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            initial_hits + 3,
+            "failed refreshes are throttled"
+        );
+        failing.store(false, Ordering::SeqCst);
+        keys.lock().unwrap()["keys"][0]["kid"] = json!("recovered");
+        entry.lock().await.retry_after = None;
+        assert!(verify_private_key_jwt(
+            &state,
+            "relay",
+            &issuer,
+            "worker",
+            source.as_ref(),
+            &sign("recovered"),
+            false
+        )
+        .await
+        .is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), initial_hits + 4);
+    }
+    task.abort();
 }
