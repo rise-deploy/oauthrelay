@@ -1005,6 +1005,7 @@ async fn authenticate(
             client_id,
             issuer,
             subject,
+            audience,
             jwks,
         } => {
             if form.client_assertion_type.as_deref()
@@ -1014,9 +1015,12 @@ async fn authenticate(
                 return Err(());
             }
             let assertion = form.client_assertion.as_deref().ok_or(())?;
+            let audience = audience
+                .clone()
+                .unwrap_or_else(|| token_url(&state.cfg.public_url, &relay.key).to_string());
             verify_private_key_jwt(
                 state,
-                relay,
+                &audience,
                 issuer.as_deref().unwrap_or(client_id),
                 subject.as_deref().unwrap_or(client_id),
                 jwks.as_ref(),
@@ -1029,7 +1033,7 @@ async fn authenticate(
 
 async fn verify_private_key_jwt(
     state: &AppState,
-    relay: &Relay,
+    audience: &str,
     issuer: &str,
     subject: &str,
     source: Option<&ClientJwks>,
@@ -1102,10 +1106,9 @@ async fn verify_private_key_jwt(
             }
         }
     }
-    let audience = token_url(&state.cfg.public_url, &relay.key).to_string();
     let aud_ok = claims.get("aud").is_some_and(|aud| match aud {
-        Value::String(value) => value == &audience,
-        Value::Array(values) => values.iter().any(|value| value.as_str() == Some(&audience)),
+        Value::String(value) => value == audience,
+        Value::Array(values) => values.iter().any(|value| value.as_str() == Some(audience)),
         _ => false,
     });
     aud_ok.then_some(()).ok_or(())

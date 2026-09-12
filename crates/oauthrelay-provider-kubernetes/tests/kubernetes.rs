@@ -177,7 +177,7 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         json!({"type":"ClientSecret","clientId":"app","clientSecret":{"value":"secret"}}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwksUrl":"https://app.example/jwks"}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwks":inline}),
-        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","subject":"system:serviceaccount:workloads:worker"}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","subject":"system:serviceaccount:workloads:worker","audience":"api://oauthrelay"}),
         json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","subject":"system:serviceaccount:workloads:worker","jwks":inline}),
         json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","jwksUrl":"https://keys.example/jwks"}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwks":{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y"},{"kty":"OKP","crv":"Ed25519","x":"x"}]}}),
@@ -205,6 +205,8 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         json!({"type":"PrivateKeyJwt","clientId":"app","issuer":null}),
         json!({"type":"PrivateKeyJwt","clientId":"app","issuer":""}),
         json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","subject":""}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","audience":""}),
+        json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","audience":["api://oauthrelay"]}),
         json!({"type":"PrivateKeyJwt","clientId":"app","issuer":"https://cluster.example","jwksUrl":"https://keys.example/jwks","jwks":inline}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwks":null}),
         json!({"type":"PrivateKeyJwt","clientId":"app","jwksUrl":null}),
@@ -356,7 +358,7 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
     let mut resource = relay(
         "worker",
         json!({"type":"PrivateKeyJwt","clientId":"worker-client",
-        "issuer":discovery["issuer"],"subject":format!("system:serviceaccount:{namespace}:worker"),"jwks":jwks}),
+        "issuer":discovery["issuer"],"subject":format!("system:serviceaccount:{namespace}:worker"),"audience":"api://oauthrelay","jwks":jwks}),
     );
     resource["metadata"]["namespace"] = json!(namespace);
     Api::<Relay>::namespaced(admin.clone(), namespace)
@@ -371,7 +373,7 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
         .load()
         .await
         .unwrap();
-    let audience = "https://relay.example/relay/worker/token";
+    let audience = "api://oauthrelay";
     let app = router(
         Arc::new(resources),
         RelayConfig {
@@ -386,6 +388,11 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
     for (name, token_audience, expected) in [
         ("worker", audience, StatusCode::ACCEPTED),
         ("other", audience, StatusCode::UNAUTHORIZED),
+        (
+            "worker",
+            "https://relay.example/relay/worker/token",
+            StatusCode::UNAUTHORIZED,
+        ),
         (
             "worker",
             "https://kubernetes.default.svc",

@@ -132,6 +132,11 @@
           "description": "Require a signed client assertion, optionally from a federated workload issuer.",
           "type": "object",
           "properties": {
+            "audience": {
+              "description": "Exact required assertion audience; defaults to the relay token endpoint URL.",
+              "type": "string",
+              "minLength": 1
+            },
             "clientId": {
               "description": "Client identifier required in the token request; default assertion issuer and subject.",
               "type": "string"

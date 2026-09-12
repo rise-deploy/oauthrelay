@@ -177,6 +177,8 @@ pub enum ClientAuth {
         #[serde(default)]
         subject: Option<String>,
         #[serde(default)]
+        audience: Option<String>,
+        #[serde(default)]
         jwks: Option<ClientJwks>,
     },
 }
@@ -325,6 +327,7 @@ impl Relay {
             ClientAuth::PrivateKeyJwt {
                 issuer,
                 subject,
+                audience,
                 jwks,
                 ..
             } => {
@@ -337,6 +340,9 @@ impl Relay {
                 }
                 if subject.as_ref().is_some_and(|value| value.is_empty()) {
                     return Err("clientAuthentication.subject must not be empty".into());
+                }
+                if audience.as_ref().is_some_and(|value| value.is_empty()) {
+                    return Err("clientAuthentication.audience must not be empty".into());
                 }
                 match jwks {
                     None if issuer.is_none() => {

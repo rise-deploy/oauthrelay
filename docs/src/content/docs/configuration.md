@@ -186,7 +186,9 @@ The relying party sends a signed JWT in `client_assertion`, with
 `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and
 `client_id` equal to the configured `clientId`. The assertion's `iss` and `sub` must match
 `issuer` and `subject`, each defaulting to `clientId`. Matching is exact, including trailing
-slashes. The `aud` claim must contain the relay token endpoint URL, as a string or an array.
+slashes. The `aud` claim must equal `audience` as a string, or contain it as an array element.
+`audience` is an optional non-empty string, defaulting to the relay token endpoint URL. An explicit
+value replaces that default; it does not add an alternative accepted audience.
 A valid signature and `exp` are required. When present, `iat` and `nbf` must be numeric timestamps
 no later than the current time, allowing 60 seconds of clock skew for time checks.
 
@@ -251,7 +253,8 @@ you can configure `issuer` with explicit inline `jwks` obtained by an administra
 See [Kubernetes issuer discovery](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#service-account-issuer-discovery)
 for publishing discovery and public keys to relying parties.
 
-Project a token with the **relay token endpoint as its audience**. For a relay named `worker`
+Project a token with the **configured audience**, defaulting to the relay token endpoint URL.
+For a relay named `worker`
 served at `https://relay.example.com`, the workload Pod spec includes:
 
 ```yaml
@@ -273,6 +276,18 @@ volumes:
             expirationSeconds: 3600
 ```
 
+To use a custom audience, add it to the relay authentication configuration and set the projected
+`serviceAccountToken.audience` to the same value:
+
+```yaml
+clientAuthentication:
+  type: PrivateKeyJwt
+  clientId: worker
+  issuer: https://cluster-issuer.example.com
+  subject: system:serviceaccount:workloads:worker
+  audience: api://oauthrelay
+```
+
 Create the `worker` ServiceAccount and Pod in namespace `workloads`. Read the token file on each
 request so the application picks up kubelet rotation. For example, a refresh request uses:
 
@@ -286,8 +301,8 @@ curl --fail-with-body https://relay.example.com/relay/worker/token \
 ```
 
 This authenticates the existing authorization-code and refresh-token flows; it does not create
-a client-credentials grant. The default Kubernetes API token has a different audience and is
-rejected. Matching projected tokens may be reused until expiry. Verification checks the JWT
+a client-credentials grant. Tokens without the configured audience are rejected.
+Matching projected tokens may be reused until expiry. Verification checks the JWT
 offline and does not perform TokenReview or check whether a bound Pod or ServiceAccount still
 exists. Deleting those objects does not immediately revoke a token at oauthrelay.
 

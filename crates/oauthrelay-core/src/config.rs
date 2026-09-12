@@ -233,6 +233,10 @@ pub enum ClientAuthentication {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(with = "String", length(min = 1))]
         subject: Option<String>,
+        /// Exact required assertion audience; defaults to the relay token endpoint URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String", length(min = 1))]
+        audience: Option<String>,
         /// Inline public keys. Mutually exclusive with jwksUrl; omit both to discover from issuer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(with = "PublicJwkSet")]
@@ -430,6 +434,7 @@ pub async fn compile_resources(
                 client_id,
                 issuer,
                 subject,
+                audience,
                 jwks,
                 jwks_url,
             } => ClientAuth::PrivateKeyJwt {
@@ -448,6 +453,7 @@ pub async fn compile_resources(
                 },
                 issuer,
                 subject,
+                audience,
             },
         };
         let redirect_policy = resource
@@ -756,7 +762,7 @@ mod tests {
             serde_json::json!({"jwksUrl":"https://keys.example/jwks"}),
             serde_json::json!({"jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
         ] {
-            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject});
+            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay"});
             auth.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
@@ -771,6 +777,7 @@ mod tests {
             let ClientAuth::PrivateKeyJwt {
                 issuer: actual_issuer,
                 subject: actual_subject,
+                audience: actual_audience,
                 ..
             } = &compiled.relays.values().next().unwrap().client_auth
             else {
@@ -778,6 +785,7 @@ mod tests {
             };
             assert_eq!(actual_issuer.as_deref(), Some(issuer));
             assert_eq!(actual_subject.as_deref(), Some(subject));
+            assert_eq!(actual_audience.as_deref(), Some("api://oauthrelay"));
         }
         for extra in [
             serde_json::json!({"issuer":""}),
@@ -787,10 +795,11 @@ mod tests {
             serde_json::json!({"issuer":"https://cluster.example?query"}),
             serde_json::json!({"issuer":"https://cluster.example#fragment"}),
             serde_json::json!({"subject":""}),
+            serde_json::json!({"audience":""}),
             serde_json::json!({"issuer":null}),
             serde_json::json!({"jwksUrl":"https://keys.example/jwks","jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
         ] {
-            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject});
+            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay"});
             auth.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());

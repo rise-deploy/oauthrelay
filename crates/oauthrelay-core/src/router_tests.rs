@@ -1525,6 +1525,7 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
         client_id: "jwt-application".into(),
         issuer: None,
         subject: None,
+        audience: None,
         jwks: Some(ClientJwks::Inline(jwks)),
     };
     let (app, _, task) = setup("jwt", auth, KeyStrategy::SingleSegment).await;
@@ -1604,17 +1605,24 @@ async fn workload_jwt_enforces_identity_audience_and_validity_for_every_key_sour
     let claims = json!({"iss":issuer, "sub":"system:serviceaccount:workloads:worker",
         "aud":["https://relay.example/relay/jwt/token"], "exp":unix_now()+3600,
         "iat":unix_now(), "nbf":unix_now(), "jti":"reusable-projected-token"});
-    for source in [
-        Some(ClientJwks::Inline(jwks)),
-        Some(ClientJwks::Url(
-            Url::parse(&format!("{issuer}/keys")).unwrap(),
-        )),
-        None,
+    for (source, configured_audience) in [
+        (Some(ClientJwks::Inline(jwks)), None),
+        (
+            Some(ClientJwks::Url(
+                Url::parse(&format!("{issuer}/keys")).unwrap(),
+            )),
+            Some("api://oauthrelay"),
+        ),
+        (None, Some("api://oauthrelay")),
     ] {
+        let audience = configured_audience.unwrap_or("https://relay.example/relay/jwt/token");
+        let mut claims = claims.clone();
+        claims["aud"] = json!([audience]);
         let auth = ClientAuth::PrivateKeyJwt {
             client_id: "worker-client".into(),
             issuer: Some(issuer.clone()),
             subject: Some("system:serviceaccount:workloads:worker".into()),
+            audience: configured_audience.map(str::to_owned),
             jwks: source,
         };
         let (app, _, task, capture) = setup_with_capture(
@@ -1665,8 +1673,30 @@ async fn workload_jwt_enforces_identity_audience_and_validity_for_every_key_sour
                 StatusCode::ACCEPTED
             );
         }
+        for aud in [json!(audience), json!(["another-audience", audience])] {
+            let mut claims = claims.clone();
+            claims["aud"] = aud;
+            let assertion = encode(&header, &claims, &signing_key).unwrap();
+            assert_eq!(
+                post_token(&app, "jwt", &refresh_form(&assertion, "worker-client"))
+                    .await
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+        }
         let forwarded = capture.token.lock().unwrap().len();
         for (claim, value) in [
+            (
+                "aud",
+                json!(if configured_audience.is_some() {
+                    "https://relay.example/relay/jwt/token"
+                } else {
+                    "api://oauthrelay"
+                }),
+            ),
+            ("aud", json!("")),
+            ("aud", json!([])),
+            ("aud", Value::Null),
             ("iss", json!("https://another-cluster.example")),
             ("iss", json!(format!("{issuer}/"))),
             ("sub", json!("system:serviceaccount:other:worker")),
@@ -1798,6 +1828,7 @@ async fn workload_jwt_rejects_invalid_discovery_metadata() {
                 client_id: "worker".into(),
                 issuer: Some(issuer.clone()),
                 subject: None,
+                audience: None,
                 jwks: None,
             },
             KeyStrategy::SingleSegment,

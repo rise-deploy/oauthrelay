@@ -62,7 +62,7 @@ redirect policy.
   secret.
 - `Public`: no client credential; S256 PKCE is mandatory.
 - `ClientSecret`: a relay-specific client ID and secret are compared in constant time.
-- `PrivateKeyJwt`: a signed client assertion is verified against inline JWKS, a JWKS URL, or configured issuer discovery. `issuer` and `subject` are exact claim constraints, each defaulting to `clientId`; `client_id` must still match `clientId`. The audience must contain the relay token endpoint, expiration is required, and optional `iat`/`nbf` timestamps are checked with 60 seconds of skew. Configured workload subjects may differ from the OAuth client ID. Tokens are reusable until expiry; verification does not call Kubernetes TokenReview.
+- `PrivateKeyJwt`: a signed client assertion is verified against inline JWKS, a JWKS URL, or configured issuer discovery. `issuer` and `subject` are exact claim constraints, each defaulting to `clientId`; `client_id` must still match `clientId`. `audience` is an optional non-empty exact audience constraint, defaulting to the relay token endpoint URL; the JWT must contain it as a string or array element. Expiration is required, and optional `iat`/`nbf` timestamps are checked with 60 seconds of skew. Configured workload subjects may differ from the OAuth client ID. Tokens are reusable until expiry; verification does not call Kubernetes TokenReview.
 
 `ResourceResolver` resolves relays and upstreams independently for every request. `Registry`
 implements the resolver with an atomically swapped `ProviderSnapshot` containing both maps.

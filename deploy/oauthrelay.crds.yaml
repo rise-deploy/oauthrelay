@@ -429,6 +429,9 @@ spec:
                   - allOf:
                     - not:
                         required:
+                        - audience
+                    - not:
+                        required:
                         - clientId
                     - not:
                         required:
@@ -455,6 +458,9 @@ spec:
                   - allOf:
                     - not:
                         required:
+                        - audience
+                    - not:
+                        required:
                         - clientId
                     - not:
                         required:
@@ -479,6 +485,9 @@ spec:
                     - type
                 - allOf:
                   - allOf:
+                    - not:
+                        required:
+                        - audience
                     - not:
                         required:
                         - issuer
@@ -834,6 +843,8 @@ spec:
                       required:
                       - issuer
                     properties:
+                      audience:
+                        minLength: 1
                       clientId: {}
                       issuer:
                         minLength: 1
@@ -942,6 +953,10 @@ spec:
                     - clientId
                     - type
                 properties:
+                  audience:
+                    description: Exact required assertion audience; defaults to the relay token endpoint URL.
+                    minLength: 1
+                    type: string
                   clientId:
                     description: Relay-specific downstream client identifier.
                     type: string
