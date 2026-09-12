@@ -15,6 +15,9 @@ pub(crate) fn structural<T: JsonSchema>() -> Schema {
     Schema::try_from(value).expect("generated schema is an object")
 }
 
+/// Hoists object properties out of schemars unions to satisfy Kubernetes structural
+/// schema rules while preserving each alternative's validation constraints. The
+/// `allOf` wrappers keep kube's schema rewriter from hoisting those constraints too.
 fn adapt(value: &mut Value) {
     match value {
         Value::Array(values) => {
