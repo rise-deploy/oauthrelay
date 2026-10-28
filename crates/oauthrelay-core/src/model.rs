@@ -111,6 +111,16 @@ pub struct Upstream {
     pub jwks_uri: Option<Url>,
     pub client_id: String,
     pub client_secret: SecretString,
+    #[serde(default)]
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEndpointAuthMethod {
+    #[default]
+    ClientSecretPost,
+    ClientSecretBasic,
 }
 
 #[derive(Clone, Debug, Deserialize)]

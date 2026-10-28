@@ -1,12 +1,12 @@
 use super::*;
 use crate::{
-    ClientAuth, MemoryReplayCache, ProviderSnapshot, RedirectMatcher, SecretString, Upstream,
-    XChaChaSealer,
+    ClientAuth, MemoryReplayCache, ProviderSnapshot, RedirectMatcher, SecretString,
+    TokenEndpointAuthMethod, Upstream, XChaChaSealer,
 };
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, Uri},
+    http::{HeaderMap, Request, Uri},
     routing::{get, post},
 };
 use http_body_util::BodyExt;
@@ -26,7 +26,14 @@ use std::sync::{
 use tower::ServiceExt;
 
 type FormPairs = Vec<(String, String)>;
-type RequestCapture = Arc<StdMutex<Vec<FormPairs>>>;
+type AuthorizeCapture = Arc<StdMutex<Vec<FormPairs>>>;
+type TokenCapture = Arc<StdMutex<Vec<CapturedTokenRequest>>>;
+
+#[derive(Clone, Debug, Default)]
+struct CapturedTokenRequest {
+    form: FormPairs,
+    authorization: Option<String>,
+}
 
 #[derive(Clone)]
 struct MockIdpState {
@@ -36,8 +43,8 @@ struct MockIdpState {
 
 #[derive(Clone, Default)]
 struct MockCapture {
-    authorize: RequestCapture,
-    token: RequestCapture,
+    authorize: AuthorizeCapture,
+    token: TokenCapture,
 }
 
 #[derive(Clone, Copy)]
@@ -81,12 +88,25 @@ async fn mock_authorize(State(state): State<MockIdpState>, uri: Uri) -> Response
     found(callback.as_str())
 }
 
-async fn mock_token(State(state): State<MockIdpState>, body: String) -> Response {
-    state.capture.token.lock().unwrap().push(
-        url::form_urlencoded::parse(body.as_bytes())
-            .into_owned()
-            .collect(),
-    );
+async fn mock_token(
+    State(state): State<MockIdpState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    state
+        .capture
+        .token
+        .lock()
+        .unwrap()
+        .push(CapturedTokenRequest {
+            form: url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect(),
+            authorization: headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        });
     if body.contains("grant_type=refresh_token") {
         return Response::builder()
             .status(StatusCode::ACCEPTED)
@@ -340,6 +360,7 @@ async fn setup_signed_policy(
         jwks_uri: Some(base.join("jwks").unwrap()),
         client_id: "upstream-client".into(),
         client_secret: SecretString::new("upstream-secret"),
+        token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
     });
     let relay = Arc::new(Relay {
         key: key.clone(),
@@ -391,6 +412,30 @@ async fn setup_with_capture(
     tokio::task::JoinHandle<()>,
     MockCapture,
 ) {
+    setup_with_capture_upstream_auth(
+        key,
+        auth,
+        strategy,
+        allowed_scopes,
+        endpoint_configuration,
+        TokenEndpointAuthMethod::ClientSecretPost,
+    )
+    .await
+}
+
+async fn setup_with_capture_upstream_auth(
+    key: &str,
+    auth: ClientAuth,
+    strategy: KeyStrategy,
+    allowed_scopes: Option<Vec<String>>,
+    endpoint_configuration: EndpointConfiguration,
+    upstream_auth: TokenEndpointAuthMethod,
+) -> (
+    Router,
+    Arc<XChaChaSealer>,
+    tokio::task::JoinHandle<()>,
+    MockCapture,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let base = Url::parse(&format!("http://{address}/")).unwrap();
@@ -423,6 +468,7 @@ async fn setup_with_capture(
         jwks_uri,
         client_id: "upstream-client".into(),
         client_secret: SecretString::new("upstream-secret"),
+        token_endpoint_auth_method: upstream_auth,
     });
     let relay = Arc::new(Relay {
         key: key.clone(),
@@ -478,6 +524,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
         jwks_uri: None,
         client_id: "upstream-client".into(),
         client_secret: SecretString::new("upstream-secret"),
+        token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
     });
     let mut resources = ProviderSnapshot::default();
     resources.upstreams.insert(upstream_key.clone(), upstream);
@@ -718,6 +765,8 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     assert_eq!(response.headers()[header::PRAGMA], "no-cache");
     let upstream_refresh = capture.token.lock().unwrap().last().unwrap().clone();
+    assert!(upstream_refresh.authorization.is_none());
+    let upstream_refresh = upstream_refresh.form;
     assert!(upstream_refresh
         .iter()
         .any(|pair| pair == &("client_id".into(), "upstream-client".into())));
@@ -741,6 +790,62 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
         StatusCode::UNAUTHORIZED
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn upstream_token_requests_use_client_secret_basic_when_configured() {
+    let auth = ClientAuth::ClientSecret {
+        client_id: "application".into(),
+        client_secret: SecretString::new("application-secret"),
+    };
+    let (app, _, task, capture) = setup_with_capture_upstream_auth(
+        "github",
+        auth,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+        TokenEndpointAuthMethod::ClientSecretBasic,
+    )
+    .await;
+    let code = authorization_code(&app, "github", None).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", "https://app.example/callback"),
+        ("client_id", "application"),
+        ("client_secret", "application-secret"),
+    ])
+    .unwrap();
+    assert_eq!(
+        post_token(&app, "github", &form).await.status(),
+        StatusCode::CREATED
+    );
+    let refresh = "grant_type=refresh_token&refresh_token=refresh&client_id=application&client_secret=application-secret";
+    assert_eq!(
+        post_token(&app, "github", refresh).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let requests = capture.token.lock().unwrap().clone();
+    let expected_auth = "Basic dXBzdHJlYW0tY2xpZW50OnVwc3RyZWFtLXNlY3JldA==";
+    for request in requests {
+        assert_eq!(request.authorization.as_deref(), Some(expected_auth));
+        assert!(!request.form.iter().any(|(name, _)| name == "client_id"));
+        assert!(!request.form.iter().any(|(name, _)| name == "client_secret"));
+    }
+    task.abort();
+}
+
+#[test]
+fn basic_auth_value_urlencodes_credentials() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let expected = format!(
+        "Basic {}",
+        STANDARD.encode("client%3Aid:secret%2Bwith+space")
+    );
+    assert_eq!(
+        upstream_basic_auth_value("client:id", "secret+with space"),
+        expected
+    );
 }
 
 #[tokio::test]

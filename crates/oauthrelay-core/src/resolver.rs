@@ -160,7 +160,7 @@ impl ResourceResolver for ProviderSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClientAuth, RedirectMatcher, SecretString};
+    use crate::{ClientAuth, RedirectMatcher, SecretString, TokenEndpointAuthMethod};
     use url::Url;
 
     fn upstream(key: &str) -> Arc<Upstream> {
@@ -172,6 +172,7 @@ mod tests {
             jwks_uri: None,
             client_id: "id".into(),
             client_secret: SecretString::new("secret"),
+            token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
         })
     }
 

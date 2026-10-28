@@ -40,6 +40,7 @@ pub struct Upstream {
     pub jwks_uri: Option<Url>,
     pub client_id: String,
     pub client_secret: SecretString,
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
 }
 
 pub struct Relay {

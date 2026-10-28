@@ -24,6 +24,7 @@ spec:
       valueFrom:
         env:
           name: GOOGLE_CLIENT_SECRET
+    tokenEndpointAuthMethod: client_secret_post
 ---
 apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
@@ -68,6 +69,7 @@ An upstream and a relay may use the same name because identities include the res
 | `spec.endpoints.jwks` | no | Explicit upstream JWKS endpoint. Discovery supplies it when omitted. |
 | `spec.oauthClient.clientId` | yes | Provider OAuth client ID. |
 | `spec.oauthClient.clientSecret` | yes | Provider OAuth client secret as a [secret value](#secret-values). |
+| `spec.oauthClient.tokenEndpointAuthMethod` | no | Upstream token endpoint client authentication method: `client_secret_post` (default) or `client_secret_basic`. |
 
 `OAUTHRELAY_PUBLIC_URL` is the complete externally visible OAuth API base. The callback registered
 with the provider is derived from that base and the upstream name:

@@ -1,6 +1,6 @@
 use crate::{
     ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher, Relay,
-    ResourceKey, SecretString, Upstream,
+    ResourceKey, SecretString, TokenEndpointAuthMethod, Upstream,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -124,6 +124,17 @@ pub struct OAuthClient {
     pub client_id: String,
     /// Provider client secret, supplied inline or through a provider-supported reference.
     pub client_secret: SecretValue,
+    /// Authentication used at the provider token endpoint.
+    #[serde(default)]
+    pub token_endpoint_auth_method: UpstreamTokenEndpointAuthMethod,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTokenEndpointAuthMethod {
+    #[default]
+    ClientSecretPost,
+    ClientSecretBasic,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -416,6 +427,15 @@ pub async fn compile_resources(
             jwks_uri: parse_optional_url("spec.endpoints.jwks", resource.spec.endpoints.jwks)?,
             client_id: resource.spec.oauth_client.client_id,
             client_secret: secret,
+            token_endpoint_auth_method: match resource.spec.oauth_client.token_endpoint_auth_method
+            {
+                UpstreamTokenEndpointAuthMethod::ClientSecretPost => {
+                    TokenEndpointAuthMethod::ClientSecretPost
+                }
+                UpstreamTokenEndpointAuthMethod::ClientSecretBasic => {
+                    TokenEndpointAuthMethod::ClientSecretBasic
+                }
+            },
         };
         upstream
             .validate()
@@ -581,6 +601,8 @@ mod tests {
                     oauth_client: OAuthClient {
                         client_id: "client".into(),
                         client_secret: secret,
+                        token_endpoint_auth_method:
+                            UpstreamTokenEndpointAuthMethod::ClientSecretPost,
                     },
                 },
             }),
@@ -634,6 +656,31 @@ mod tests {
             HashMap::from([("hd".into(), "example.com".into())])
         );
         assert_eq!(*secrets.calls.lock().unwrap(), vec![source]);
+    }
+
+    #[tokio::test]
+    async fn compiles_upstream_token_endpoint_auth_method() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let ResourceDocument::Upstream(upstream) = &mut resources[0] else {
+            unreachable!()
+        };
+        upstream.spec.oauth_client.token_endpoint_auth_method =
+            UpstreamTokenEndpointAuthMethod::ClientSecretBasic;
+        let snapshot = compile_resources(resources, &secrets).await.unwrap();
+        assert_eq!(
+            snapshot
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .token_endpoint_auth_method,
+            TokenEndpointAuthMethod::ClientSecretBasic
+        );
     }
 
     #[tokio::test]

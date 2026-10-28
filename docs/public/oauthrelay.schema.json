@@ -412,6 +412,11 @@
         "clientSecret": {
           "description": "Provider client secret, supplied inline or through a provider-supported reference.",
           "$ref": "#/$defs/SecretValue"
+        },
+        "tokenEndpointAuthMethod": {
+          "description": "Authentication used at the provider token endpoint.",
+          "default": "client_secret_post",
+          "$ref": "#/$defs/UpstreamTokenEndpointAuthMethod"
         }
       },
       "additionalProperties": false,
@@ -1020,6 +1025,13 @@
       "required": [
         "issuerUrl",
         "oauthClient"
+      ]
+    },
+    "UpstreamTokenEndpointAuthMethod": {
+      "type": "string",
+      "enum": [
+        "client_secret_post",
+        "client_secret_basic"
       ]
     },
     "UriRedirectPolicy": {

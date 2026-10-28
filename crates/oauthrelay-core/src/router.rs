@@ -10,7 +10,10 @@ use axum::{
     routing::any,
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -572,21 +575,33 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
         Err(status) => return status.into_response(),
     };
     let callback = callback_url(&state.cfg.public_url, &upstream.key);
-    let upstream_response = match state
-        .cfg
-        .http
-        .post(endpoints.token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("client_id", upstream.client_id.as_str()),
-            ("client_secret", upstream.client_secret.expose()),
-            ("redirect_uri", callback.as_str()),
-            ("code_verifier", flow.upstream_pkce_verifier.as_str()),
-        ])
-        .send()
-        .await
-    {
+    let mut upstream_form = vec![
+        ("grant_type", "authorization_code".to_owned()),
+        ("code", code.to_owned()),
+        ("redirect_uri", callback.to_string()),
+        ("code_verifier", flow.upstream_pkce_verifier.to_owned()),
+    ];
+    let upstream_request = match upstream.token_endpoint_auth_method {
+        crate::TokenEndpointAuthMethod::ClientSecretPost => {
+            upstream_form.push(("client_id", upstream.client_id.clone()));
+            upstream_form.push(("client_secret", upstream.client_secret.expose().to_owned()));
+            state
+                .cfg
+                .http
+                .post(endpoints.token_endpoint)
+                .form(&upstream_form)
+        }
+        crate::TokenEndpointAuthMethod::ClientSecretBasic => state
+            .cfg
+            .http
+            .post(endpoints.token_endpoint)
+            .header(
+                header::AUTHORIZATION,
+                upstream_basic_auth_value(&upstream.client_id, upstream.client_secret.expose()),
+            )
+            .form(&upstream_form),
+    };
+    let upstream_response = match upstream_request.send().await {
         Ok(response) => response,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
@@ -1001,19 +1016,30 @@ async fn refresh(
         })
         .cloned()
         .collect();
-    upstream_form.push(("client_id".into(), upstream.client_id.clone()));
-    upstream_form.push((
-        "client_secret".into(),
-        upstream.client_secret.expose().to_owned(),
-    ));
-    match state
-        .cfg
-        .http
-        .post(endpoints.token_endpoint)
-        .form(&upstream_form)
-        .send()
-        .await
-    {
+    let upstream_request = match upstream.token_endpoint_auth_method {
+        crate::TokenEndpointAuthMethod::ClientSecretPost => {
+            upstream_form.push(("client_id".into(), upstream.client_id.clone()));
+            upstream_form.push((
+                "client_secret".into(),
+                upstream.client_secret.expose().to_owned(),
+            ));
+            state
+                .cfg
+                .http
+                .post(endpoints.token_endpoint)
+                .form(&upstream_form)
+        }
+        crate::TokenEndpointAuthMethod::ClientSecretBasic => state
+            .cfg
+            .http
+            .post(endpoints.token_endpoint)
+            .header(
+                header::AUTHORIZATION,
+                upstream_basic_auth_value(&upstream.client_id, upstream.client_secret.expose()),
+            )
+            .form(&upstream_form),
+    };
+    match upstream_request.send().await {
         Ok(response) => proxy_response(response).await,
         Err(_) => oauth_error(
             StatusCode::BAD_GATEWAY,
@@ -1021,6 +1047,13 @@ async fn refresh(
             "upstream request failed",
         ),
     }
+}
+
+fn upstream_basic_auth_value(client_id: &str, client_secret: &str) -> String {
+    let encode =
+        |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    let credentials = format!("{}:{}", encode(client_id), encode(client_secret));
+    format!("Basic {}", STANDARD.encode(credentials))
 }
 
 async fn authenticate(
