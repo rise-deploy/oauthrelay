@@ -183,6 +183,7 @@ mod tests {
             scopes: vec![],
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
+            id_token_policy: None,
             redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
         })
     }

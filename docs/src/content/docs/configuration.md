@@ -91,6 +91,7 @@ upstream-owned by the relay contract.
 | `spec.scopes.default` | no | `[]` | Scopes used when the authorization request omits `scope`. |
 | `spec.scopes.allowed` | no | unrestricted | Complete allow-list for configured and requested scopes. Every default scope must be allowed. |
 | `spec.requiredIdTokenClaims` | no | `{}` | Exact string values required in the verified upstream ID token. |
+| `spec.idTokenPolicy` | no | omitted | Typed claim rules for initial sign-in; all rules also compose with `requiredIdTokenClaims`. |
 | `spec.clientAuthentication` | yes | — | Authentication policy for requests to the relay token endpoint. |
 | `spec.redirectPolicy` | yes | — | Non-empty list of explicit application redirect matchers. |
 
@@ -140,6 +141,64 @@ as a string with the exact configured value. The policy reads only signed ID-tok
 not read UserInfo. A failed policy returns `invalid_grant` without returning upstream tokens. Relay
 codes remain single-use after a failed check. Refresh grants do not evaluate this policy because an
 upstream refresh response does not always contain an ID token.
+
+### ID-token admission policy
+
+`idTokenPolicy` evaluates top-level claims from the verified upstream ID token. It can require a
+verified email and admit either a Google Workspace domain or an explicit set of Gmail accounts:
+
+```yaml
+idTokenPolicy:
+  required:
+    email_verified:
+      booleanEquals: true
+  anyOf:
+    - hd:
+        stringEquals: example.com
+    - email:
+        stringIn:
+          - alice@gmail.com
+          - bob@gmail.com
+```
+
+Every matcher in `required` must pass. At least one `anyOf` branch must pass, and every matcher
+within that branch must pass. If both sections are configured, both must pass. A missing claim
+or a value of the wrong JSON type fails only its matcher: a Gmail account without `hd` can still
+match the email branch. When `requiredIdTokenClaims` is configured too, its exact-string checks
+must also pass. Both policy fields are optional; omitting both leaves admission to the upstream.
+
+Each claim has exactly one operator:
+
+| Operator | Configuration value | Comparison |
+| --- | --- | --- |
+| `stringEquals` | string | Exact, case-sensitive equality. |
+| `stringIn` | non-empty string list | Exact, case-sensitive membership. |
+| `stringLike` | string | Full-string, case-sensitive glob matching. |
+| `booleanEquals` | boolean | Exact JSON boolean equality; `true` does not match the string `"true"`. |
+
+For `stringLike`, `*` matches zero or more Unicode characters and `?` matches exactly one. All
+other characters, including brackets and backslashes, are literals; there is no regex or escape
+syntax, path-separator handling, or implicit email normalization. For example,
+`stringLike: "guest-?@example.net"` matches `guest-a@example.net`, but not `guest-ab@example.net`
+or `guest-a@example.net.evil`. Use Google's signed `hd` claim when checking Workspace membership;
+an email-address suffix alone does not establish it.
+
+Absent or null optional policy fields are omitted. Empty policies or sections, empty branches or
+membership lists, unknown operators, and multiple operators on one claim reject the candidate configuration. A denied
+authorization-code exchange returns `invalid_grant` without upstream tokens and consumes the
+single-use relay code. Failed signature, issuer, audience, nonce, or lifetime validation also
+rejects the exchange before claim evaluation.
+
+Admission rules apply only to authorization-code redemption. Refresh grants do not evaluate
+either policy field, even when they return an ID token. Removing an identity from an allowlist
+does not revoke an existing session or establish that a submitted refresh token passed admission.
+
+Enable `OAUTHRELAY_LOG=info,oauthrelay::id_token_policy=debug` to log matcher, branch, and final
+admission results, including missing-claim, wrong-type, and value-mismatch reasons. Events identify
+the relay, upstream, section, claim name, operator, and branch index where applicable. They do
+not include actual claim values, configured comparison values or patterns, or tokens. Invalid
+tokens produce a final rejection result without evaluating their untrusted claims. Exchanges
+without an admission policy or without a successful upstream response log a `skipped` outcome.
 
 ## Client authentication
 

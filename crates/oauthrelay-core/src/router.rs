@@ -756,7 +756,7 @@ async fn exchange_sealed_code(
             "PKCE challenge is missing",
         );
     }
-    let validation = validate_required_id_token_claims(
+    let validation = validate_id_token_policy(
         state,
         relay,
         upstream,
@@ -764,6 +764,20 @@ async fn exchange_sealed_code(
         envelope.id_token_nonce.as_deref(),
     )
     .await;
+    tracing::debug!(
+        target: "oauthrelay::id_token_policy",
+        relay = %relay.key,
+        upstream = %upstream.key,
+        policy_configured = !relay.required_id_token_claims.is_empty() || relay.id_token_policy.is_some(),
+        outcome = match validation {
+            Ok(()) if (relay.required_id_token_claims.is_empty() && relay.id_token_policy.is_none())
+                || !StatusCode::from_u16(envelope.upstream_response.status).is_ok_and(|status| status.is_success()) => "skipped",
+            Ok(()) => "allowed",
+            Err(IdTokenValidationError::Rejected) => "rejected",
+            Err(IdTokenValidationError::Unavailable) => "validation_unavailable",
+        },
+        "ID-token admission evaluation completed"
+    );
     if validation == Err(IdTokenValidationError::Unavailable) {
         return oauth_error(
             StatusCode::BAD_GATEWAY,
@@ -796,14 +810,14 @@ enum IdTokenValidationError {
     Unavailable,
 }
 
-async fn validate_required_id_token_claims(
+async fn validate_id_token_policy(
     state: &AppState,
     relay: &Relay,
     upstream: &Upstream,
     response: &StoredResponse,
     expected_nonce: Option<&str>,
 ) -> Result<(), IdTokenValidationError> {
-    if relay.required_id_token_claims.is_empty()
+    if (relay.required_id_token_claims.is_empty() && relay.id_token_policy.is_none())
         || !StatusCode::from_u16(response.status).is_ok_and(|status| status.is_success())
     {
         return Ok(());
@@ -873,11 +887,28 @@ async fn validate_required_id_token_claims(
         return Err(IdTokenValidationError::Rejected);
     }
 
-    if relay
-        .required_id_token_claims
-        .iter()
-        .all(|(name, expected)| claims.get(name).and_then(Value::as_str) == Some(expected))
-    {
+    let mut legacy_matches = true;
+    for (claim, expected) in &relay.required_id_token_claims {
+        let (matched, reason) = match claims.get(claim) {
+            None => (false, "missing_claim"),
+            Some(Value::String(actual)) if actual == expected => (true, "matched"),
+            Some(Value::String(_)) => (false, "value_mismatch"),
+            Some(_) => (false, "wrong_type"),
+        };
+        tracing::debug!(
+            target: "oauthrelay::id_token_policy",
+            relay = %relay.key, upstream = %upstream.key,
+            section = "requiredIdTokenClaims", claim,
+            operator = "stringEquals", matched, reason,
+            "ID-token policy matcher evaluated"
+        );
+        legacy_matches &= matched;
+    }
+    let policy_matches = relay
+        .id_token_policy
+        .as_ref()
+        .is_none_or(|policy| policy.evaluate(&claims, relay.key.as_str(), upstream.key.as_str()));
+    if legacy_matches && policy_matches {
         Ok(())
     } else {
         Err(IdTokenValidationError::Rejected)

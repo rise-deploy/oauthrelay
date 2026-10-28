@@ -1456,6 +1456,211 @@ spec:
                   type:
                     type: string
                 type: object
+              idTokenPolicy:
+                anyOf:
+                - allOf:
+                  - anyOf:
+                    - allOf:
+                      - properties:
+                          required:
+                            not:
+                              enum:
+                              - null
+                        required:
+                        - required
+                    - allOf:
+                      - properties:
+                          anyOf:
+                            not:
+                              enum:
+                              - null
+                        required:
+                        - anyOf
+                    properties:
+                      anyOf:
+                        items:
+                          minProperties: 1
+                        minItems: 1
+                      required:
+                        minProperties: 1
+                - allOf:
+                  - enum:
+                    - null
+                description: >-
+                  Typed admission policy applied to the verified upstream ID token, in addition
+                  to requiredIdTokenClaims.
+                properties:
+                  anyOf:
+                    description: At least one branch must pass; matchers within each branch are ANDed.
+                    items:
+                      additionalProperties:
+                        anyOf:
+                        - allOf:
+                          - allOf:
+                            - not:
+                                required:
+                                - booleanEquals
+                            - not:
+                                required:
+                                - stringIn
+                            - not:
+                                required:
+                                - stringLike
+                            properties:
+                              stringEquals: {}
+                            required:
+                            - stringEquals
+                        - allOf:
+                          - allOf:
+                            - not:
+                                required:
+                                - booleanEquals
+                            - not:
+                                required:
+                                - stringEquals
+                            - not:
+                                required:
+                                - stringLike
+                            properties:
+                              stringIn:
+                                items: {}
+                                minItems: 1
+                            required:
+                            - stringIn
+                        - allOf:
+                          - allOf:
+                            - not:
+                                required:
+                                - booleanEquals
+                            - not:
+                                required:
+                                - stringEquals
+                            - not:
+                                required:
+                                - stringIn
+                            properties:
+                              stringLike: {}
+                            required:
+                            - stringLike
+                        - allOf:
+                          - allOf:
+                            - not:
+                                required:
+                                - stringEquals
+                            - not:
+                                required:
+                                - stringIn
+                            - not:
+                                required:
+                                - stringLike
+                            properties:
+                              booleanEquals: {}
+                            required:
+                            - booleanEquals
+                        description: Exactly one typed comparison of a top-level ID-token claim.
+                        properties:
+                          booleanEquals:
+                            type: boolean
+                          stringEquals:
+                            type: string
+                          stringIn:
+                            items:
+                              type: string
+                            minItems: 1
+                            type: array
+                          stringLike:
+                            type: string
+                        type: object
+                      description: Claim names and matchers that must all pass within one policy section.
+                      minProperties: 1
+                      type: object
+                    minItems: 1
+                    nullable: true
+                    type: array
+                  required:
+                    additionalProperties:
+                      anyOf:
+                      - allOf:
+                        - allOf:
+                          - not:
+                              required:
+                              - booleanEquals
+                          - not:
+                              required:
+                              - stringIn
+                          - not:
+                              required:
+                              - stringLike
+                          properties:
+                            stringEquals: {}
+                          required:
+                          - stringEquals
+                      - allOf:
+                        - allOf:
+                          - not:
+                              required:
+                              - booleanEquals
+                          - not:
+                              required:
+                              - stringEquals
+                          - not:
+                              required:
+                              - stringLike
+                          properties:
+                            stringIn:
+                              items: {}
+                              minItems: 1
+                          required:
+                          - stringIn
+                      - allOf:
+                        - allOf:
+                          - not:
+                              required:
+                              - booleanEquals
+                          - not:
+                              required:
+                              - stringEquals
+                          - not:
+                              required:
+                              - stringIn
+                          properties:
+                            stringLike: {}
+                          required:
+                          - stringLike
+                      - allOf:
+                        - allOf:
+                          - not:
+                              required:
+                              - stringEquals
+                          - not:
+                              required:
+                              - stringIn
+                          - not:
+                              required:
+                              - stringLike
+                          properties:
+                            booleanEquals: {}
+                          required:
+                          - booleanEquals
+                      description: Exactly one typed comparison of a top-level ID-token claim.
+                      properties:
+                        booleanEquals:
+                          type: boolean
+                        stringEquals:
+                          type: string
+                        stringIn:
+                          items:
+                            type: string
+                          minItems: 1
+                          type: array
+                        stringLike:
+                          type: string
+                      type: object
+                    description: Every matcher must pass when this section is present.
+                    minProperties: 1
+                    nullable: true
+                    type: object
+                type: object
               redirectPolicy:
                 description: Explicit application redirect matchers.
                 items:

@@ -196,6 +196,44 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
     // Dynamic resources exercise API validation before typed deserialization rejects input.
     let dynamic_relays: Api<kube::core::DynamicObject> =
         Api::namespaced_with(admin.clone(), "oauthrelay", &Relay::api_resource());
+    let policy = json!({
+        "required": {"email_verified": {"booleanEquals": true}},
+        "anyOf": [
+            {"hd": {"stringEquals": "example.com"}},
+            {"email": {"stringIn": ["guest@gmail.com"]}},
+            {"email": {"stringLike": "guest-?@example.net"}}
+        ]
+    });
+    let mut expected = relay("policy", json!({"type":"Public"}));
+    expected["spec"]["idTokenPolicy"] = policy;
+    let result = relays
+        .create(&dry_run, &serde_json::from_value(expected.clone()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap()["spec"]["idTokenPolicy"],
+        expected["spec"]["idTokenPolicy"],
+        "API must retain every typed matcher and branch"
+    );
+    for policy in [
+        json!({}),
+        json!({"required": {}}),
+        json!({"anyOf": []}),
+        json!({"anyOf": [{}]}),
+        json!({"required": {"email": {"stringIn": []}}}),
+        json!({"required": {"email": {"stringEquals": "x", "stringLike": "*"}}}),
+        json!({"required": {"email_verified": {"booleanEquals": "true"}}}),
+    ] {
+        let mut invalid = relay("invalid-policy", json!({"type":"Public"}));
+        invalid["spec"]["idTokenPolicy"] = policy.clone();
+        let result = dynamic_relays
+            .create(&dry_run, &serde_json::from_value(invalid).unwrap())
+            .await;
+        assert!(
+            matches!(&result, Err(kube::Error::Api(status)) if status.code == 422),
+            "API must reject {policy}: {result:?}"
+        );
+    }
     for auth in [
         json!({"type":"Unknown"}),
         json!({"type":"ClientSecret","clientId":"app"}),

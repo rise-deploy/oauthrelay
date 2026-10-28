@@ -86,6 +86,13 @@ fn crds_are_deterministic_namespaced_and_structural() {
         assert!(!schema
             .to_string()
             .contains("x-kubernetes-preserve-unknown-fields"));
+        if crd["spec"]["names"]["kind"] == "Relay" {
+            let policy = &schema["properties"]["spec"]["properties"]["idTokenPolicy"];
+            assert_eq!(policy["properties"]["anyOf"]["type"], "array");
+            assert_eq!(policy["properties"]["anyOf"]["minItems"], 1);
+            assert_eq!(policy["properties"]["anyOf"]["items"]["minProperties"], 1);
+            assert_eq!(policy["properties"]["required"]["minProperties"], 1);
+        }
     }
 }
 

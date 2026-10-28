@@ -122,6 +122,8 @@ pub struct Relay {
     pub allowed_scopes: Option<Vec<String>>,
     #[serde(default)]
     pub required_id_token_claims: HashMap<String, String>,
+    #[serde(default)]
+    pub id_token_policy: Option<crate::IdTokenPolicy>,
     pub redirect_policy: Vec<RedirectMatcher>,
 }
 
@@ -274,6 +276,9 @@ impl Relay {
             .any(|claim| claim.is_empty())
         {
             return Err("required_id_token_claims must not contain an empty claim name".into());
+        }
+        if let Some(policy) = &self.id_token_policy {
+            policy.validate()?;
         }
         let mut configured_scopes = HashSet::new();
         for scope in &self.scopes {
@@ -493,6 +498,7 @@ mod tests {
             scopes: vec![],
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
+            id_token_policy: None,
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb?channel=stable&next=%2Fhome")
                     .unwrap(),
@@ -570,6 +576,7 @@ mod tests {
             scopes: vec![],
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
+            id_token_policy: None,
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb").unwrap(),
                 RedirectMatcher::origin("https://preview.example").unwrap(),
