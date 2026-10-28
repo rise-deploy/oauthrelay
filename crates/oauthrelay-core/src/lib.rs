@@ -20,6 +20,7 @@
 //! ```
 
 mod config;
+mod id_token_policy;
 mod jwks;
 mod model;
 mod resolver;
@@ -27,6 +28,7 @@ mod router;
 mod seal;
 
 pub use config::*;
+pub use id_token_policy::*;
 pub use jwks::*;
 pub use model::*;
 pub use resolver::*;

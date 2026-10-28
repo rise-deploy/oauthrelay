@@ -1,6 +1,6 @@
 use crate::{
-    ClientAuth, ClientJwks, ProviderSnapshot, PublicJwkSet, RedirectMatcher, Relay, ResourceKey,
-    SecretString, Upstream,
+    ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher, Relay,
+    ResourceKey, SecretString, Upstream,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -138,6 +138,9 @@ pub struct RelayResourceSpec {
     /// Exact string values required in the verified upstream ID token.
     #[serde(default)]
     pub required_id_token_claims: HashMap<String, String>,
+    /// Typed admission policy applied to the verified upstream ID token, in addition to requiredIdTokenClaims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token_policy: Option<IdTokenPolicy>,
     /// Authentication required at the relay token endpoint.
     pub client_authentication: ClientAuthentication,
     /// Explicit application redirect matchers.
@@ -491,6 +494,7 @@ pub async fn compile_resources(
             scopes: resource.spec.scopes.default,
             allowed_scopes: resource.spec.scopes.allowed,
             required_id_token_claims: resource.spec.required_id_token_claims,
+            id_token_policy: resource.spec.id_token_policy,
             redirect_policy,
         };
         relay
@@ -592,6 +596,7 @@ mod tests {
                     },
                     scopes: ScopePolicy::default(),
                     required_id_token_claims: HashMap::new(),
+                    id_token_policy: None,
                     client_authentication: ClientAuthentication::UpstreamClient,
                     redirect_policy: vec![RedirectPolicyEntry::Uri(UriRedirectPolicy {
                         uri: "https://app.example/callback".into(),
@@ -629,6 +634,49 @@ mod tests {
             HashMap::from([("hd".into(), "example.com".into())])
         );
         assert_eq!(*secrets.calls.lock().unwrap(), vec![source]);
+    }
+
+    #[tokio::test]
+    async fn compiles_typed_id_token_policy_and_rejects_empty_policy() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!()
+        };
+        relay.spec.id_token_policy = Some(serde_json::from_value(serde_json::json!({
+            "required": {"email_verified": {"booleanEquals": true}},
+            "anyOf": [{"hd": {"stringEquals": "example.com"}}, {"email": {"stringLike": "guest-?@gmail.com"}}]
+        })).unwrap());
+        let snapshot = compile_resources(resources.clone(), &secrets)
+            .await
+            .unwrap();
+        let compiled = snapshot.relays.values().next().unwrap();
+        assert!(compiled.id_token_policy.is_some());
+        assert!(compiled.required_id_token_claims.is_empty());
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!()
+        };
+        relay.spec.id_token_policy = Some(serde_json::from_value(serde_json::json!({})).unwrap());
+        assert!(compile_resources(resources, &secrets).await.is_err());
+    }
+
+    #[test]
+    fn null_optional_id_token_policy_is_omitted() {
+        let resource = serde_json::json!({
+            "apiVersion": "oauthrelay.dev/v1alpha1", "kind": "Relay", "metadata": {"name": "app"},
+            "spec": {"upstreamRef": {"name": "google"}, "clientAuthentication": {"type": "Public"},
+                "redirectPolicy": [{"uri": "https://app.example/callback"}], "idTokenPolicy": null}
+        });
+        let ResourceDocument::Relay(relay) =
+            serde_json::from_value::<ResourceDocument>(resource).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(relay.spec.id_token_policy.is_none());
     }
 
     #[tokio::test]

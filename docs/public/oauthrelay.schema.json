@@ -224,6 +224,134 @@
         "P-384"
       ]
     },
+    "IdTokenClaimMatcher": {
+      "description": "Exactly one typed comparison of a top-level ID-token claim.",
+      "anyOf": [
+        {
+          "description": "Case-sensitive equality with a string claim.",
+          "type": "object",
+          "properties": {
+            "stringEquals": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "stringEquals"
+          ]
+        },
+        {
+          "description": "Case-sensitive membership in a non-empty list of strings.",
+          "type": "object",
+          "properties": {
+            "stringIn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "stringIn"
+          ]
+        },
+        {
+          "description": "Full-string, case-sensitive glob: `*` matches any sequence; `?` matches one character.",
+          "type": "object",
+          "properties": {
+            "stringLike": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "stringLike"
+          ]
+        },
+        {
+          "description": "Equality with a JSON boolean, without string coercion.",
+          "type": "object",
+          "properties": {
+            "booleanEquals": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "booleanEquals"
+          ]
+        }
+      ]
+    },
+    "IdTokenClaimSet": {
+      "description": "Claim names and matchers that must all pass within one policy section.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/IdTokenClaimMatcher"
+      },
+      "minProperties": 1
+    },
+    "IdTokenPolicy": {
+      "description": "Admission rules evaluated against a verified upstream ID token.",
+      "type": "object",
+      "properties": {
+        "anyOf": {
+          "description": "At least one branch must pass; matchers within each branch are ANDed.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/IdTokenClaimSet"
+          },
+          "minItems": 1
+        },
+        "required": {
+          "description": "Every matcher must pass when this section is present.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdTokenClaimSet"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "required": {
+              "not": {
+                "enum": [
+                  null
+                ]
+              }
+            }
+          },
+          "required": [
+            "required"
+          ]
+        },
+        {
+          "properties": {
+            "anyOf": {
+              "not": {
+                "enum": [
+                  null
+                ]
+              }
+            }
+          },
+          "required": [
+            "anyOf"
+          ]
+        }
+      ]
+    },
     "InlineSecret": {
       "description": "Literal secret representation.",
       "type": "object",
@@ -601,6 +729,17 @@
         "clientAuthentication": {
           "description": "Authentication required at the relay token endpoint.",
           "$ref": "#/$defs/ClientAuthentication"
+        },
+        "idTokenPolicy": {
+          "description": "Typed admission policy applied to the verified upstream ID token, in addition to requiredIdTokenClaims.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdTokenPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "redirectPolicy": {
           "description": "Explicit application redirect matchers.",

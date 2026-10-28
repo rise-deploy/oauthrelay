@@ -33,7 +33,7 @@ configuration; Amazon Cognito is one example.
 - Public, shared-secret, upstream-client, and `private_key_jwt` relay authentication, including issuer/subject constraints for workload tokens.
 - Exact URI, HTTPS-origin, and variable-port loopback redirect policies with sealed state/code envelopes.
 - Transparent authorization, token, refresh, discovery metadata, and JWKS routing.
-- Relay-specific exact matching of verified upstream ID-token claims.
+- Relay-specific admission rules over verified upstream ID-token claims, with typed comparisons and glob matching.
 - Multi-document File configuration with local or AWS-backed secret references.
 - Namespaced Kubernetes custom resources, live watches, and Kubernetes Secret references.
 - AWS SSM resource discovery with SSM `SecureString` and Secrets Manager `jsonKey` references.

@@ -30,8 +30,12 @@ fn adapt(value: &mut Value) {
                 adapt(value);
             }
             for union in ["oneOf", "anyOf"] {
-                let Some(Value::Array(branches)) = object.remove(union) else {
+                // A properties dictionary may contain a field named anyOf or oneOf.
+                if !object.get(union).is_some_and(Value::is_array) {
                     continue;
+                }
+                let Some(Value::Array(branches)) = object.remove(union) else {
+                    unreachable!();
                 };
                 // OpenAPI represents nullable scalar alternatives without object properties.
                 if !branches.iter().any(|b| b.get("properties").is_some()) {

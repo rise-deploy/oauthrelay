@@ -124,6 +124,7 @@ struct SignedFixtureState {
     jwks_failures_remaining: Arc<AtomicUsize>,
     nonce: Arc<StdMutex<Option<String>>>,
     authorize: Arc<StdMutex<Vec<(String, String)>>>,
+    claim_overrides: Arc<StdMutex<serde_json::Map<String, Value>>>,
 }
 
 async fn signed_discovery(State(state): State<SignedFixtureState>) -> Json<Value> {
@@ -202,6 +203,13 @@ async fn signed_token(State(state): State<SignedFixtureState>, body: String) -> 
     if state.issuer == "https://accounts.google.com" {
         claims["hd"] = Value::String("example.com".into());
     }
+    for (name, value) in state.claim_overrides.lock().unwrap().iter() {
+        if value.is_null() {
+            claims.as_object_mut().unwrap().remove(name);
+        } else {
+            claims[name] = value.clone();
+        }
+    }
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("fixture-signing-key".into());
     let id_token = encode(
@@ -254,6 +262,22 @@ async fn signed_userinfo(headers: HeaderMap) -> Response {
 async fn setup_signed_profile(
     profile: RelayProfile,
     required_id_token_claims: HashMap<String, String>,
+) -> SignedProfile {
+    setup_signed_policy(profile, required_id_token_claims, None).await
+}
+
+type SignedProfile = (
+    Router,
+    SignedFixtureState,
+    tokio::task::JoinHandle<()>,
+    String,
+    ClientAuth,
+);
+
+async fn setup_signed_policy(
+    profile: RelayProfile,
+    required_id_token_claims: HashMap<String, String>,
+    id_token_policy: Option<crate::IdTokenPolicy>,
 ) -> (
     Router,
     SignedFixtureState,
@@ -287,6 +311,7 @@ async fn setup_signed_profile(
         jwks_failures_remaining: Arc::new(AtomicUsize::new(0)),
         nonce: Arc::new(StdMutex::new(None)),
         authorize: Arc::new(StdMutex::new(Vec::new())),
+        claim_overrides: Arc::new(StdMutex::new(serde_json::Map::new())),
     };
     let idp = Router::new()
         .route("/.well-known/openid-configuration", get(signed_discovery))
@@ -323,6 +348,7 @@ async fn setup_signed_profile(
         scopes: vec!["openid".into(), "email".into(), "profile".into()],
         allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
         required_id_token_claims,
+        id_token_policy,
         redirect_policy: vec![RedirectMatcher::uri(redirect_uri).unwrap()],
     });
     let mut resources = ProviderSnapshot::default();
@@ -405,6 +431,7 @@ async fn setup_with_capture(
         scopes: vec!["openid".into(), "email".into()],
         allowed_scopes,
         required_id_token_claims: HashMap::new(),
+        id_token_policy: None,
         redirect_policy: vec![
             RedirectMatcher::uri("https://app.example/callback").unwrap(),
             RedirectMatcher::uri("https://app.example/callback?channel=stable&next=%2Fhome")
@@ -465,6 +492,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
                 scopes: vec!["openid".into()],
                 allowed_scopes: None,
                 required_id_token_claims: HashMap::new(),
+                id_token_policy: None,
                 redirect_policy: vec![
                     RedirectMatcher::uri("https://app.example/callback").unwrap(),
                 ],
@@ -1124,6 +1152,129 @@ async fn required_id_token_claims_accept_exact_strings_and_reject_missing_or_mis
         }
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn id_token_policy_enforces_verified_domain_or_guest_at_code_redemption() {
+    let policy: crate::IdTokenPolicy = serde_json::from_value(json!({
+        "required": {"email_verified": {"booleanEquals": true}},
+        "anyOf": [
+            {"hd": {"stringEquals": "example.com"}},
+            {"email": {"stringIn": ["guest@gmail.com"]}}
+        ]
+    }))
+    .unwrap();
+    let (app, fixture, task, redirect_uri, _) = setup_signed_policy(
+        RelayProfile::Google,
+        HashMap::from([("name".into(), "Fixture Person".into())]),
+        Some(policy),
+    )
+    .await;
+    for (overrides, accepted) in [
+        (json!({}), true),
+        (json!({"hd": null, "email": "guest@gmail.com"}), true),
+        (json!({"hd": null, "email": "outsider@gmail.com"}), false),
+        (
+            json!({"hd": null, "email": "guest@gmail.com", "email_verified": false}),
+            false,
+        ),
+        (
+            json!({"hd": null, "email": "guest@gmail.com", "email_verified": "true"}),
+            false,
+        ),
+        (
+            json!({"hd": null, "email": "guest@gmail.com", "name": "Other Person"}),
+            false,
+        ),
+        (json!({"iss": "https://untrusted.example"}), false),
+        (json!({"aud": "other-client"}), false),
+        (json!({"exp": 1}), false),
+        (json!({"nonce": "wrong-nonce"}), false),
+    ] {
+        *fixture.claim_overrides.lock().unwrap() = overrides.as_object().unwrap().clone();
+        let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .unwrap();
+        let response = post_token(&app, "profile", &form).await;
+        assert_eq!(
+            response.status(),
+            if accepted {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{overrides}"
+        );
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        if accepted {
+            assert!(body.get("id_token").is_some());
+        } else {
+            assert_eq!(body["error"], "invalid_grant");
+            assert!(body.get("id_token").is_none());
+            assert!(body.get("access_token").is_none());
+            assert!(body.get("refresh_token").is_none());
+            let replay = post_token(&app, "profile", &form).await;
+            let replay_body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+            assert_eq!(replay_body["error_description"], "code was already used");
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn string_like_policy_applies_only_to_initial_admission() {
+    let policy: crate::IdTokenPolicy = serde_json::from_value(json!({
+        "required": {"email": {"stringLike": "*@example.com"}}
+    }))
+    .unwrap();
+    let (app, fixture, task, redirect_uri, _) =
+        setup_signed_policy(RelayProfile::Google, HashMap::new(), Some(policy)).await;
+    let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ])
+    .unwrap();
+    assert_eq!(
+        post_token(&app, "profile", &form).await.status(),
+        StatusCode::OK
+    );
+    fixture
+        .claim_overrides
+        .lock()
+        .unwrap()
+        .insert("email".into(), json!("person@example.com.evil"));
+    let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ])
+    .unwrap();
+    let denied = post_token(&app, "profile", &form).await;
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+    let denied_body: Value = serde_json::from_slice(&response_body(denied).await).unwrap();
+    assert_eq!(denied_body["error"], "invalid_grant");
+    assert!(denied_body.get("access_token").is_none());
+    let refresh = post_token(
+        &app,
+        "profile",
+        "grant_type=refresh_token&refresh_token=fixture-refresh-token",
+    )
+    .await;
+    assert_eq!(refresh.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response_body(refresh).await).unwrap();
+    assert_eq!(body["access_token"], "fixture-refreshed-access-token");
+    assert!(body.get("id_token").is_none());
+    task.abort();
 }
 
 #[tokio::test]
