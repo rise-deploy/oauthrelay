@@ -826,8 +826,10 @@ impl Rotator {
         let Some(ttl) = ttl_until(family_expires_ms, (self.clock)()) else {
             return Ok(());
         };
+        // Only the marker's presence is read; the random value keeps it unique to this writer, as
+        // the store contract requires.
         self.store
-            .put_if_absent(&self.family_key(family_id), b"1", ttl)
+            .put_if_absent(&self.family_key(family_id), &random_array::<16>(), ttl)
             .await?;
         let head_key = self.head_key(family_id);
         let head = self
