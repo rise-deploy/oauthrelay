@@ -282,6 +282,53 @@
           "required": [
             "booleanEquals"
           ]
+        },
+        {
+          "description": "The claim is an array of strings and at least one listed value is an element\n(case-sensitive).",
+          "type": "object",
+          "properties": {
+            "arrayContainsAny": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "arrayContainsAny"
+          ]
+        },
+        {
+          "description": "The claim is an array of strings and every listed value is an element\n(case-sensitive).",
+          "type": "object",
+          "properties": {
+            "arrayContainsAll": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "arrayContainsAll"
+          ]
+        },
+        {
+          "description": "The claim is an array of strings and at least one element matches the `stringLike` glob.",
+          "type": "object",
+          "properties": {
+            "arrayLikeAny": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "arrayLikeAny"
+          ]
         }
       ]
     },
