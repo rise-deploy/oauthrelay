@@ -1,0 +1,1257 @@
+use crate::{
+    ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher,
+    RefreshTokenMode, RefreshTokens, Relay, ResourceKey, SecretString, TokenEndpointAuthMethod,
+    Upstream,
+};
+use anyhow::{anyhow, Context};
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
+use url::Url;
+
+/// API version accepted by oauthrelay resource documents.
+pub const API_VERSION: &str = "oauthrelay.dev/v1alpha1";
+
+/// Returns the JSON Schema for one oauthrelay resource document.
+pub fn resource_schema() -> schemars::Schema {
+    schemars::schema_for!(ResourceDocument)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind")]
+/// A versioned oauthrelay configuration resource.
+pub enum ResourceDocument {
+    /// An external OAuth/OIDC provider client and its stable callback.
+    Upstream(UpstreamResource),
+    /// A transparent-relay policy that references an upstream.
+    Relay(RelayResource),
+}
+
+impl ResourceDocument {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Upstream(_) => "Upstream",
+            Self::Relay(_) => "Relay",
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Upstream(resource) => &resource.metadata.name,
+            Self::Relay(resource) => &resource.metadata.name,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// An external OAuth/OIDC provider connection.
+pub struct UpstreamResource {
+    /// Configuration API version. Must be `oauthrelay.dev/v1alpha1`.
+    #[serde(rename = "apiVersion")]
+    pub api_version: ApiVersion,
+    /// Resource identity.
+    pub metadata: Metadata,
+    /// Provider connection and OAuth client configuration.
+    pub spec: UpstreamResourceSpec,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// A transparent relay that applies downstream policy to one upstream.
+pub struct RelayResource {
+    /// Configuration API version. Must be `oauthrelay.dev/v1alpha1`.
+    #[serde(rename = "apiVersion")]
+    pub api_version: ApiVersion,
+    /// Resource identity.
+    pub metadata: Metadata,
+    /// Upstream reference and transparent-relay policy.
+    pub spec: RelayResourceSpec,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+/// Supported configuration API versions.
+pub enum ApiVersion {
+    /// Initial upstream and relay resource API.
+    #[serde(rename = "oauthrelay.dev/v1alpha1")]
+    V1Alpha1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Common resource identity fields.
+pub struct Metadata {
+    /// Kubernetes namespace; ignored by File and SSM resource discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`.
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// External issuer, optional explicit endpoints, and provider OAuth client.
+pub struct UpstreamResourceSpec {
+    /// Absolute HTTP(S) issuer URL used for discovery and transparent token trust.
+    pub issuer_url: String,
+    /// Explicit provider endpoints. Omitted endpoints are resolved through issuer discovery.
+    #[serde(default)]
+    pub endpoints: UpstreamEndpoints,
+    /// OAuth client registered with the external provider.
+    pub oauth_client: OAuthClient,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Optional explicit provider endpoints.
+pub struct UpstreamEndpoints {
+    /// Absolute provider authorization endpoint.
+    #[serde(default)]
+    pub authorization: Option<String>,
+    /// Absolute provider token endpoint.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Absolute provider JSON Web Key Set endpoint.
+    #[serde(default)]
+    pub jwks: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// OAuth client registered with the external provider.
+pub struct OAuthClient {
+    /// Provider client identifier.
+    pub client_id: String,
+    /// Provider client secret, supplied inline or through a provider-supported reference.
+    pub client_secret: SecretValue,
+    /// How the relay authenticates at the provider token endpoint. Choose `client_secret_basic`
+    /// for providers that accept only HTTP Basic client authentication. Defaults to
+    /// `client_secret_post`.
+    #[serde(default)]
+    pub token_endpoint_auth_method: TokenEndpointAuthMethodSpec,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// Client authentication method at the provider token endpoint.
+pub enum TokenEndpointAuthMethodSpec {
+    /// Send `client_id` and `client_secret` as form fields in the request body.
+    #[default]
+    ClientSecretPost,
+    /// Send the credentials in an HTTP Basic `Authorization` header (RFC 6749 section 2.3.1) and
+    /// leave them out of the request body.
+    ClientSecretBasic,
+}
+
+impl From<TokenEndpointAuthMethodSpec> for TokenEndpointAuthMethod {
+    fn from(spec: TokenEndpointAuthMethodSpec) -> Self {
+        match spec {
+            TokenEndpointAuthMethodSpec::ClientSecretPost => Self::ClientSecretPost,
+            TokenEndpointAuthMethodSpec::ClientSecretBasic => Self::ClientSecretBasic,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Transparent-relay policy and upstream reference.
+pub struct RelayResourceSpec {
+    /// Upstream used for authorization and token exchange.
+    pub upstream_ref: ResourceReference,
+    /// Default and allowed upstream scopes.
+    #[serde(default)]
+    pub scopes: ScopePolicy,
+    /// Exact string values required in the verified upstream ID token.
+    #[serde(default)]
+    pub required_id_token_claims: HashMap<String, String>,
+    /// Typed admission policy applied to the verified upstream ID token, in addition to requiredIdTokenClaims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token_policy: Option<IdTokenPolicy>,
+    /// How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.
+    #[serde(default, skip_serializing_if = "RefreshTokensSpec::is_default")]
+    pub refresh_tokens: RefreshTokensSpec,
+    /// Authentication required at the relay token endpoint.
+    pub client_authentication: ClientAuthentication,
+    /// Explicit application redirect matchers.
+    #[schemars(length(min = 1))]
+    pub redirect_policy: Vec<RedirectPolicyEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Refresh-token handling for token responses.
+pub struct RefreshTokensSpec {
+    /// `passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque
+    /// handle in its place, so a refresh token that leaves the relying party cannot be used
+    /// at the upstream directly. `rotating` returns single-use handles whose state lives in the
+    /// transient store, so a replayed handle is detected and revokes its whole token family;
+    /// it requires a store shared by all serving instances.
+    #[serde(default)]
+    pub mode: RefreshTokenModeSpec,
+    /// `rotating` only: seconds during which an already-rotated handle is still answered with the
+    /// same successor, so concurrent tabs and retried requests are safe. 1 to 300; defaults to 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 300))]
+    pub grace_period_seconds: Option<u32>,
+    /// `rotating` only: absolute lifetime of a refresh-token family in seconds, measured from the
+    /// original sign-in. After it a refresh fails with `invalid_grant`. At least
+    /// `gracePeriodSeconds`; defaults to 2592000 (30 days).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 315360000))]
+    pub max_lifetime_seconds: Option<u32>,
+}
+
+impl RefreshTokensSpec {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+/// How the relay presents upstream refresh tokens downstream.
+pub enum RefreshTokenModeSpec {
+    /// Return the upstream refresh token unchanged.
+    #[default]
+    Passthrough,
+    /// Replace the upstream refresh token with a handle sealed to this relay.
+    Sealed,
+    /// Replace the upstream refresh token with a single-use handle; each refresh issues a
+    /// successor and a replayed handle revokes the family.
+    Rotating,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Reference to another resource of the expected kind.
+pub struct ResourceReference {
+    /// Referenced resource name.
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Scopes applied to upstream authorization and refresh requests.
+pub struct ScopePolicy {
+    /// Scopes used when an authorization request omits `scope`.
+    #[serde(default)]
+    pub default: Vec<String>,
+    /// Complete allow-list for configured and requested scopes. Omission leaves scope policy to the upstream.
+    #[serde(default)]
+    pub allowed: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+/// One explicit application redirect matcher.
+pub enum RedirectPolicyEntry {
+    /// Match one complete redirect URI exactly.
+    Uri(UriRedirectPolicy),
+    /// Match every path and query at one HTTPS origin.
+    Origin(OriginRedirectPolicy),
+    /// Match one loopback path and query on any runtime port.
+    Loopback(LoopbackRedirectPolicy),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Exact redirect URI matcher.
+pub struct UriRedirectPolicy {
+    /// Complete HTTPS URI, or an exact HTTP URI on an IP-literal loopback host.
+    uri: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// HTTPS origin matcher.
+pub struct OriginRedirectPolicy {
+    /// HTTPS scheme, host, and optional port; every path and query at the origin is allowed.
+    origin: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Variable-port loopback matcher.
+pub struct LoopbackRedirectPolicy {
+    /// HTTP URI on 127.0.0.1 or ::1 without a port; path and query match exactly.
+    loopback: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "type", deny_unknown_fields)]
+#[schemars(transform = require_jwks_source)]
+/// Authentication accepted from a relying party at the relay token endpoint.
+pub enum ClientAuthentication {
+    /// Require the referenced upstream's OAuth client ID and secret.
+    UpstreamClient,
+    /// Accept no client secret and require S256 PKCE for authorization-code flows.
+    Public,
+    /// Require a relay-specific client ID and shared secret.
+    ClientSecret {
+        /// Relay-specific downstream client identifier.
+        #[serde(rename = "clientId")]
+        client_id: String,
+        /// Relay-specific downstream client secret.
+        #[serde(rename = "clientSecret")]
+        client_secret: SecretValue,
+    },
+    /// Require a signed client assertion, optionally from a federated workload issuer.
+    PrivateKeyJwt {
+        /// Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.
+        /// Requires a transient store shared by all serving instances; false permits reusable workload JWTs.
+        #[serde(
+            default,
+            rename = "requireSingleUse",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        require_single_use: bool,
+        /// Client identifier required in the token request; default assertion issuer and subject.
+        #[serde(rename = "clientId")]
+        client_id: String,
+        /// Exact assertion issuer. HTTPS URL (HTTP allowed on loopback); defaults to clientId.
+        /// Supplies OIDC discovery when neither jwks nor jwksUrl is configured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String", length(min = 1))]
+        issuer: Option<String>,
+        /// Exact assertion subject, such as system:serviceaccount:namespace:name; defaults to clientId.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String", length(min = 1))]
+        subject: Option<String>,
+        /// Exact required assertion audience; defaults to the relay token endpoint URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String", length(min = 1))]
+        audience: Option<String>,
+        /// Inline public keys. Mutually exclusive with jwksUrl; omit both to discover from issuer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "PublicJwkSet")]
+        jwks: Option<PublicJwkSet>,
+        /// Absolute HTTP(S) JWKS URL. Mutually exclusive with jwks; omit both to discover from issuer.
+        #[serde(default, rename = "jwksUrl", skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "String")]
+        jwks_url: Option<String>,
+    },
+}
+
+/// Require one explicit key source, or issuer discovery when neither is supplied.
+fn require_jwks_source(schema: &mut schemars::Schema) {
+    if let Some(variants) = schema
+        .get_mut("oneOf")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for variant in variants {
+            if variant
+                .get("properties")
+                .and_then(|p| p.get("jwksUrl"))
+                .is_some()
+            {
+                variant["oneOf"] = serde_json::json!([
+                    {"required":["jwks"], "not":{"required":["jwksUrl"]}},
+                    {"required":["jwksUrl"], "not":{"required":["jwks"]}},
+                    {"required":["issuer"], "not":{"anyOf":[{"required":["jwks"]},{"required":["jwksUrl"]}]}}
+                ]);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+/// A secret supplied either inline or through exactly one external source.
+pub enum SecretValue {
+    /// Inline secret value.
+    Value(InlineSecret),
+    /// Provider-resolved secret reference.
+    ValueFrom(ReferencedSecret),
+}
+
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Literal secret representation.
+pub struct InlineSecret {
+    /// Literal secret value.
+    value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// External secret reference.
+pub struct ReferencedSecret {
+    /// Exactly one provider-specific secret source.
+    value_from: SecretSource,
+}
+
+impl std::fmt::Debug for InlineSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InlineSecret([REDACTED])")
+    }
+}
+
+impl SecretValue {
+    pub fn value(&self) -> Option<&str> {
+        match self {
+            Self::Value(secret) => Some(&secret.value),
+            Self::ValueFrom(_) => None,
+        }
+    }
+
+    pub fn value_from(&self) -> Option<&SecretSource> {
+        match self {
+            Self::Value(_) => None,
+            Self::ValueFrom(secret) => Some(&secret.value_from),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Secret sources resolved by configured provider backends.
+pub enum SecretSource {
+    /// Environment variable in the oauthrelay process.
+    Env {
+        /// Environment variable name.
+        name: String,
+    },
+    /// Local file accessible to the oauthrelay process.
+    File {
+        /// Absolute path or path relative to the resource file.
+        path: String,
+    },
+    /// Exact AWS SSM SecureString parameter.
+    AwsSsmParameter {
+        /// Absolute SSM parameter name.
+        name: String,
+    },
+    /// Secret key resolved within the Kubernetes provider namespace.
+    SecretKeyRef {
+        /// Secret resource name.
+        name: String,
+        /// Key in the Secret data map.
+        key: String,
+    },
+    /// AWS Secrets Manager SecretString.
+    AwsSecretsManager {
+        /// Secret name or ARN passed to Secrets Manager GetSecretValue.
+        #[serde(rename = "secretId")]
+        secret_id: String,
+        /// Optional top-level JSON string field selected from SecretString.
+        #[serde(default, rename = "jsonKey")]
+        json_key: Option<String>,
+    },
+}
+
+#[async_trait]
+pub trait SecretResolver: Send + Sync {
+    async fn resolve_value(&self, value: &str) -> anyhow::Result<SecretString>;
+    async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString>;
+}
+
+pub async fn compile_resources(
+    documents: Vec<ResourceDocument>,
+    secrets: &dyn SecretResolver,
+) -> anyhow::Result<ProviderSnapshot> {
+    let mut upstream_documents = Vec::new();
+    let mut relay_documents = Vec::new();
+    let mut identities = std::collections::HashSet::new();
+
+    for document in documents {
+        let identity = (document.kind(), document.name().to_owned());
+        if !identities.insert(identity.clone()) {
+            return Err(anyhow!("duplicate {}/{}", identity.0, identity.1));
+        }
+        match document {
+            ResourceDocument::Upstream(resource) => upstream_documents.push(resource),
+            ResourceDocument::Relay(resource) => relay_documents.push(resource),
+        }
+    }
+
+    let mut snapshot = ProviderSnapshot::default();
+    let mut secret_cache = HashMap::new();
+    for resource in upstream_documents {
+        let key = resource_key("Upstream", &resource.metadata.name)?;
+        let secret = resolve_secret(
+            &resource.spec.oauth_client.client_secret,
+            secrets,
+            &mut secret_cache,
+        )
+        .await
+        .with_context(|| format!("Upstream/{key} spec.oauthClient.clientSecret"))?;
+        let upstream = Upstream {
+            key: key.clone(),
+            issuer_url: parse_url("spec.issuerUrl", &resource.spec.issuer_url)?,
+            authorization_endpoint: parse_optional_url(
+                "spec.endpoints.authorization",
+                resource.spec.endpoints.authorization,
+            )?,
+            token_endpoint: parse_optional_url(
+                "spec.endpoints.token",
+                resource.spec.endpoints.token,
+            )?,
+            jwks_uri: parse_optional_url("spec.endpoints.jwks", resource.spec.endpoints.jwks)?,
+            client_id: resource.spec.oauth_client.client_id,
+            client_secret: secret,
+            token_endpoint_auth_method: resource
+                .spec
+                .oauth_client
+                .token_endpoint_auth_method
+                .into(),
+        };
+        upstream
+            .validate()
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("Upstream/{key}"))?;
+        snapshot.upstreams.insert(key, Arc::new(upstream));
+    }
+
+    for resource in relay_documents {
+        let key = resource_key("Relay", &resource.metadata.name)?;
+        let upstream = resource_key("Upstream", &resource.spec.upstream_ref.name)?;
+        let client_auth = match resource.spec.client_authentication {
+            ClientAuthentication::UpstreamClient => ClientAuth::UpstreamClient,
+            ClientAuthentication::Public => ClientAuth::Public,
+            ClientAuthentication::ClientSecret {
+                client_id,
+                client_secret,
+            } => ClientAuth::ClientSecret {
+                client_id,
+                client_secret: resolve_secret(&client_secret, secrets, &mut secret_cache)
+                    .await
+                    .with_context(|| {
+                        format!("Relay/{key} spec.clientAuthentication.clientSecret")
+                    })?,
+            },
+            ClientAuthentication::PrivateKeyJwt {
+                require_single_use,
+                client_id,
+                issuer,
+                subject,
+                audience,
+                jwks,
+                jwks_url,
+            } => ClientAuth::PrivateKeyJwt {
+                require_single_use,
+                client_id,
+                jwks: match (jwks, jwks_url) {
+                    (None, Some(value)) => Some(ClientJwks::Url(
+                        Url::parse(&value).context("spec.clientAuthentication.jwksUrl")?,
+                    )),
+                    (Some(jwks), None) => Some(ClientJwks::Inline(serde_json::to_value(jwks)?)),
+                    (None, None) if issuer.is_some() => None,
+                    _ => {
+                        return Err(anyhow!(
+                            "Relay/{key}: PrivateKeyJwt requires exactly one of jwks and jwksUrl, or issuer discovery with neither"
+                        ))
+                    }
+                },
+                issuer,
+                subject,
+                audience,
+            },
+        };
+        let redirect_policy = resource
+            .spec
+            .redirect_policy
+            .into_iter()
+            .enumerate()
+            .map(|(index, policy)| {
+                let matcher = match policy {
+                    RedirectPolicyEntry::Uri(policy) => RedirectMatcher::uri(policy.uri),
+                    RedirectPolicyEntry::Origin(policy) => RedirectMatcher::origin(&policy.origin),
+                    RedirectPolicyEntry::Loopback(policy) => {
+                        RedirectMatcher::loopback(&policy.loopback)
+                    }
+                };
+                matcher
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| format!("Relay/{key} spec.redirectPolicy[{index}]"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let relay = Relay {
+            key: key.clone(),
+            upstream,
+            client_auth,
+            scopes: resource.spec.scopes.default,
+            allowed_scopes: resource.spec.scopes.allowed,
+            required_id_token_claims: resource.spec.required_id_token_claims,
+            id_token_policy: resource.spec.id_token_policy,
+            refresh_tokens: compile_refresh_tokens(&resource.spec.refresh_tokens)
+                .with_context(|| format!("Relay/{key} spec.refreshTokens"))?,
+            redirect_policy,
+        };
+        relay
+            .validate()
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("Relay/{key}"))?;
+        snapshot.relays.insert(key, Arc::new(relay));
+    }
+
+    snapshot.validate().map_err(anyhow::Error::msg)?;
+    Ok(snapshot)
+}
+
+async fn resolve_secret(
+    secret: &SecretValue,
+    resolver: &dyn SecretResolver,
+    cache: &mut HashMap<SecretSource, SecretString>,
+) -> anyhow::Result<SecretString> {
+    if let Some(value) = secret.value() {
+        return resolver.resolve_value(value).await;
+    }
+    let source = secret.value_from().expect("validated source");
+    if let Some(value) = cache.get(source) {
+        return Ok(value.clone());
+    }
+    let value = resolver.resolve_source(source).await?;
+    cache.insert(source.clone(), value.clone());
+    Ok(value)
+}
+
+fn compile_refresh_tokens(spec: &RefreshTokensSpec) -> anyhow::Result<RefreshTokens> {
+    let mode = match spec.mode {
+        RefreshTokenModeSpec::Passthrough => RefreshTokenMode::Passthrough,
+        RefreshTokenModeSpec::Sealed => RefreshTokenMode::Sealed,
+        RefreshTokenModeSpec::Rotating => RefreshTokenMode::Rotating,
+    };
+    if mode != RefreshTokenMode::Rotating
+        && (spec.grace_period_seconds.is_some() || spec.max_lifetime_seconds.is_some())
+    {
+        return Err(anyhow!(
+            "gracePeriodSeconds and maxLifetimeSeconds apply only to mode: rotating"
+        ));
+    }
+    let defaults = RefreshTokens::default();
+    let compiled = RefreshTokens {
+        mode,
+        grace_period_seconds: spec
+            .grace_period_seconds
+            .map_or(defaults.grace_period_seconds, u64::from),
+        max_lifetime_seconds: spec
+            .max_lifetime_seconds
+            .map_or(defaults.max_lifetime_seconds, u64::from),
+    };
+    compiled.validate().map_err(anyhow::Error::msg)?;
+    Ok(compiled)
+}
+
+fn resource_key(kind: &str, value: &str) -> anyhow::Result<ResourceKey> {
+    if value.contains('/') {
+        return Err(anyhow!(
+            "{kind}/{value}: metadata.name must be one path segment"
+        ));
+    }
+    ResourceKey::new(value).map_err(|error| anyhow!("{kind}/{value}: metadata.name {error}"))
+}
+
+fn parse_url(field: &str, value: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(value).with_context(|| field.to_owned())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(anyhow!("{field}: must be an absolute http(s) URL"));
+    }
+    Ok(url)
+}
+
+fn parse_optional_url(field: &str, value: Option<String>) -> anyhow::Result<Option<Url>> {
+    value.map(|value| parse_url(field, &value)).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct MockSecrets {
+        calls: Mutex<Vec<SecretSource>>,
+    }
+
+    #[async_trait]
+    impl SecretResolver for MockSecrets {
+        async fn resolve_value(&self, value: &str) -> anyhow::Result<SecretString> {
+            Ok(SecretString::new(value))
+        }
+
+        async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString> {
+            self.calls.lock().unwrap().push(source.clone());
+            Ok(SecretString::new("resolved"))
+        }
+    }
+
+    fn documents(secret: SecretValue) -> Vec<ResourceDocument> {
+        vec![
+            ResourceDocument::Upstream(UpstreamResource {
+                api_version: ApiVersion::V1Alpha1,
+                metadata: Metadata {
+                    namespace: None,
+                    name: "google".into(),
+                },
+                spec: UpstreamResourceSpec {
+                    issuer_url: "https://issuer.example".into(),
+                    endpoints: UpstreamEndpoints::default(),
+                    oauth_client: OAuthClient {
+                        client_id: "client".into(),
+                        client_secret: secret,
+                        token_endpoint_auth_method: TokenEndpointAuthMethodSpec::default(),
+                    },
+                },
+            }),
+            ResourceDocument::Relay(RelayResource {
+                api_version: ApiVersion::V1Alpha1,
+                metadata: Metadata {
+                    namespace: None,
+                    name: "cognito".into(),
+                },
+                spec: RelayResourceSpec {
+                    upstream_ref: ResourceReference {
+                        name: "google".into(),
+                    },
+                    scopes: ScopePolicy::default(),
+                    required_id_token_claims: HashMap::new(),
+                    id_token_policy: None,
+                    refresh_tokens: RefreshTokensSpec::default(),
+                    client_authentication: ClientAuthentication::UpstreamClient,
+                    redirect_policy: vec![RedirectPolicyEntry::Uri(UriRedirectPolicy {
+                        uri: "https://app.example/callback".into(),
+                    })],
+                },
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn compiles_references_and_resolves_secret_source() {
+        let source = SecretSource::Env {
+            name: "GOOGLE_SECRET".into(),
+        };
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::ValueFrom(ReferencedSecret {
+            value_from: source.clone(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!();
+        };
+        relay.spec.required_id_token_claims = HashMap::from([("hd".into(), "example.com".into())]);
+        let snapshot = compile_resources(resources, &secrets).await.unwrap();
+        assert_eq!(snapshot.upstreams.len(), 1);
+        assert_eq!(snapshot.relays.len(), 1);
+        assert_eq!(
+            snapshot
+                .relays
+                .values()
+                .next()
+                .unwrap()
+                .required_id_token_claims,
+            HashMap::from([("hd".into(), "example.com".into())])
+        );
+        assert_eq!(*secrets.calls.lock().unwrap(), vec![source]);
+    }
+
+    #[tokio::test]
+    async fn compiles_upstream_token_endpoint_auth_method() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let ResourceDocument::Upstream(upstream) = &mut resources[0] else {
+            unreachable!()
+        };
+        upstream.spec.oauth_client.token_endpoint_auth_method =
+            TokenEndpointAuthMethodSpec::ClientSecretBasic;
+        let snapshot = compile_resources(resources, &secrets).await.unwrap();
+        assert_eq!(
+            snapshot
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .token_endpoint_auth_method,
+            TokenEndpointAuthMethod::ClientSecretBasic
+        );
+    }
+
+    #[test]
+    fn token_endpoint_auth_method_defaults_to_post_and_rejects_unknown_values() {
+        let client = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({"clientId": "id", "clientSecret": {"value": "s"}});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<OAuthClient>(value)
+        };
+        assert_eq!(
+            client(serde_json::json!({}))
+                .unwrap()
+                .token_endpoint_auth_method,
+            TokenEndpointAuthMethodSpec::ClientSecretPost
+        );
+        for (value, expected) in [
+            (
+                "client_secret_post",
+                TokenEndpointAuthMethodSpec::ClientSecretPost,
+            ),
+            (
+                "client_secret_basic",
+                TokenEndpointAuthMethodSpec::ClientSecretBasic,
+            ),
+        ] {
+            assert_eq!(
+                client(serde_json::json!({"tokenEndpointAuthMethod": value}))
+                    .unwrap()
+                    .token_endpoint_auth_method,
+                expected
+            );
+        }
+        for value in ["client_secret_jwt", "clientSecretBasic", "basic"] {
+            assert!(client(serde_json::json!({"tokenEndpointAuthMethod": value})).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn compiles_typed_id_token_policy_and_rejects_empty_policy() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!()
+        };
+        relay.spec.id_token_policy = Some(serde_json::from_value(serde_json::json!({
+            "required": {"email_verified": {"booleanEquals": true}},
+            "anyOf": [{"hd": {"stringEquals": "example.com"}}, {"email": {"stringLike": "guest-?@gmail.com"}}]
+        })).unwrap());
+        let snapshot = compile_resources(resources.clone(), &secrets)
+            .await
+            .unwrap();
+        let compiled = snapshot.relays.values().next().unwrap();
+        assert!(compiled.id_token_policy.is_some());
+        assert!(compiled.required_id_token_claims.is_empty());
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!()
+        };
+        relay.spec.id_token_policy = Some(serde_json::from_value(serde_json::json!({})).unwrap());
+        assert!(compile_resources(resources, &secrets).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn compiles_refresh_token_mode_and_defaults_to_passthrough() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let snapshot = compile_resources(resources.clone(), &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.relays.values().next().unwrap().refresh_tokens.mode,
+            RefreshTokenMode::Passthrough
+        );
+        let mut value = serde_json::to_value(&resources[1]).unwrap();
+        assert!(value["spec"].get("refreshTokens").is_none());
+        value["spec"]["refreshTokens"] = serde_json::json!({"mode": "sealed"});
+        let sealed: ResourceDocument = serde_json::from_value(value.clone()).unwrap();
+        let snapshot = compile_resources(vec![resources[0].clone(), sealed], &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.relays.values().next().unwrap().refresh_tokens.mode,
+            RefreshTokenMode::Sealed
+        );
+        for invalid in [
+            serde_json::json!({"mode": "sealed", "gracePeriod": "1m"}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": "30"}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": -1}),
+        ] {
+            value["spec"]["refreshTokens"] = invalid;
+            assert!(serde_json::from_value::<ResourceDocument>(value.clone()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn compiles_rotating_refresh_tokens_with_defaults_and_bounds() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let mut value = serde_json::to_value(&resources[1]).unwrap();
+        let compile = |refresh_tokens: serde_json::Value| {
+            let mut value = value.clone();
+            value["spec"]["refreshTokens"] = refresh_tokens;
+            let relay: ResourceDocument = serde_json::from_value(value).unwrap();
+            let resources = vec![resources[0].clone(), relay];
+            let secrets = &secrets;
+            async move {
+                compile_resources(resources, secrets).await.map(|snapshot| {
+                    snapshot
+                        .relays
+                        .values()
+                        .next()
+                        .unwrap()
+                        .refresh_tokens
+                        .clone()
+                })
+            }
+        };
+        let defaults = compile(serde_json::json!({"mode": "rotating"}))
+            .await
+            .unwrap();
+        assert_eq!(defaults.mode, RefreshTokenMode::Rotating);
+        assert_eq!(defaults.grace_period_seconds, 30);
+        assert_eq!(defaults.max_lifetime_seconds, 30 * 24 * 60 * 60);
+        let custom = compile(serde_json::json!({
+            "mode": "rotating", "gracePeriodSeconds": 300, "maxLifetimeSeconds": 3600
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            (custom.grace_period_seconds, custom.max_lifetime_seconds),
+            (300, 3600)
+        );
+
+        for invalid in [
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 0}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 301}),
+            serde_json::json!({"mode": "rotating", "maxLifetimeSeconds": 0}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 60, "maxLifetimeSeconds": 59}),
+            serde_json::json!({"mode": "rotating", "maxLifetimeSeconds": 315_360_001_u64}),
+            // Rotation settings mean nothing outside rotating mode and are not silently ignored.
+            serde_json::json!({"mode": "sealed", "gracePeriodSeconds": 30}),
+            serde_json::json!({"mode": "passthrough", "maxLifetimeSeconds": 3600}),
+            serde_json::json!({"gracePeriodSeconds": 30}),
+        ] {
+            let error = compile(invalid.clone()).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("refresh"),
+                "{invalid}: {error:#}"
+            );
+        }
+        value["spec"]["refreshTokens"] =
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 30});
+        let document: ResourceDocument = serde_json::from_value(value).unwrap();
+        let ResourceDocument::Relay(relay) = &document else {
+            unreachable!()
+        };
+        let serialized = serde_json::to_value(relay).unwrap();
+        assert_eq!(serialized["spec"]["refreshTokens"]["mode"], "rotating");
+        assert!(serialized["spec"]["refreshTokens"]
+            .get("maxLifetimeSeconds")
+            .is_none());
+    }
+
+    #[test]
+    fn null_optional_id_token_policy_is_omitted() {
+        let resource = serde_json::json!({
+            "apiVersion": "oauthrelay.dev/v1alpha1", "kind": "Relay", "metadata": {"name": "app"},
+            "spec": {"upstreamRef": {"name": "google"}, "clientAuthentication": {"type": "Public"},
+                "redirectPolicy": [{"uri": "https://app.example/callback"}], "idTokenPolicy": null}
+        });
+        let ResourceDocument::Relay(relay) =
+            serde_json::from_value::<ResourceDocument>(resource).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(relay.spec.id_token_policy.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolves_and_deduplicates_relay_client_secret_references() {
+        let source = SecretSource::AwsSsmParameter {
+            name: "/oauthrelay/secrets/shared".into(),
+        };
+        let mut resources = documents(SecretValue::ValueFrom(ReferencedSecret {
+            value_from: source.clone(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!();
+        };
+        relay.spec.client_authentication = ClientAuthentication::ClientSecret {
+            client_id: "downstream".into(),
+            client_secret: SecretValue::ValueFrom(ReferencedSecret {
+                value_from: source.clone(),
+            }),
+        };
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+
+        let snapshot = compile_resources(resources, &secrets).await.unwrap();
+        let relay = snapshot.relays.values().next().unwrap();
+        let ClientAuth::ClientSecret { client_secret, .. } = &relay.client_auth else {
+            panic!("expected relay client secret authentication");
+        };
+        assert_eq!(client_secret.expose(), "resolved");
+        assert_eq!(*secrets.calls.lock().unwrap(), vec![source]);
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_reference_and_ambiguous_secret() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "inline".into(),
+        }));
+        resources.remove(0);
+        assert!(compile_resources(resources, &secrets)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+
+        let ambiguous = r#"{"value":"inline","valueFrom":{"env":{"name":"X"}}}"#;
+        assert!(serde_json::from_str::<SecretValue>(ambiguous).is_err());
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_requires_strict_non_empty_entries() {
+        let valid = r#"[
+            {"uri":"https://app.example/callback?channel=stable"},
+            {"origin":"https://preview.example"},
+            {"loopback":"http://127.0.0.1/callback"}
+        ]"#;
+        let entries: Vec<RedirectPolicyEntry> = serde_json::from_str(valid).unwrap();
+        assert_eq!(entries.len(), 3);
+        for invalid in [
+            r#"[{"uri":"https://app.example/callback","origin":"https://app.example"}]"#,
+            r#"[{"prefix":"https://app.example"}]"#,
+            r#"{"allowedOrigins":["https://app.example"]}"#,
+        ] {
+            assert!(serde_json::from_str::<Vec<RedirectPolicyEntry>>(invalid).is_err());
+        }
+
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "inline".into(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!();
+        };
+        relay.spec.redirect_policy.clear();
+        let error = compile_resources(resources, &secrets).await.unwrap_err();
+        assert!(format!("{error:#}").contains("at least one matcher"));
+
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "inline".into(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!();
+        };
+        relay
+            .spec
+            .redirect_policy
+            .push(RedirectPolicyEntry::Uri(UriRedirectPolicy {
+                uri: "https://app.example/callback".into(),
+            }));
+        let error = compile_resources(resources, &secrets).await.unwrap_err();
+        assert!(format!("{error:#}").contains("must not contain duplicates"));
+    }
+
+    #[test]
+    fn generated_schema_contains_versioned_resources_and_json_key() {
+        let schema = serde_json::to_string(&resource_schema()).unwrap();
+        assert!(schema.contains(API_VERSION));
+        assert!(schema.contains("Upstream"));
+        assert!(schema.contains("Relay"));
+        assert!(schema.contains("awsSsmParameter"));
+        assert!(schema.contains("awsSecretsManager"));
+        assert!(schema.contains("jsonKey"));
+        assert!(schema.contains("requiredIdTokenClaims"));
+        assert!(schema.contains("stable callback"));
+        assert!(schema.contains("complete redirect URI exactly"));
+    }
+
+    #[test]
+    fn aws_secret_sources_require_cloud_prefixed_keys() {
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"awsSsmParameter":{"name":"/oauthrelay/secrets/google"}}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"awsSecretsManager":{"secretId":"oauthrelay/google","jsonKey":"clientSecret"}}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"ssmParameter":{"name":"/oauthrelay/secrets/google"}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"secretsManager":{"secretId":"oauthrelay/google"}}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn compiles_workload_identity_and_rejects_invalid_trust_configuration() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let issuer = "https://cluster.example";
+        let subject = "system:serviceaccount:workloads:worker";
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"jwksUrl":"https://keys.example/jwks"}),
+            serde_json::json!({"jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
+        ] {
+            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay","requireSingleUse":true});
+            auth.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "secret".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!()
+            };
+            relay.spec.client_authentication = serde_json::from_value(auth).unwrap();
+            let compiled = compile_resources(resources, &secrets).await.unwrap();
+            let ClientAuth::PrivateKeyJwt {
+                require_single_use,
+                issuer: actual_issuer,
+                subject: actual_subject,
+                audience: actual_audience,
+                ..
+            } = &compiled.relays.values().next().unwrap().client_auth
+            else {
+                unreachable!()
+            };
+            assert!(*require_single_use);
+            assert_eq!(actual_issuer.as_deref(), Some(issuer));
+            assert_eq!(actual_subject.as_deref(), Some(subject));
+            assert_eq!(actual_audience.as_deref(), Some("api://oauthrelay"));
+        }
+        for extra in [
+            serde_json::json!({"issuer":""}),
+            serde_json::json!({"issuer":"cluster.example"}),
+            serde_json::json!({"issuer":"http://cluster.example"}),
+            serde_json::json!({"issuer":"https://user@cluster.example"}),
+            serde_json::json!({"issuer":"https://cluster.example?query"}),
+            serde_json::json!({"issuer":"https://cluster.example#fragment"}),
+            serde_json::json!({"subject":""}),
+            serde_json::json!({"audience":""}),
+            serde_json::json!({"issuer":null}),
+            serde_json::json!({"jwksUrl":"https://keys.example/jwks","jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
+        ] {
+            let mut auth = serde_json::json!({"type":"PrivateKeyJwt","clientId":"worker","issuer":issuer,"subject":subject,"audience":"api://oauthrelay"});
+            auth.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "secret".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!()
+            };
+            relay.spec.client_authentication = serde_json::from_value(auth.clone()).unwrap();
+            assert!(
+                compile_resources(resources, &secrets).await.is_err(),
+                "{auth}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compilation_requires_one_jwks_source_and_ignores_namespace_identity() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        for auth in [
+            serde_json::json!({"type":"PrivateKeyJwt","clientId":"app"}),
+            serde_json::json!({"type":"PrivateKeyJwt","clientId":"app","jwksUrl":"https://app.example/jwks","jwks":{"keys":[{"kty":"RSA","n":"a","e":"b"}]}}),
+        ] {
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "secret".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!()
+            };
+            relay.spec.client_authentication = serde_json::from_value(auth).unwrap();
+            assert!(format!(
+                "{:#}",
+                compile_resources(resources, &secrets).await.unwrap_err()
+            )
+            .contains("exactly one"));
+        }
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let ResourceDocument::Upstream(upstream) = &mut resources[0] else {
+            unreachable!()
+        };
+        upstream.metadata.namespace = Some("first".into());
+        let mut duplicate = upstream.clone();
+        duplicate.metadata.namespace = Some("second".into());
+        assert!(compile_resources(resources.clone(), &secrets).await.is_ok());
+        resources.push(ResourceDocument::Upstream(duplicate));
+        assert!(compile_resources(resources, &secrets)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate Upstream"));
+    }
+}
+
+#[cfg(test)]
+mod kubernetes_configuration_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn namespaces_are_optional_and_do_not_change_file_identities() {
+        for namespace in [None, Some("team")] {
+            let metadata: Metadata =
+                serde_json::from_value(json!({"name":"issuer", "namespace":namespace})).unwrap();
+            assert_eq!(metadata.name, "issuer");
+            assert_eq!(metadata.namespace.as_deref(), namespace);
+        }
+    }
+
+    #[test]
+    fn private_key_jwt_accepts_exactly_one_typed_key_source() {
+        let base = json!({"type":"PrivateKeyJwt", "clientId":"app"});
+        for source in [
+            json!({"jwksUrl":"https://app.example/jwks"}),
+            json!({"jwks":{"keys":[{"kty":"RSA", "n":"AQAB", "e":"AQAB", "kid":"rsa"}]}}),
+            json!({"jwks":{"keys":[{"kty":"EC", "crv":"P-256", "x":"abc", "y":"def"}]}}),
+            json!({"jwks":{"keys":[{"kty":"OKP", "crv":"Ed25519", "x":"abc"}]}}),
+        ] {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(source.as_object().unwrap().clone());
+            let parsed: ClientAuthentication = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        }
+        for source in [
+            json!({"jwks":"https://app.example/jwks"}),
+            json!({"jwks":{"keys":[{"kty":"RSA", "n":"a"}]}}),
+            json!({"jwks":{"keys":[{"kty":"EC", "crv":"invalid", "x":"a", "y":"b"}]}}),
+        ] {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(source.as_object().unwrap().clone());
+            assert!(
+                serde_json::from_value::<ClientAuthentication>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_debug_output_is_redacted() {
+        let source: SecretValue = serde_json::from_value(json!({"value":"do-not-log"})).unwrap();
+        assert!(!format!("{source:?}").contains("do-not-log"));
+    }
+}

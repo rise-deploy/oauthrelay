@@ -1,0 +1,154 @@
+# A real Dex with Kubernetes storage, for the Dex AuthCode mapping tests (run.py applies it after
+# the other Kind tests and port-forwards the Service to the issuer URL below). Dex installs its own
+# CRDs. The two static clients are what crates/oauthrelay-store-kubernetes/tests/dex.rs logs in as.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dex
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dex
+  namespace: dex
+---
+# What Dex's Kubernetes storage documents: its own resources in its namespace, and creating the CRDs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dex
+  namespace: dex
+rules:
+  - apiGroups: [dex.coreos.com]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dex
+  namespace: dex
+subjects:
+  - kind: ServiceAccount
+    name: dex
+    namespace: dex
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dex
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: oauthrelay-test-dex-crds
+rules:
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [create, get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oauthrelay-test-dex-crds
+subjects:
+  - kind: ServiceAccount
+    name: dex
+    namespace: dex
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: oauthrelay-test-dex-crds
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dex
+  namespace: dex
+data:
+  config.yaml: |
+    # Reached through `kubectl port-forward` from the host, which is where the tests run.
+    issuer: http://127.0.0.1:15556/dex
+
+    storage:
+      type: kubernetes
+      config:
+        inCluster: true
+
+    web:
+      http: 0.0.0.0:5556
+
+    logger:
+      level: debug
+
+    oauth2:
+      grantTypes:
+        - authorization_code
+        - refresh_token
+        - urn:ietf:params:oauth:grant-type:device_code
+      responseTypes: [code]
+      skipApprovalScreen: true
+
+    staticClients:
+      - id: oauthrelay-test
+        name: oauthrelay test
+        secret: oauthrelay-test-secret
+        redirectURIs:
+          - http://127.0.0.1:18080/callback
+      - id: oauthrelay-device
+        name: oauthrelay device test
+        public: true
+        # Dex derives the device flow's redirect from the issuer path: {issuer path}/device/callback.
+        redirectURIs:
+          - /dex/device/callback
+
+    connectors:
+      - type: mockCallback
+        id: mock
+        name: Test identity
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dex
+  namespace: dex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dex
+  template:
+    metadata:
+      labels:
+        app: dex
+    spec:
+      serviceAccountName: dex
+      containers:
+        - name: dex
+          image: ghcr.io/dexidp/dex:v2.46.1
+          # The image is loaded into the cluster by run.py.
+          imagePullPolicy: IfNotPresent
+          args: [dex, serve, /etc/dex/config.yaml]
+          ports:
+            - containerPort: 5556
+          readinessProbe:
+            tcpSocket:
+              port: 5556
+          volumeMounts:
+            - name: config
+              mountPath: /etc/dex
+      volumes:
+        - name: config
+          configMap:
+            name: dex
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex
+  namespace: dex
+spec:
+  selector:
+    app: dex
+  ports:
+    - port: 5556
+      targetPort: 5556

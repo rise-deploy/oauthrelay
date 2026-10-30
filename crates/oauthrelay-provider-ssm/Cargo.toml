@@ -1,0 +1,25 @@
+[package]
+name = "oauthrelay-provider-ssm"
+description = "AWS SSM Parameter Store configuration provider for oauthrelay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["aws"]
+aws = ["dep:aws-sdk-secretsmanager", "dep:aws-sdk-ssm"]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+aws-sdk-secretsmanager = { workspace = true, optional = true }
+aws-sdk-ssm = { workspace = true, optional = true }
+oauthrelay-core = { path = "../oauthrelay-core" }
+oauthrelay-secret-resolver = { path = "../oauthrelay-secret-resolver" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true

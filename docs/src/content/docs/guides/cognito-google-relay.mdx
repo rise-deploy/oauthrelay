@@ -1,0 +1,183 @@
+---
+title: Cognito relay to Google
+description: Connect an Amazon Cognito user pool to Google through oauthrelay transparent relay.
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../components/Mermaid.astro';
+
+This layout lets one Google OAuth client serve many Amazon Cognito user pools through one stable
+oauthrelay callback. Each pool talks to the same relay for authorization and token exchange. That
+relay references the shared Google upstream, while Cognito validates Google's ID token and obtains
+claims from Google's UserInfo endpoint. The URLs below use
+`OAUTHRELAY_PUBLIC_URL=https://login.example.com/oidc`.
+
+<Mermaid
+  label="Multiple Cognito user pools use one relay backed by one Google upstream and one stable callback registered with Google."
+  chart={`flowchart LR
+    B[Browser]
+    C[Cognito user pools]
+    M[oauthrelay]
+    G[Google OAuth]
+
+    B --> C
+    C -->|authorize and token| M
+    M -->|authorize and code exchange| G
+    G -->|oauthrelay callback| M
+    M -->|Google-signed tokens| C
+    C -.->|JWKS and UserInfo| G`}
+/>
+
+## Why oauthrelay fits this topology
+
+Google sees one OAuth client and one allowed redirect URL regardless of how many Cognito pools use
+it:
+
+```text
+https://login.example.com/oidc/upstream/google/callback
+```
+
+oauthrelay remembers which validated Cognito `/oauth2/idpresponse` URL started each flow and returns
+the result to that pool. All participating pools share the Google client ID, consent boundary,
+scopes, and oauthrelay downstream client credential. Their callback origins remain explicit in the
+oauthrelay allow-list.
+
+Use one `google` upstream for the shared Google OAuth client and one `cognito-google` relay when
+the pools share scopes, downstream authentication, and redirect policy. Additional relays can
+reference the same upstream when those policies differ; they retain the same Google callback.
+Separate upstreams represent independent Google OAuth client registrations and therefore have
+independent callbacks and credentials. Separate oauthrelay deployments provide operational
+isolation.
+
+## The three configurations
+
+### 1. Google OAuth client
+
+Create a web OAuth client in the Google project. Register exactly the stable callback for the
+shared upstream:
+
+```text
+https://login.example.com/oidc/upstream/google/callback
+```
+
+The client needs the OpenID Connect scopes Cognito will request, normally `openid`, `email`, and
+`profile`. Keep the Google client ID and secret available for both the oauthrelay upstream
+configuration and the Cognito provider configuration.
+
+### 2. oauthrelay resources
+
+Configure Google as the upstream and reference it from a relay that permits the hosted-domain
+origin of every participating Cognito pool. `UpstreamClient` authentication checks the credentials
+each pool sends to oauthrelay against the Google OAuth client credentials.
+
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  endpoints:
+    authorization: https://accounts.google.com/o/oauth2/v2/auth
+    token: https://oauth2.googleapis.com/token
+    jwks: https://www.googleapis.com/oauth2/v3/certs
+  oauthClient:
+    clientId: 123456789.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: cognito-google
+spec:
+  upstreamRef:
+    name: google
+  scopes:
+    default: [openid, email, profile]
+    allowed: [openid, email, profile]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    - uri: https://pool-a.auth.eu-west-1.amazoncognito.com/oauth2/idpresponse
+    - uri: https://pool-b.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
+```
+
+Each entry names one complete Cognito callback. oauthrelay compares the decoded `redirect_uri`
+exactly before starting the flow, including its path and any configured query.
+
+### Store the shared upstream in SSM
+
+For Lambda deployments, the SSM provider is a good fit for a redirect policy that changes as Cognito
+pools are created. Store the complete documents as `String` parameters named
+`/oauthrelay/upstreams/google` and `/oauthrelay/relays/cognito-google`. Add each pool callback to the
+relay document. Store the Google secret separately as a `SecureString`, for example
+`/oauthrelay/secrets/google-client-secret`, and use this source in the upstream document:
+
+```yaml
+clientSecret:
+  valueFrom:
+    awsSsmParameter:
+      name: /oauthrelay/secrets/google-client-secret
+```
+
+An AWS Secrets Manager reference with `secretId` and optional `jsonKey` is also supported. The
+[AWS SSM provider reference](/oauthrelay/reference/ssm-provider/) describes the parameter layout,
+secret constraints, IAM permissions, and refresh behavior.
+
+oauthrelay loads the initial snapshot during Lambda cold start. A warm execution environment checks
+the snapshot age before every invocation and synchronously reloads providers once it reaches
+`OAUTHRELAY_LAMBDA_CONFIG_TTL`, which defaults to `60s`. A failed SSM refresh keeps the last valid
+snapshot. Consequently, an SSM update normally becomes visible to each active environment on its
+first invocation after the TTL expires; no background timer is required while Lambda is frozen.
+
+Lambda scales out into several execution environments, and the default in-memory store cannot
+see codes redeemed in another one. To make each authorization code single-use across all
+environments, create the DynamoDB table described in the
+[Transient store reference](/oauthrelay/reference/transient-store/), grant the function role
+access to it, and set `OAUTHRELAY_STORE=dynamodb` and `OAUTHRELAY_STORE_DYNAMODB_TABLE`.
+
+### 3. Cognito OIDC provider
+
+Add an OIDC provider to each user pool using manual input. Keep trust fields pointed at Google and
+route only the authorization and token fields through the `cognito-google` relay.
+
+```json
+{
+  "ProviderDetails": {
+    "client_id": "123456789.apps.googleusercontent.com",
+    "client_secret": "<Google OAuth client secret>",
+    "authorize_scopes": "openid email profile",
+    "oidc_issuer": "https://accounts.google.com",
+    "authorize_url": "https://login.example.com/oidc/relay/cognito-google/authorize",
+    "token_url": "https://login.example.com/oidc/relay/cognito-google/token",
+    "attributes_url": "https://openidconnect.googleapis.com/v1/userinfo",
+    "attributes_request_method": "GET",
+    "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs"
+  }
+}
+```
+
+Map the Google claims Cognito needs, enable this provider on the intended user-pool app client,
+and include it in the hosted UI's identity-provider choices.
+
+## Correctness checks
+
+- Google lists the oauthrelay callback, not Cognito's `/oauth2/idpresponse`, as its redirect URI.
+- oauthrelay allows the exact `/oauth2/idpresponse` URI of every participating pool.
+- Cognito's issuer, JWKS, and UserInfo fields point directly to Google.
+- Cognito's authorization and token fields point to the `cognito-google` relay.
+- The Google client ID is Cognito's provider client ID so the Google ID token audience is valid.
+
+oauthrelay forwards Cognito's nonce to Google and returns Google's token response unchanged. Cognito
+therefore validates the nonce, audience, issuer, and signature against the identity Google issued.
+
+See the [Google OpenID Connect documentation](https://developers.google.com/identity/openid-connect/openid-connect)
+and [Cognito OIDC provider documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-idp.html)
+for the provider-side settings represented here.
+
+See [Configuration](/oauthrelay/configuration/) for the complete `Upstream` and `Relay` field
+reference.

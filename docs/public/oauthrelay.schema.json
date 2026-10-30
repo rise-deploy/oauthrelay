@@ -1,0 +1,1163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResourceDocument",
+  "description": "A versioned oauthrelay configuration resource.",
+  "oneOf": [
+    {
+      "description": "An external OAuth/OIDC provider client and its stable callback.",
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "description": "Configuration API version. Must be `oauthrelay.dev/v1alpha1`.",
+          "$ref": "#/$defs/ApiVersion"
+        },
+        "kind": {
+          "type": "string",
+          "const": "Upstream"
+        },
+        "metadata": {
+          "description": "Resource identity.",
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "description": "Provider connection and OAuth client configuration.",
+          "$ref": "#/$defs/UpstreamResourceSpec"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "apiVersion",
+        "metadata",
+        "spec"
+      ]
+    },
+    {
+      "description": "A transparent-relay policy that references an upstream.",
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "description": "Configuration API version. Must be `oauthrelay.dev/v1alpha1`.",
+          "$ref": "#/$defs/ApiVersion"
+        },
+        "kind": {
+          "type": "string",
+          "const": "Relay"
+        },
+        "metadata": {
+          "description": "Resource identity.",
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "description": "Upstream reference and transparent-relay policy.",
+          "$ref": "#/$defs/RelayResourceSpec"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "apiVersion",
+        "metadata",
+        "spec"
+      ]
+    }
+  ],
+  "$defs": {
+    "ApiVersion": {
+      "description": "Supported configuration API versions.",
+      "oneOf": [
+        {
+          "description": "Initial upstream and relay resource API.",
+          "type": "string",
+          "const": "oauthrelay.dev/v1alpha1"
+        }
+      ]
+    },
+    "ClientAuthentication": {
+      "description": "Authentication accepted from a relying party at the relay token endpoint.",
+      "oneOf": [
+        {
+          "description": "Require the referenced upstream's OAuth client ID and secret.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "UpstreamClient"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Accept no client secret and require S256 PKCE for authorization-code flows.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "Public"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Require a relay-specific client ID and shared secret.",
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "description": "Relay-specific downstream client identifier.",
+              "type": "string"
+            },
+            "clientSecret": {
+              "description": "Relay-specific downstream client secret.",
+              "$ref": "#/$defs/SecretValue"
+            },
+            "type": {
+              "type": "string",
+              "const": "ClientSecret"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "clientId",
+            "clientSecret"
+          ]
+        },
+        {
+          "description": "Require a signed client assertion, optionally from a federated workload issuer.",
+          "type": "object",
+          "properties": {
+            "audience": {
+              "description": "Exact required assertion audience; defaults to the relay token endpoint URL.",
+              "type": "string",
+              "minLength": 1
+            },
+            "clientId": {
+              "description": "Client identifier required in the token request; default assertion issuer and subject.",
+              "type": "string"
+            },
+            "issuer": {
+              "description": "Exact assertion issuer. HTTPS URL (HTTP allowed on loopback); defaults to clientId.\nSupplies OIDC discovery when neither jwks nor jwksUrl is configured.",
+              "type": "string",
+              "minLength": 1
+            },
+            "jwks": {
+              "description": "Inline public keys. Mutually exclusive with jwksUrl; omit both to discover from issuer.",
+              "$ref": "#/$defs/PublicJwkSet"
+            },
+            "jwksUrl": {
+              "description": "Absolute HTTP(S) JWKS URL. Mutually exclusive with jwks; omit both to discover from issuer.",
+              "type": "string"
+            },
+            "requireSingleUse": {
+              "description": "Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.\nRequires a transient store shared by all serving instances; false permits reusable workload JWTs.",
+              "type": "boolean"
+            },
+            "subject": {
+              "description": "Exact assertion subject, such as system:serviceaccount:namespace:name; defaults to clientId.",
+              "type": "string",
+              "minLength": 1
+            },
+            "type": {
+              "type": "string",
+              "const": "PrivateKeyJwt"
+            }
+          },
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "not": {
+                "required": [
+                  "jwksUrl"
+                ]
+              },
+              "required": [
+                "jwks"
+              ]
+            },
+            {
+              "not": {
+                "required": [
+                  "jwks"
+                ]
+              },
+              "required": [
+                "jwksUrl"
+              ]
+            },
+            {
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "jwks"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "jwksUrl"
+                    ]
+                  }
+                ]
+              },
+              "required": [
+                "issuer"
+              ]
+            }
+          ],
+          "required": [
+            "type",
+            "clientId"
+          ]
+        }
+      ]
+    },
+    "EcCurve": {
+      "type": "string",
+      "enum": [
+        "P-256",
+        "P-384"
+      ]
+    },
+    "IdTokenClaimMatcher": {
+      "description": "Exactly one typed comparison of a top-level ID-token claim.",
+      "anyOf": [
+        {
+          "description": "Case-sensitive equality with a string claim.",
+          "type": "object",
+          "properties": {
+            "stringEquals": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "stringEquals"
+          ]
+        },
+        {
+          "description": "Case-sensitive membership in a non-empty list of strings.",
+          "type": "object",
+          "properties": {
+            "stringIn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "stringIn"
+          ]
+        },
+        {
+          "description": "Full-string, case-sensitive glob: `*` matches any sequence; `?` matches one character.",
+          "type": "object",
+          "properties": {
+            "stringLike": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "stringLike"
+          ]
+        },
+        {
+          "description": "Equality with a JSON boolean, without string coercion.",
+          "type": "object",
+          "properties": {
+            "booleanEquals": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "booleanEquals"
+          ]
+        },
+        {
+          "description": "The claim is an array of strings and at least one listed value is an element\n(case-sensitive).",
+          "type": "object",
+          "properties": {
+            "arrayContainsAny": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "arrayContainsAny"
+          ]
+        },
+        {
+          "description": "The claim is an array of strings and every listed value is an element\n(case-sensitive).",
+          "type": "object",
+          "properties": {
+            "arrayContainsAll": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "arrayContainsAll"
+          ]
+        },
+        {
+          "description": "The claim is an array of strings and at least one element matches the `stringLike` glob.",
+          "type": "object",
+          "properties": {
+            "arrayLikeAny": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "arrayLikeAny"
+          ]
+        }
+      ]
+    },
+    "IdTokenClaimSet": {
+      "description": "Claim names and matchers that must all pass within one policy section.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/IdTokenClaimMatcher"
+      },
+      "minProperties": 1
+    },
+    "IdTokenPolicy": {
+      "description": "Admission rules evaluated against a verified upstream ID token.",
+      "type": "object",
+      "properties": {
+        "anyOf": {
+          "description": "At least one branch must pass; matchers within each branch are ANDed.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/IdTokenClaimSet"
+          },
+          "minItems": 1
+        },
+        "required": {
+          "description": "Every matcher must pass when this section is present.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdTokenClaimSet"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "required": {
+              "not": {
+                "enum": [
+                  null
+                ]
+              }
+            }
+          },
+          "required": [
+            "required"
+          ]
+        },
+        {
+          "properties": {
+            "anyOf": {
+              "not": {
+                "enum": [
+                  null
+                ]
+              }
+            }
+          },
+          "required": [
+            "anyOf"
+          ]
+        }
+      ]
+    },
+    "InlineSecret": {
+      "description": "Literal secret representation.",
+      "type": "object",
+      "properties": {
+        "value": {
+          "description": "Literal secret value.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "value"
+      ]
+    },
+    "LoopbackRedirectPolicy": {
+      "description": "Variable-port loopback matcher.",
+      "type": "object",
+      "properties": {
+        "loopback": {
+          "description": "HTTP URI on 127.0.0.1 or ::1 without a port; path and query match exactly.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "loopback"
+      ]
+    },
+    "Metadata": {
+      "description": "Common resource identity fields.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`.",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "Kubernetes namespace; ignored by File and SSM resource discovery.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "OAuthClient": {
+      "description": "OAuth client registered with the external provider.",
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "description": "Provider client identifier.",
+          "type": "string"
+        },
+        "clientSecret": {
+          "description": "Provider client secret, supplied inline or through a provider-supported reference.",
+          "$ref": "#/$defs/SecretValue"
+        },
+        "tokenEndpointAuthMethod": {
+          "description": "How the relay authenticates at the provider token endpoint. Choose `client_secret_basic`\nfor providers that accept only HTTP Basic client authentication. Defaults to\n`client_secret_post`.",
+          "$ref": "#/$defs/TokenEndpointAuthMethodSpec",
+          "default": "client_secret_post"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "clientId",
+        "clientSecret"
+      ]
+    },
+    "OkpCurve": {
+      "type": "string",
+      "enum": [
+        "Ed25519"
+      ]
+    },
+    "OriginRedirectPolicy": {
+      "description": "HTTPS origin matcher.",
+      "type": "object",
+      "properties": {
+        "origin": {
+          "description": "HTTPS scheme, host, and optional port; every path and query at the origin is allowed.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "origin"
+      ]
+    },
+    "PublicJwk": {
+      "description": "Public key material for the asymmetric algorithms accepted by oauthrelay.",
+      "oneOf": [
+        {
+          "description": "Standard optional JWK metadata. Key material is carried by the key type.",
+          "type": "object",
+          "properties": {
+            "alg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "e": {
+              "type": "string"
+            },
+            "key_ops": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "kid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kty": {
+              "type": "string",
+              "const": "RSA"
+            },
+            "n": {
+              "type": "string"
+            },
+            "use": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5c": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "x5t": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5t#S256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5u": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kty",
+            "n",
+            "e"
+          ]
+        },
+        {
+          "description": "Standard optional JWK metadata. Key material is carried by the key type.",
+          "type": "object",
+          "properties": {
+            "alg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "crv": {
+              "$ref": "#/$defs/EcCurve"
+            },
+            "key_ops": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "kid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kty": {
+              "type": "string",
+              "const": "EC"
+            },
+            "use": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x": {
+              "type": "string"
+            },
+            "x5c": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "x5t": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5t#S256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5u": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "y": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kty",
+            "crv",
+            "x",
+            "y"
+          ]
+        },
+        {
+          "description": "Standard optional JWK metadata. Key material is carried by the key type.",
+          "type": "object",
+          "properties": {
+            "alg": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "crv": {
+              "$ref": "#/$defs/OkpCurve"
+            },
+            "key_ops": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "kid": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kty": {
+              "type": "string",
+              "const": "OKP"
+            },
+            "use": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x": {
+              "type": "string"
+            },
+            "x5c": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "x5t": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5t#S256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "x5u": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kty",
+            "crv",
+            "x"
+          ]
+        }
+      ]
+    },
+    "PublicJwkSet": {
+      "description": "Public JSON Web Key Set used to verify client assertions.",
+      "type": "object",
+      "properties": {
+        "keys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PublicJwk"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "keys"
+      ]
+    },
+    "RedirectPolicyEntry": {
+      "description": "One explicit application redirect matcher.",
+      "anyOf": [
+        {
+          "description": "Match one complete redirect URI exactly.",
+          "$ref": "#/$defs/UriRedirectPolicy"
+        },
+        {
+          "description": "Match every path and query at one HTTPS origin.",
+          "$ref": "#/$defs/OriginRedirectPolicy"
+        },
+        {
+          "description": "Match one loopback path and query on any runtime port.",
+          "$ref": "#/$defs/LoopbackRedirectPolicy"
+        }
+      ]
+    },
+    "ReferencedSecret": {
+      "description": "External secret reference.",
+      "type": "object",
+      "properties": {
+        "valueFrom": {
+          "description": "Exactly one provider-specific secret source.",
+          "$ref": "#/$defs/SecretSource"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "valueFrom"
+      ]
+    },
+    "RefreshTokenModeSpec": {
+      "description": "How the relay presents upstream refresh tokens downstream.",
+      "oneOf": [
+        {
+          "description": "Return the upstream refresh token unchanged.",
+          "type": "string",
+          "const": "passthrough"
+        },
+        {
+          "description": "Replace the upstream refresh token with a handle sealed to this relay.",
+          "type": "string",
+          "const": "sealed"
+        },
+        {
+          "description": "Replace the upstream refresh token with a single-use handle; each refresh issues a\nsuccessor and a replayed handle revokes the family.",
+          "type": "string",
+          "const": "rotating"
+        }
+      ]
+    },
+    "RefreshTokensSpec": {
+      "description": "Refresh-token handling for token responses.",
+      "type": "object",
+      "properties": {
+        "gracePeriodSeconds": {
+          "description": "`rotating` only: seconds during which an already-rotated handle is still answered with the\nsame successor, so concurrent tabs and retried requests are safe. 1 to 300; defaults to 30.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 300,
+          "minimum": 1
+        },
+        "maxLifetimeSeconds": {
+          "description": "`rotating` only: absolute lifetime of a refresh-token family in seconds, measured from the\noriginal sign-in. After it a refresh fails with `invalid_grant`. At least\n`gracePeriodSeconds`; defaults to 2592000 (30 days).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 315360000,
+          "minimum": 1
+        },
+        "mode": {
+          "description": "`passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque\nhandle in its place, so a refresh token that leaves the relying party cannot be used\nat the upstream directly. `rotating` returns single-use handles whose state lives in the\ntransient store, so a replayed handle is detected and revokes its whole token family;\nit requires a store shared by all serving instances.",
+          "$ref": "#/$defs/RefreshTokenModeSpec",
+          "default": "passthrough"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RelayResourceSpec": {
+      "description": "Transparent-relay policy and upstream reference.",
+      "type": "object",
+      "properties": {
+        "clientAuthentication": {
+          "description": "Authentication required at the relay token endpoint.",
+          "$ref": "#/$defs/ClientAuthentication"
+        },
+        "idTokenPolicy": {
+          "description": "Typed admission policy applied to the verified upstream ID token, in addition to requiredIdTokenClaims.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdTokenPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "redirectPolicy": {
+          "description": "Explicit application redirect matchers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RedirectPolicyEntry"
+          },
+          "minItems": 1
+        },
+        "refreshTokens": {
+          "description": "How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.",
+          "$ref": "#/$defs/RefreshTokensSpec"
+        },
+        "requiredIdTokenClaims": {
+          "description": "Exact string values required in the verified upstream ID token.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "scopes": {
+          "description": "Default and allowed upstream scopes.",
+          "$ref": "#/$defs/ScopePolicy",
+          "default": {
+            "allowed": null,
+            "default": []
+          }
+        },
+        "upstreamRef": {
+          "description": "Upstream used for authorization and token exchange.",
+          "$ref": "#/$defs/ResourceReference"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "upstreamRef",
+        "clientAuthentication",
+        "redirectPolicy"
+      ]
+    },
+    "ResourceReference": {
+      "description": "Reference to another resource of the expected kind.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Referenced resource name.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "ScopePolicy": {
+      "description": "Scopes applied to upstream authorization and refresh requests.",
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "description": "Complete allow-list for configured and requested scopes. Omission leaves scope policy to the upstream.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "default": {
+          "description": "Scopes used when an authorization request omits `scope`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SecretSource": {
+      "description": "Secret sources resolved by configured provider backends.",
+      "oneOf": [
+        {
+          "description": "Environment variable in the oauthrelay process.",
+          "type": "object",
+          "properties": {
+            "env": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Environment variable name.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "env"
+          ]
+        },
+        {
+          "description": "Local file accessible to the oauthrelay process.",
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Absolute path or path relative to the resource file.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "file"
+          ]
+        },
+        {
+          "description": "Exact AWS SSM SecureString parameter.",
+          "type": "object",
+          "properties": {
+            "awsSsmParameter": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Absolute SSM parameter name.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "awsSsmParameter"
+          ]
+        },
+        {
+          "description": "Secret key resolved within the Kubernetes provider namespace.",
+          "type": "object",
+          "properties": {
+            "secretKeyRef": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "description": "Key in the Secret data map.",
+                  "type": "string"
+                },
+                "name": {
+                  "description": "Secret resource name.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "key"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "secretKeyRef"
+          ]
+        },
+        {
+          "description": "AWS Secrets Manager SecretString.",
+          "type": "object",
+          "properties": {
+            "awsSecretsManager": {
+              "type": "object",
+              "properties": {
+                "jsonKey": {
+                  "description": "Optional top-level JSON string field selected from SecretString.",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "default": null
+                },
+                "secretId": {
+                  "description": "Secret name or ARN passed to Secrets Manager GetSecretValue.",
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "secretId"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "awsSecretsManager"
+          ]
+        }
+      ]
+    },
+    "SecretValue": {
+      "description": "A secret supplied either inline or through exactly one external source.",
+      "anyOf": [
+        {
+          "description": "Inline secret value.",
+          "$ref": "#/$defs/InlineSecret"
+        },
+        {
+          "description": "Provider-resolved secret reference.",
+          "$ref": "#/$defs/ReferencedSecret"
+        }
+      ]
+    },
+    "TokenEndpointAuthMethodSpec": {
+      "description": "Client authentication method at the provider token endpoint.",
+      "oneOf": [
+        {
+          "description": "Send `client_id` and `client_secret` as form fields in the request body.",
+          "type": "string",
+          "const": "client_secret_post"
+        },
+        {
+          "description": "Send the credentials in an HTTP Basic `Authorization` header (RFC 6749 section 2.3.1) and\nleave them out of the request body.",
+          "type": "string",
+          "const": "client_secret_basic"
+        }
+      ]
+    },
+    "UpstreamEndpoints": {
+      "description": "Optional explicit provider endpoints.",
+      "type": "object",
+      "properties": {
+        "authorization": {
+          "description": "Absolute provider authorization endpoint.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "jwks": {
+          "description": "Absolute provider JSON Web Key Set endpoint.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "token": {
+          "description": "Absolute provider token endpoint.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "UpstreamResourceSpec": {
+      "description": "External issuer, optional explicit endpoints, and provider OAuth client.",
+      "type": "object",
+      "properties": {
+        "endpoints": {
+          "description": "Explicit provider endpoints. Omitted endpoints are resolved through issuer discovery.",
+          "$ref": "#/$defs/UpstreamEndpoints",
+          "default": {
+            "authorization": null,
+            "jwks": null,
+            "token": null
+          }
+        },
+        "issuerUrl": {
+          "description": "Absolute HTTP(S) issuer URL used for discovery and transparent token trust.",
+          "type": "string"
+        },
+        "oauthClient": {
+          "description": "OAuth client registered with the external provider.",
+          "$ref": "#/$defs/OAuthClient"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "issuerUrl",
+        "oauthClient"
+      ]
+    },
+    "UriRedirectPolicy": {
+      "description": "Exact redirect URI matcher.",
+      "type": "object",
+      "properties": {
+        "uri": {
+          "description": "Complete HTTPS URI, or an exact HTTP URI on an IP-literal loopback host.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "uri"
+      ]
+    }
+  }
+}

@@ -1,0 +1,8 @@
+services:
+  dex:
+    image: ghcr.io/dexidp/dex:v2.45.1
+    command: ["dex", "serve", "/etc/dex/oauthrelay.yaml"]
+    ports:
+      - "127.0.0.1:15556:5556"
+    volumes:
+      - ./dex.yaml:/etc/dex/oauthrelay.yaml:ro

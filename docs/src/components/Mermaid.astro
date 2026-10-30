@@ -1,0 +1,37 @@
+---
+interface Props {
+  chart: string;
+  label: string;
+}
+
+const { chart, label } = Astro.props;
+---
+
+<figure class="oauthrelay-diagram" role="img" aria-label={label}>
+  <pre class="mermaid" aria-hidden="true">{chart}</pre>
+</figure>
+
+<script>
+  import mermaid from 'mermaid';
+
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'strict',
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#ede9fe',
+      primaryTextColor: '#18181b',
+      primaryBorderColor: '#7c3aed',
+      lineColor: '#7c3aed',
+      secondaryColor: '#dbeafe',
+      tertiaryColor: '#f5f3ff',
+      fontFamily: 'var(--sl-font-system)',
+    },
+  });
+
+  const renderDiagrams = () =>
+    mermaid.run({ querySelector: '.mermaid:not([data-processed])' });
+
+  void renderDiagrams();
+  document.addEventListener('astro:page-load', renderDiagrams);
+</script>

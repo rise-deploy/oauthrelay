@@ -1,0 +1,17 @@
+[package]
+name = "oauthrelay-secret-resolver"
+description = "Standard secret source resolution for oauthrelay configuration providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+oauthrelay-core = { path = "../oauthrelay-core" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true

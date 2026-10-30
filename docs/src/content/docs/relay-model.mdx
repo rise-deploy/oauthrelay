@@ -1,0 +1,46 @@
+---
+title: Relay trust model
+description: The endpoint and trust boundaries of oauthrelay.
+---
+
+import Mermaid from '../../components/Mermaid.astro';
+
+oauthrelay owns OAuth transport without becoming an identity issuer. Endpoint ownership and token
+trust remain separate.
+
+## Trust boundary
+
+<Mermaid
+  label="Transparent relay sends authorization and token traffic through oauthrelay while the relying party trusts the upstream issuer."
+  chart={`flowchart LR
+    RP[Client or relying party]
+    M[oauthrelay]
+    U[Upstream issuer]
+
+    RP -->|authorize and token| M
+    M -->|authorization and code exchange| U
+    U -->|upstream-signed response| M
+    M -->|unchanged response| RP
+    RP -.->|trust issuer and JWKS| U`}
+/>
+
+oauthrelay owns the stable callback, authorization state, PKCE
+exchange, redirect policy, and the relayed authorization and token endpoints. The token response
+is byte-for-byte upstream output, so its `iss`, signature, JWKS, audience, and UserInfo contract
+remain upstream-owned.
+
+A relay can require exact string values in verified upstream ID-token claims. oauthrelay rejects
+the exchange unless the signed token satisfies the configured policy. The relying party still
+validates every accepted token against the upstream issuer and JWKS.
+
+Use oauthrelay when the relying party supports manual OIDC endpoints. Configure its issuer, JWKS,
+and UserInfo URLs from the upstream provider, then point only its authorization and token URLs at
+oauthrelay. Amazon Cognito is a useful example because its OIDC provider configuration exposes all
+of those fields independently.
+
+:::caution
+Metadata served below an oauthrelay URL preserves the upstream `issuer` and `jwks_uri` and rewrites
+the authorization and token endpoints. It is useful as relay metadata, but it is not a portable
+OIDC Discovery contract: standard discovery requires the metadata URL and advertised issuer to
+identify the same issuer.
+:::

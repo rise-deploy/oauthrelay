@@ -1,0 +1,30 @@
+issuer: http://127.0.0.1:15556/dex
+
+storage:
+  type: sqlite3
+  config:
+    file: /var/dex/dex.db
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  grantTypes: [authorization_code, refresh_token]
+  responseTypes: [code]
+  skipApprovalScreen: true
+  alwaysShowLoginScreen: false
+  pkce:
+    enforce: true
+    codeChallengeMethodsSupported: [S256]
+
+staticClients:
+  - id: oauthrelay-e2e
+    name: oauthrelay E2E
+    secret: oauthrelay-e2e-secret
+    redirectURIs:
+      - http://127.0.0.1:18080/oidc/upstream/dex/callback
+
+connectors:
+  - type: mockCallback
+    id: mock
+    name: Test identity
