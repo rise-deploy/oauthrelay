@@ -219,7 +219,7 @@ handle is answered with `invalid_grant`.
 | | `passthrough` | `sealed` | `rotating` |
 |---|---|---|---|
 | The client holds | the upstream token | an `rrt1.` handle | an `rrt2.` handle |
-| Usable at the provider directly | yes | no | no |
+| The upstream token leaves the relay | yes | no | no |
 | A leaked token works through the relay | until the provider expires it | until the provider expires it | until the legitimate client next refreshes; if the thief refreshed first, that refresh revokes the family |
 | Theft detection | none | none | reuse after the grace period revokes the family |
 | Lifetime bound set by the relay | none | none | `maxLifetimeSeconds` |
