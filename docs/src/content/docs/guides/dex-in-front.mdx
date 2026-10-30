@@ -81,15 +81,15 @@ spec:
   upstreamRef:
     name: idp
   scopes:
-    allowed: [openid, profile, email, offline_access]
+    allowed: [openid, profile, email, groups, offline_access]
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
     - uri: https://dex.example.com/dex/callback
   idTokenPolicy:
     required:
-      department:
-        stringIn: [engineering, platform]
+      groups:
+        arrayContainsAny: [engineering, platform]
 ---
 apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
@@ -99,7 +99,7 @@ spec:
   upstreamRef:
     name: idp
   scopes:
-    allowed: [openid, profile, email, offline_access]
+    allowed: [openid, profile, email, groups, offline_access]
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
@@ -115,15 +115,18 @@ spec:
 - `UpstreamClient` makes the relay accept the IdP client's ID and secret from Dex. This is the
   fitting choice because Dex validates the ID token's `aud` against its connector `clientID`, and
   the ID token the IdP issued names the IdP client. The Dex connector therefore has to be
-  configured with that same client ID. oauthrelay reads client credentials from the token request
-  body only, so the connector sets `basicAuthUnsupported: true`.
+  configured with that same client ID. The relay token endpoint accepts the client credentials as
+  HTTP Basic (Dex's default) or in the form body.
 - The `uri` redirect entry is Dex's callback, `{Dex issuer}/callback`, matched exactly.
 - Every scope Dex requests must be in `scopes.allowed`; a scope outside it is rejected. Add
   `offline_access` if Dex requests it from your IdP, and any extra scope you add to a connector's
-  `scopes`.
-- `idTokenPolicy` matchers read top-level claims that are strings or booleans. `department` here
-  stands for any string claim your IdP puts in the ID token. An array-valued claim such as `groups`
-  does not match any operator; see [Limitations](#limitations).
+  `scopes`, such as `groups` here.
+- `idTokenPolicy` matchers read top-level claims of the IdP's ID token. `relay-a` admits users whose
+  `groups` array contains `engineering` or `platform`; `relay-b` admits verified partner email
+  addresses. The IdP has to put the claim in the ID token: the scope that requests `groups` and the
+  claim's name are IdP-specific, so check what yours emits. Providers that omit the claim for some
+  users, such as Microsoft Entra ID for users in too many groups, are denied for those users, because
+  an absent claim fails the rule (`missing_claim`).
 - `refreshTokens.mode` stays at its default, `passthrough`. The refresh tokens oauthrelay would wrap
   are held by Dex on the server side rather than by browsers, so sealing them adds nothing.
 
@@ -148,8 +151,7 @@ connectors:
       clientID: dex-relay
       clientSecret: $IDP_CLIENT_SECRET
       redirectURI: https://dex.example.com/dex/callback
-      basicAuthUnsupported: true
-      scopes: [profile, email]
+      scopes: [profile, email, groups]
   - type: oidc
     id: relay-b
     name: Partner sign-in
@@ -159,8 +161,7 @@ connectors:
       clientID: dex-relay
       clientSecret: $IDP_CLIENT_SECRET
       redirectURI: https://dex.example.com/dex/callback
-      basicAuthUnsupported: true
-      scopes: [profile, email]
+      scopes: [profile, email, groups]
 
 staticClients:
   - id: app-a
@@ -178,7 +179,8 @@ staticClients:
 ```
 
 Both connectors share the IdP client ID and secret. Only `issuer` differs, and with it the relay,
-and so the policy.
+and so the policy. `insecureEnableGroups: true` on a connector is only needed if Dex itself should
+pass the IdP's groups on to the applications; the relay's group rule does not depend on it.
 
 Instead of `issuerAlias`, a connector can keep the IdP as its issuer and override just the two
 endpoints. Dex then does not fetch discovery from oauthrelay:
@@ -219,10 +221,9 @@ failed sign-in. The application only sees what Dex reports for a failed login. E
   `expiry.refreshTokens.absoluteLifetime` in the Dex configuration.
 - **Dex before 2.46.0 only advises.** Without `allowedConnectors` enforcement, nothing stops a
   client from selecting another connector and its more permissive policy.
-- **Claim shape.** `idTokenPolicy` compares string and boolean claims. A group filter on an
-  array-valued `groups` claim is not expressible. If the policy is only about groups, Dex's own
-  connector option `allowedGroups` does it without oauthrelay, together with
-  `insecureEnableGroups` and the `groups` scope.
+- **Group-only filtering.** If the policy is only about groups, Dex's own connector option
+  `allowedGroups` does it without oauthrelay, together with `insecureEnableGroups` and the `groups`
+  scope. oauthrelay adds typed rules on any claim and combinations of them, per client.
 - **IdP claims only.** The policy sees the IdP's ID token, not UserInfo and not claims Dex adds or
   maps afterwards.
 
