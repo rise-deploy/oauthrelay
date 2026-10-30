@@ -25,6 +25,7 @@ mod jwks;
 mod model;
 mod refresh_handle;
 mod resolver;
+mod rotation;
 mod router;
 mod seal;
 mod store;

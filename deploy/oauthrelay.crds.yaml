@@ -1722,15 +1722,37 @@ spec:
                   How upstream refresh tokens are handed to relying parties. Defaults to
                   `passthrough`.
                 properties:
+                  gracePeriodSeconds:
+                    description: |-
+                      `rotating` only: seconds during which an already-rotated handle is still answered with the
+                      same successor, so concurrent tabs and retried requests are safe. 1 to 300; defaults to 30.
+                    format: uint32
+                    maximum: 300.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
+                  maxLifetimeSeconds:
+                    description: |-
+                      `rotating` only: absolute lifetime of a refresh-token family in seconds, measured from the
+                      original sign-in. After it a refresh fails with `invalid_grant`. At least
+                      `gracePeriodSeconds`; defaults to 2592000 (30 days).
+                    format: uint32
+                    maximum: 315360000.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
                   mode:
                     default: passthrough
                     description: |-
                       `passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque
                       handle in its place, so a refresh token that leaves the relying party cannot be used
-                      at the upstream directly.
+                      at the upstream directly. `rotating` returns single-use handles whose state lives in the
+                      transient store, so a replayed handle is detected and revokes its whole token family;
+                      it requires a store shared by all serving instances.
                     enum:
                     - passthrough
                     - sealed
+                    - rotating
                     type: string
                 type: object
               requiredIdTokenClaims:
