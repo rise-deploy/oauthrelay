@@ -386,6 +386,16 @@ spec:
                             type: object
                         type: object
                     type: object
+                  tokenEndpointAuthMethod:
+                    default: client_secret_post
+                    description: |-
+                      How the relay authenticates at the provider token endpoint. Choose `client_secret_basic`
+                      for providers that accept only HTTP Basic client authentication. Defaults to
+                      `client_secret_post`.
+                    enum:
+                    - client_secret_post
+                    - client_secret_basic
+                    type: string
                 required:
                 - clientId
                 - clientSecret
