@@ -111,6 +111,18 @@ pub struct Upstream {
     pub jwks_uri: Option<Url>,
     pub client_id: String,
     pub client_secret: SecretString,
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
+}
+
+/// How the upstream client authenticates at the provider token endpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEndpointAuthMethod {
+    /// `client_id` and `client_secret` are form fields in the request body.
+    #[default]
+    ClientSecretPost,
+    /// The credentials travel in an HTTP Basic `Authorization` header and not in the body.
+    ClientSecretBasic,
 }
 
 #[derive(Clone, Debug, Deserialize)]

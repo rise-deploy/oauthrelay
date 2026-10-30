@@ -605,7 +605,8 @@ mod tests {
     use async_trait::async_trait;
     #[cfg(feature = "lambda")]
     use oauthrelay_core::{
-        ClientAuth, RedirectMatcher, Relay, ResourceKey, SecretString, Upstream,
+        ClientAuth, RedirectMatcher, Relay, ResourceKey, SecretString, TokenEndpointAuthMethod,
+        Upstream,
     };
 
     #[cfg(feature = "lambda")]
@@ -627,6 +628,7 @@ mod tests {
             jwks_uri: None,
             client_id: "upstream".into(),
             client_secret: SecretString::new("secret"),
+            token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
         });
         let relay = Arc::new(Relay {
             key: key.clone(),

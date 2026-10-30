@@ -1,6 +1,7 @@
 use crate::{
     ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher,
-    RefreshTokenMode, RefreshTokens, Relay, ResourceKey, SecretString, Upstream,
+    RefreshTokenMode, RefreshTokens, Relay, ResourceKey, SecretString, TokenEndpointAuthMethod,
+    Upstream,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -124,6 +125,32 @@ pub struct OAuthClient {
     pub client_id: String,
     /// Provider client secret, supplied inline or through a provider-supported reference.
     pub client_secret: SecretValue,
+    /// How the relay authenticates at the provider token endpoint. Choose `client_secret_basic`
+    /// for providers that accept only HTTP Basic client authentication. Defaults to
+    /// `client_secret_post`.
+    #[serde(default)]
+    pub token_endpoint_auth_method: TokenEndpointAuthMethodSpec,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// Client authentication method at the provider token endpoint.
+pub enum TokenEndpointAuthMethodSpec {
+    /// Send `client_id` and `client_secret` as form fields in the request body.
+    #[default]
+    ClientSecretPost,
+    /// Send the credentials in an HTTP Basic `Authorization` header (RFC 6749 section 2.3.1) and
+    /// leave them out of the request body.
+    ClientSecretBasic,
+}
+
+impl From<TokenEndpointAuthMethodSpec> for TokenEndpointAuthMethod {
+    fn from(spec: TokenEndpointAuthMethodSpec) -> Self {
+        match spec {
+            TokenEndpointAuthMethodSpec::ClientSecretPost => Self::ClientSecretPost,
+            TokenEndpointAuthMethodSpec::ClientSecretBasic => Self::ClientSecretBasic,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -463,6 +490,11 @@ pub async fn compile_resources(
             jwks_uri: parse_optional_url("spec.endpoints.jwks", resource.spec.endpoints.jwks)?,
             client_id: resource.spec.oauth_client.client_id,
             client_secret: secret,
+            token_endpoint_auth_method: resource
+                .spec
+                .oauth_client
+                .token_endpoint_auth_method
+                .into(),
         };
         upstream
             .validate()
@@ -657,6 +689,7 @@ mod tests {
                     oauth_client: OAuthClient {
                         client_id: "client".into(),
                         client_secret: secret,
+                        token_endpoint_auth_method: TokenEndpointAuthMethodSpec::default(),
                     },
                 },
             }),
@@ -711,6 +744,69 @@ mod tests {
             HashMap::from([("hd".into(), "example.com".into())])
         );
         assert_eq!(*secrets.calls.lock().unwrap(), vec![source]);
+    }
+
+    #[tokio::test]
+    async fn compiles_upstream_token_endpoint_auth_method() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let ResourceDocument::Upstream(upstream) = &mut resources[0] else {
+            unreachable!()
+        };
+        upstream.spec.oauth_client.token_endpoint_auth_method =
+            TokenEndpointAuthMethodSpec::ClientSecretBasic;
+        let snapshot = compile_resources(resources, &secrets).await.unwrap();
+        assert_eq!(
+            snapshot
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .token_endpoint_auth_method,
+            TokenEndpointAuthMethod::ClientSecretBasic
+        );
+    }
+
+    #[test]
+    fn token_endpoint_auth_method_defaults_to_post_and_rejects_unknown_values() {
+        let client = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({"clientId": "id", "clientSecret": {"value": "s"}});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<OAuthClient>(value)
+        };
+        assert_eq!(
+            client(serde_json::json!({}))
+                .unwrap()
+                .token_endpoint_auth_method,
+            TokenEndpointAuthMethodSpec::ClientSecretPost
+        );
+        for (value, expected) in [
+            (
+                "client_secret_post",
+                TokenEndpointAuthMethodSpec::ClientSecretPost,
+            ),
+            (
+                "client_secret_basic",
+                TokenEndpointAuthMethodSpec::ClientSecretBasic,
+            ),
+        ] {
+            assert_eq!(
+                client(serde_json::json!({"tokenEndpointAuthMethod": value}))
+                    .unwrap()
+                    .token_endpoint_auth_method,
+                expected
+            );
+        }
+        for value in ["client_secret_jwt", "clientSecretBasic", "basic"] {
+            assert!(client(serde_json::json!({"tokenEndpointAuthMethod": value})).is_err());
+        }
     }
 
     #[tokio::test]

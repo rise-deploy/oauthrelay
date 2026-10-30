@@ -41,6 +41,7 @@ pub struct Upstream {
     pub jwks_uri: Option<Url>,
     pub client_id: String,
     pub client_secret: SecretString,
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
 }
 
 pub struct Relay {
@@ -115,11 +116,28 @@ unvalidated redirect URI is never reflected into a response.
 - Redirect policy uses explicit exact-URI, HTTPS-origin, or variable-port IP-loopback matchers.
 - `localhost` aliases an IP-loopback matcher only when service compatibility is enabled.
 - Client-secret comparisons are constant-time.
+- A relying party authenticates to a password-style relay (`UpstreamClient`, `ClientSecret`) by
+  exactly one method: form fields `client_id` and `client_secret`, or `Authorization: Basic` with
+  the form-urlencoded ID and secret joined by `:` and base64-encoded (RFC 6749 section 2.3.1),
+  decoded strictly. Header credentials combined with a body `client_secret`, client assertion, or
+  differing `client_id` are `invalid_request`. A Basic header that is not valid credentials,
+  several `Authorization` headers, or wrong credentials are `invalid_client`, and a header failure
+  carries `WWW-Authenticate: Basic realm="oauthrelay"`. An `Authorization` header of another scheme
+  is not a client credential and leaves body credentials in force. `Public` rejects a Basic header
+  with a non-empty secret like a body secret, while an empty secret only identifies the client like
+  a body `client_id`; `PrivateKeyJwt` ignores the `Authorization` header. The relying party's header
+  is never forwarded upstream. CORS allows only `Content-Type`, so browsers cannot send Basic.
 - Upstream-owned authorization parameters are replaced rather than forwarded.
 - Other authorization and grant extensions are preserved.
 - OIDC request objects are rejected because their routing fields conflict with proxy ownership.
 - Upstream token response status, content type, and bytes are preserved, except for the
   `refresh_token` member of a `sealed` or `rotating` relay (below).
+- Every request to the upstream token endpoint, the authorization-code exchange and each refresh
+  grant, authenticates the upstream client as the `Upstream`'s `token_endpoint_auth_method` says.
+  `client_secret_post` (the default) adds `client_id` and `client_secret` to the form body.
+  `client_secret_basic` sends `Authorization: Basic` with the form-urlencoded client ID and secret
+  joined by `:` and base64-encoded (RFC 6749 section 2.3.1), and the body carries neither.
+  Credentials presented by the downstream client are never forwarded.
 - A `sealed` relay never returns an upstream refresh token. In every successful (2xx) JSON token
   response, from the authorization-code grant and the refresh grant alike, the string
   `refresh_token` member is replaced by a handle: `rrt1.` followed by an XChaCha20-Poly1305

@@ -45,6 +45,13 @@ application.
 
 ## Token endpoint
 
+Relying parties with a `UpstreamClient` or `ClientSecret` relay authenticate with either an
+`Authorization: Basic` header (RFC 6749 section 2.3.1: form-urlencoded client ID and secret joined by
+`:` and base64-encoded) or `client_id` and `client_secret` form fields, never both. Both at once
+return HTTP 400 `invalid_request`. A malformed header or wrong credentials return HTTP 401
+`invalid_client`, with `WWW-Authenticate: Basic realm="oauthrelay"` when the client used the header.
+See [Client authentication](/oauthrelay/configuration/#client-authentication).
+
 The authorization-code request must use the same redirect URI and, when present, the matching PKCE
 verifier. Successful exchange returns the upstream status, content type, and body bytes unchanged
 under `no-store`/`no-cache` response headers. The transient store rejects a second use: in the same
