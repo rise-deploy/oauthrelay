@@ -216,7 +216,8 @@ enum StoreConfig {
         /// The `plural.group` resource name, validated where the store crate is linked; `None`
         /// is the store's own `TransientRecord`.
         resource: Option<String>,
-        /// `None` follows the provider namespace, then the pod or kubeconfig namespace.
+        /// `None` follows the provider namespace, then the pod or kubeconfig namespace, except
+        /// for Dex's resource, which has no fallback and needs Dex's namespace named.
         namespace: Option<String>,
         /// `None` disables the sweeper.
         sweep: Option<Duration>,
@@ -344,8 +345,9 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
             namespace,
             sweep,
         } => {
-            use oauthrelay_provider_kubernetes::select_namespace;
-            use oauthrelay_store_kubernetes::{KubeClient, KubernetesStore};
+            use oauthrelay_store_kubernetes::{
+                KubeClient, KubernetesStore, RecordMapping, DEX_MINIMUM_VERSION,
+            };
             let mapping = kubernetes_mapping(resource.as_deref())?;
             let mut config = kube_config().await?;
             // The store bounds its own requests (`OPERATION_DEADLINE`). Kube's default retry
@@ -359,10 +361,19 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
             } else {
                 None
             };
-            let namespace = select_namespace(
-                namespace.as_deref().or(provider_namespace.as_deref()),
+            let namespace = kubernetes_store_namespace(
+                mapping,
+                namespace.as_deref(),
+                provider_namespace.as_deref(),
                 &config.default_namespace,
             )?;
+            if mapping == RecordMapping::DexAuthCode {
+                tracing::warn!(
+                    minimum_dex_version = DEX_MINIMUM_VERSION,
+                    %namespace,
+                    "the Dex AuthCode store requires Dex {DEX_MINIMUM_VERSION} or later in that namespace; oauthrelay cannot detect Dex's version, and older Dex releases let anyone who knows a record's name redeem it through the device callback"
+                );
+            }
             let client =
                 KubeClient::new(kube::Client::try_from(config)?, namespace.clone(), mapping);
             let mut store = KubernetesStore::new(Arc::new(client));
@@ -389,6 +400,27 @@ fn reject_kubernetes_on_lambda(config: &StoreConfig, lambda: bool) -> anyhow::Re
         ));
     }
     Ok(())
+}
+
+/// The namespace for the Kubernetes store's records: `explicit` (`OAUTHRELAY_STORE_KUBERNETES_NAMESPACE`),
+/// then the provider's, then the pod or kubeconfig `default`.
+///
+/// Dex's records live in Dex's namespace and nowhere else, because that is where Dex's garbage
+/// collector runs, so that mapping accepts only an explicit namespace.
+#[cfg(feature = "kubernetes")]
+fn kubernetes_store_namespace(
+    mapping: oauthrelay_store_kubernetes::RecordMapping,
+    explicit: Option<&str>,
+    provider: Option<&str>,
+    default: &str,
+) -> anyhow::Result<String> {
+    if mapping.needs_explicit_namespace() && explicit.is_none() {
+        return Err(anyhow!(
+            "OAUTHRELAY_STORE_KUBERNETES_RESOURCE={} requires OAUTHRELAY_STORE_KUBERNETES_NAMESPACE to name Dex's namespace: Dex garbage-collects expired authcodes only there, so it is never inferred from the provider or pod namespace",
+            mapping.resource_name()
+        ));
+    }
+    oauthrelay_provider_kubernetes::select_namespace(explicit.or(provider), default)
 }
 
 /// The store's mapping for `OAUTHRELAY_STORE_KUBERNETES_RESOURCE`.
@@ -994,6 +1026,43 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn the_dex_mapping_requires_an_explicit_namespace() {
+        use oauthrelay_store_kubernetes::RecordMapping;
+        let dex = RecordMapping::DexAuthCode;
+        for (provider, default) in [(None, "oauthrelay"), (Some("relay-state"), "oauthrelay")] {
+            let error = kubernetes_store_namespace(dex, None, provider, default)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("OAUTHRELAY_STORE_KUBERNETES_NAMESPACE") && error.contains("Dex"),
+                "{error}"
+            );
+        }
+        // An explicit namespace wins over the provider's and the default.
+        assert_eq!(
+            kubernetes_store_namespace(dex, Some("dex"), Some("relay-state"), "oauthrelay")
+                .unwrap(),
+            "dex"
+        );
+        assert!(kubernetes_store_namespace(dex, Some("Not A Namespace"), None, "x").is_err());
+        // The default mapping keeps falling back to the provider, then the pod namespace.
+        let record = RecordMapping::TransientRecord;
+        assert_eq!(
+            kubernetes_store_namespace(record, None, Some("relay-state"), "oauthrelay").unwrap(),
+            "relay-state"
+        );
+        assert_eq!(
+            kubernetes_store_namespace(record, None, None, "oauthrelay").unwrap(),
+            "oauthrelay"
+        );
+        assert_eq!(
+            kubernetes_store_namespace(record, Some("explicit"), Some("relay-state"), "x").unwrap(),
+            "explicit"
+        );
     }
 
     #[test]
