@@ -3,6 +3,7 @@
   "extends": [
     "config:recommended"
   ],
+  "platformAutomerge": false,
   "lockFileMaintenance": {
     "description": "Refresh transitive pins in Cargo.lock and docs/package-lock.json, which no package-file bump moves. Automerged once CI is green.",
     "enabled": true,
