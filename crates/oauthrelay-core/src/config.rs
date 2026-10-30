@@ -157,9 +157,22 @@ pub struct RelayResourceSpec {
 pub struct RefreshTokensSpec {
     /// `passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque
     /// handle in its place, so a refresh token that leaves the relying party cannot be used
-    /// at the upstream directly.
+    /// at the upstream directly. `rotating` returns single-use handles whose state lives in the
+    /// transient store, so a replayed handle is detected and revokes its whole token family;
+    /// it requires a store shared by all serving instances.
     #[serde(default)]
     pub mode: RefreshTokenModeSpec,
+    /// `rotating` only: seconds during which an already-rotated handle is still answered with the
+    /// same successor, so concurrent tabs and retried requests are safe. 1 to 300; defaults to 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 300))]
+    pub grace_period_seconds: Option<u32>,
+    /// `rotating` only: absolute lifetime of a refresh-token family in seconds, measured from the
+    /// original sign-in. After it a refresh fails with `invalid_grant`. At least
+    /// `gracePeriodSeconds`; defaults to 2592000 (30 days).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 315360000))]
+    pub max_lifetime_seconds: Option<u32>,
 }
 
 impl RefreshTokensSpec {
@@ -177,6 +190,9 @@ pub enum RefreshTokenModeSpec {
     Passthrough,
     /// Replace the upstream refresh token with a handle sealed to this relay.
     Sealed,
+    /// Replace the upstream refresh token with a single-use handle; each refresh issues a
+    /// successor and a replayed handle revokes the family.
+    Rotating,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -526,12 +542,8 @@ pub async fn compile_resources(
             allowed_scopes: resource.spec.scopes.allowed,
             required_id_token_claims: resource.spec.required_id_token_claims,
             id_token_policy: resource.spec.id_token_policy,
-            refresh_tokens: RefreshTokens {
-                mode: match resource.spec.refresh_tokens.mode {
-                    RefreshTokenModeSpec::Passthrough => RefreshTokenMode::Passthrough,
-                    RefreshTokenModeSpec::Sealed => RefreshTokenMode::Sealed,
-                },
-            },
+            refresh_tokens: compile_refresh_tokens(&resource.spec.refresh_tokens)
+                .with_context(|| format!("Relay/{key} spec.refreshTokens"))?,
             redirect_policy,
         };
         relay
@@ -560,6 +572,33 @@ async fn resolve_secret(
     let value = resolver.resolve_source(source).await?;
     cache.insert(source.clone(), value.clone());
     Ok(value)
+}
+
+fn compile_refresh_tokens(spec: &RefreshTokensSpec) -> anyhow::Result<RefreshTokens> {
+    let mode = match spec.mode {
+        RefreshTokenModeSpec::Passthrough => RefreshTokenMode::Passthrough,
+        RefreshTokenModeSpec::Sealed => RefreshTokenMode::Sealed,
+        RefreshTokenModeSpec::Rotating => RefreshTokenMode::Rotating,
+    };
+    if mode != RefreshTokenMode::Rotating
+        && (spec.grace_period_seconds.is_some() || spec.max_lifetime_seconds.is_some())
+    {
+        return Err(anyhow!(
+            "gracePeriodSeconds and maxLifetimeSeconds apply only to mode: rotating"
+        ));
+    }
+    let defaults = RefreshTokens::default();
+    let compiled = RefreshTokens {
+        mode,
+        grace_period_seconds: spec
+            .grace_period_seconds
+            .map_or(defaults.grace_period_seconds, u64::from),
+        max_lifetime_seconds: spec
+            .max_lifetime_seconds
+            .map_or(defaults.max_lifetime_seconds, u64::from),
+    };
+    compiled.validate().map_err(anyhow::Error::msg)?;
+    Ok(compiled)
 }
 
 fn resource_key(kind: &str, value: &str) -> anyhow::Result<ResourceKey> {
@@ -729,12 +768,86 @@ mod tests {
             RefreshTokenMode::Sealed
         );
         for invalid in [
-            serde_json::json!({"mode": "rotating"}),
             serde_json::json!({"mode": "sealed", "gracePeriod": "1m"}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": "30"}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": -1}),
         ] {
             value["spec"]["refreshTokens"] = invalid;
             assert!(serde_json::from_value::<ResourceDocument>(value.clone()).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn compiles_rotating_refresh_tokens_with_defaults_and_bounds() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let mut value = serde_json::to_value(&resources[1]).unwrap();
+        let compile = |refresh_tokens: serde_json::Value| {
+            let mut value = value.clone();
+            value["spec"]["refreshTokens"] = refresh_tokens;
+            let relay: ResourceDocument = serde_json::from_value(value).unwrap();
+            let resources = vec![resources[0].clone(), relay];
+            let secrets = &secrets;
+            async move {
+                compile_resources(resources, secrets).await.map(|snapshot| {
+                    snapshot
+                        .relays
+                        .values()
+                        .next()
+                        .unwrap()
+                        .refresh_tokens
+                        .clone()
+                })
+            }
+        };
+        let defaults = compile(serde_json::json!({"mode": "rotating"}))
+            .await
+            .unwrap();
+        assert_eq!(defaults.mode, RefreshTokenMode::Rotating);
+        assert_eq!(defaults.grace_period_seconds, 30);
+        assert_eq!(defaults.max_lifetime_seconds, 30 * 24 * 60 * 60);
+        let custom = compile(serde_json::json!({
+            "mode": "rotating", "gracePeriodSeconds": 300, "maxLifetimeSeconds": 3600
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            (custom.grace_period_seconds, custom.max_lifetime_seconds),
+            (300, 3600)
+        );
+
+        for invalid in [
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 0}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 301}),
+            serde_json::json!({"mode": "rotating", "maxLifetimeSeconds": 0}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 60, "maxLifetimeSeconds": 59}),
+            serde_json::json!({"mode": "rotating", "maxLifetimeSeconds": 315_360_001_u64}),
+            // Rotation settings mean nothing outside rotating mode and are not silently ignored.
+            serde_json::json!({"mode": "sealed", "gracePeriodSeconds": 30}),
+            serde_json::json!({"mode": "passthrough", "maxLifetimeSeconds": 3600}),
+            serde_json::json!({"gracePeriodSeconds": 30}),
+        ] {
+            let error = compile(invalid.clone()).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("refresh"),
+                "{invalid}: {error:#}"
+            );
+        }
+        value["spec"]["refreshTokens"] =
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 30});
+        let document: ResourceDocument = serde_json::from_value(value).unwrap();
+        let ResourceDocument::Relay(relay) = &document else {
+            unreachable!()
+        };
+        let serialized = serde_json::to_value(relay).unwrap();
+        assert_eq!(serialized["spec"]["refreshTokens"]["mode"], "rotating");
+        assert!(serialized["spec"]["refreshTokens"]
+            .get("maxLifetimeSeconds")
+            .is_none());
     }
 
     #[test]

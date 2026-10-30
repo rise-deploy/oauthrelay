@@ -1,4 +1,4 @@
-//! Transient key-value storage shared by replay protection and, later, refresh-token state.
+//! Transient key-value storage shared by replay protection and rotating refresh-token state.
 //!
 //! The router never holds durable state of its own: sealed envelopes carry their own contents. The
 //! few facts that must be remembered across requests (a code was used, a handle was rotated) live
@@ -57,32 +57,36 @@ pub struct Entry {
 /// - An `Err` means the outcome is unknown. Callers fail closed: a replay check that errors rejects
 ///   the request.
 ///
-/// # Intended refresh-token rotation usage
+/// # Refresh-token rotation usage
 ///
-/// Rotation needs to claim a handle exactly once, remember its successor, answer a racing
-/// duplicate within a grace window, and revoke the whole token family on reuse. All of it fits
-/// these four operations and keeps the sealed handle itself stateless (it names its handle id and
-/// family id):
+/// A `rotating` relay keeps one record per refresh-token handle (key `refresh:handle:{hash}`,
+/// where the hash covers the relay key and the handle, so neither can be read back from the
+/// store) and one marker per revoked family. Values are sealed by the relay, so the store only
+/// ever holds opaque bytes. The protocol uses exactly these four operations:
 ///
-/// 1. *Claim.* `put_if_absent("refresh:used:{handle_id}", claim, ttl)` where `claim` records the
-///    claim time and has no successor yet. Exactly one concurrent presenter gets `true` and
-///    performs the upstream refresh. `ttl` covers the longest period the old handle could still be
-///    presented (its remaining lifetime), so reuse stays detectable for as long as it matters.
-/// 2. *Record the successor.* After issuing the new handle, `compare_and_swap(key, claim,
-///    claim_with_successor, ttl)`. Because the compare is on the whole value, include something
-///    unique to the claimant (for example a random claim id) so a stale claimant cannot match a
-///    value another claimant wrote.
-/// 3. *Racing duplicate.* A presenter that loses the claim `get`s the record. A record with a
-///    successor, read within the grace window of the claim time, is answered with that same
-///    successor instead of a failure.
-/// 4. *Release.* If the upstream refresh fails, `compare_and_swap(key, claim, released, short_ttl)`
-///    marks the claim released rather than deleting it, so a late successor write is never
-///    erased. A retrying presenter then claims by compare-and-swapping `released` to a fresh claim.
-/// 5. *Reuse and revocation.* A presenter that finds a successor outside the grace window has
-///    replayed a rotated handle: `put_if_absent("refresh:revoked:{family_id}", b"1", family_ttl)`
-///    marks the family revoked. Every refresh `get`s that key first and rejects when it is
-///    present. `family_ttl` is the family's maximum lifetime, after which no member is valid
-///    anyway. `delete` ends a revocation early or removes per-family state at logout.
+/// 1. *Issue.* `put_if_absent` creates the handle's record in the `Active` state with a TTL that
+///    ends with the family's maximum lifetime.
+/// 2. *Claim.* The presenter reads the record and `compare_and_swap`s the bytes it read for a
+///    `Claimed` value carrying a random claim id. Exactly one concurrent presenter wins and
+///    performs the upstream refresh. The compare is on the whole value, and every value is
+///    sealed with a random nonce, so no two writes ever produce equal bytes: a stale claimant
+///    can never match a value somebody else wrote.
+/// 3. *Record the successor.* The successor's record is created with `put_if_absent` and the
+///    response returned to the client is stored under a key derived from the old handle and the
+///    claim id (TTL: the grace period plus a small margin). Only then does `compare_and_swap`
+///    turn the old record into a `Rotated` tombstone (rotation time and claim id, no token) that
+///    stays until the family expires, so a replay is recognised for the family's whole life.
+/// 4. *Racing duplicate.* A presenter that finds the record `Claimed` polls it with `get` for a
+///    few seconds. A `Rotated` record within the grace period is answered with the stored
+///    response, so the duplicate receives the same successor.
+/// 5. *Release.* If the upstream refresh fails, `compare_and_swap(claimed, fresh Active value)`
+///    makes the handle claimable again. The value is new rather than a "released" marker; the
+///    unique bytes serve the same purpose. A claim older than a lease (60 seconds) is presumed
+///    abandoned and is replaced the same way.
+/// 6. *Reuse and revocation.* A `Rotated` record presented after its grace period is a replay:
+///    `put_if_absent("refresh:revoked:{hash}", ..)` marks the family revoked for the rest of its
+///    lifetime. Every refresh checks that key first. An upstream `invalid_grant` revokes the
+///    family the same way.
 ///
 /// Expiry bounds all of this state, so no sweeper is required.
 #[async_trait]
@@ -408,21 +412,36 @@ mod tests {
     #[tokio::test]
     async fn supports_the_documented_rotation_protocol() {
         let store = MemoryStore::default();
-        let handle = "refresh:used:h1";
+        let handle = "refresh:handle:h1";
         let family = "refresh:revoked:f1";
-        let claim = b"claim:A";
-        // Two presenters race: exactly one claims.
-        assert!(store.put_if_absent(handle, claim, TTL).await.unwrap());
-        assert!(!store.put_if_absent(handle, b"claim:B", TTL).await.unwrap());
-        // The loser sees a claim without a successor; the winner records one.
-        assert_eq!(store.get(handle).await.unwrap().unwrap().value, claim);
+        let active = b"active:1";
+        assert!(store.put_if_absent(handle, active, TTL).await.unwrap());
+        // Two presenters race to claim the record they both read: exactly one wins.
         assert!(store
-            .compare_and_swap(handle, claim, b"claim:A->h2", TTL)
+            .compare_and_swap(handle, active, b"claimed:A", TTL)
+            .await
+            .unwrap());
+        assert!(!store
+            .compare_and_swap(handle, active, b"claimed:B", TTL)
+            .await
+            .unwrap());
+        // The loser reads the claim; the winner records the successor.
+        assert_eq!(
+            store.get(handle).await.unwrap().unwrap().value,
+            b"claimed:A"
+        );
+        assert!(store
+            .compare_and_swap(handle, b"claimed:A", b"rotated:A", TTL)
+            .await
+            .unwrap());
+        // A stale claimant cannot overwrite the rotation, and a release only matches its own claim.
+        assert!(!store
+            .compare_and_swap(handle, b"claimed:A", b"active:2", TTL)
             .await
             .unwrap());
         assert_eq!(
             store.get(handle).await.unwrap().unwrap().value,
-            b"claim:A->h2"
+            b"rotated:A"
         );
         // Reuse revokes the family exactly once.
         assert!(store.get(family).await.unwrap().is_none());

@@ -9,7 +9,9 @@ travel with the client. The few facts that must be remembered between requests l
 own. Today it holds:
 
 - the ID of each redeemed authorization code, so a code works once (`replay:code:` keys);
-- the identity of each `requireSingleUse` client assertion (`replay:client-assertion:` keys).
+- the identity of each `requireSingleUse` client assertion (`replay:client-assertion:` keys);
+- the state of every [rotating refresh-token](/oauthrelay/configuration/#rotating-refresh-tokens)
+  family (`refresh:` keys), for relays with `refreshTokens.mode: rotating`.
 
 Select a backend with `OAUTHRELAY_STORE`:
 
@@ -18,8 +20,33 @@ Select a backend with `OAUTHRELAY_STORE`:
 | `OAUTHRELAY_STORE` | `memory` | `memory` or `dynamodb`. |
 | `OAUTHRELAY_STORE_DYNAMODB_TABLE` | — | DynamoDB table name. Required with `dynamodb`, rejected otherwise. |
 
-Records are small and short-lived: an authorization code is retained for five minutes, a client
-assertion until its expiry plus clock skew.
+Replay records are small and short-lived: an authorization code is retained for five minutes, a
+client assertion until its expiry plus clock skew. Refresh-token records live as long as the
+family, 30 days by default; see [Key namespaces](#key-namespaces).
+
+## Key namespaces
+
+Keys are namespaced by purpose. A backend never interprets them, and a table can be inspected by
+prefix.
+
+| Key | Written by | Value | Lives for |
+| --- | --- | --- | --- |
+| `replay:code:{id}` | code grant | `1` | five minutes |
+| `replay:client-assertion:{digest}` | `requireSingleUse` assertions | `1` | assertion expiry plus skew |
+| `refresh:handle:{hash}` | `rotating` relays | The handle's record, sealed: `Active`, `Claimed`, or a `Rotated` tombstone | until the family's maximum lifetime |
+| `refresh:grace:{hash}` | `rotating` relays | The response of one rotation, sealed | grace period plus ten seconds |
+| `refresh:revoked:{hash}` | `rotating` relays | `1`, present when the family is revoked | until the family's maximum lifetime |
+| `refresh:head:{hash}` | `rotating` relays | The store key of the family's newest handle record (a hash, not secret) | until the family's maximum lifetime |
+
+The `{hash}` in `refresh:` keys is a SHA-256 over the relay name and the handle or family ID, so the
+store cannot be used to recover a handle. Values are sealed with `OAUTHRELAY_SEAL_KEY` and bound
+to the relay, the purpose, and the key, so the store never holds a plaintext upstream token or
+access token and a value cannot be copied to another key. Changing the seal key without keeping the
+old one as `OAUTHRELAY_SEAL_KEY_PREVIOUS` makes the stored records unreadable: those refreshes fail with
+`invalid_grant` and the users sign in again.
+
+A rotating relay needs this store shared by every instance. With `memory`, a handle only works on
+the instance that issued it and is lost when that process restarts.
 
 ## Memory
 
@@ -48,7 +75,7 @@ export OAUTHRELAY_STORE_DYNAMODB_TABLE=oauthrelay-store
 | --- | --- |
 | Partition key | `pk`, type String |
 | Sort key | none |
-| Capacity | on-demand is a good fit; each token request is one conditional write |
+| Capacity | on-demand is a good fit; see [Sizing for rotating refresh tokens](#sizing-for-rotating-refresh-tokens) |
 | Time to Live attribute | `expires_at` |
 
 oauthrelay writes three attributes: `pk` (the store key), `value` (Binary), and `expires_at`
@@ -69,6 +96,32 @@ aws dynamodb update-time-to-live \
 Enabling TTL is for storage hygiene only. DynamoDB deletes expired items lazily, often many hours
 after expiry, so oauthrelay checks `expires_at` itself: an expired item is treated as absent when
 read and may be overwritten by a new claim. Correctness does not depend on TTL deletion.
+
+### Sizing for rotating refresh tokens
+
+Replay protection costs one conditional write per code grant or single-use assertion. Rotating
+refresh tokens cost more, because each refresh is a small transaction in the store:
+
+| Per refresh grant | Operations |
+| --- | --- |
+| Rotation | 2 strongly consistent reads (handle, revoked marker) and 5 writes: claim, response, successor, the final tombstone swap, and the head pointer |
+| Duplicate within the grace period | 3 reads, no writes |
+
+Write capacity depends on item size, charged in 1 KB units. Plan on 1 to 3 units for the record
+writes (an upstream refresh token sealed is roughly 0.2 to 2 KB; the tombstone is about 0.3 KB) and
+1 to 7 for the response write, whose size is that of your provider's token response, base64-encoded
+(a response with an ID token is typically 1 to 4 KB). A typical refresh therefore costs about 6 to
+13 write units and 2 read units. Active sessions refresh about once per access-token lifetime, so
+multiply by sessions and by one refresh per hour for a provider with one-hour access tokens.
+
+Storage is dominated by tombstones. Each rotation leaves one, about 0.3 KB, which has to stay until
+the family ends so a replay can be recognised. A session that refreshes hourly leaves roughly 720
+of them over the default 30-day family (about 220 KB). Shorten `maxLifetimeSeconds` to bound this,
+and keep Time to Live enabled so expired items are eventually reclaimed. Response records last only
+seconds and add no lasting storage.
+
+Raising `gracePeriodSeconds` does not change the cost of a rotation, but it lengthens the window in
+which a stolen, already-used handle can still fetch the recorded response.
 
 The table can be shared by several oauthrelay deployments only if their keys cannot collide; give
 each deployment its own table otherwise.
@@ -97,8 +150,9 @@ customer-managed KMS key.
 
 ### Behavior
 
-- Claims use a conditional `PutItem` that succeeds only when no live item exists, so exactly one
-  of any number of concurrent redemptions wins, across every replica and Lambda environment.
+- Claims use a conditional `PutItem` that succeeds only when no live item exists (or, for rotation,
+  when the item still holds exactly the value that was read), so exactly one of any number of
+  concurrent redemptions or refreshes wins, across every replica and Lambda environment.
 - Reads are strongly consistent.
 - A conditional write asks DynamoDB to return the existing item when its condition fails
   (`ReturnValuesOnConditionCheckFailure=ALL_OLD`). The AWS SDK retries a request whose response was
@@ -118,7 +172,8 @@ customer-managed KMS key.
 ## Embedding the core
 
 `RelayConfig.store` accepts any `Arc<dyn TransientStore>`. Without one, authorization codes are not
-tracked and `requireSingleUse` client assertions are rejected. A host that already runs a
+tracked, `requireSingleUse` client assertions are rejected, and relays in `rotating` refresh-token
+mode fail with a `server_error`. A host that already runs a
 database can implement the trait over it:
 
 | Operation | Contract |
@@ -130,6 +185,6 @@ database can implement the trait over it:
 
 Keys are non-empty and at most 1024 bytes, namespaced by their callers, and TTLs are non-zero.
 Every operation on a key must be linearizable across all instances. The `oauthrelay-core` rustdoc
-for `TransientStore` has the complete contract, plus the intended record layout for stateful
-refresh-token rotation (claim a handle once, record its successor, answer a racing duplicate, and
-revoke a token family) built from these four operations.
+for `TransientStore` has the complete contract, plus the rotation protocol built from these four
+operations (claim a handle once, record its successor, answer a racing duplicate, release a failed
+claim, and revoke a token family).

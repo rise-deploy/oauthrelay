@@ -734,6 +734,11 @@
           "description": "Replace the upstream refresh token with a handle sealed to this relay.",
           "type": "string",
           "const": "sealed"
+        },
+        {
+          "description": "Replace the upstream refresh token with a single-use handle; each refresh issues a\nsuccessor and a replayed handle revokes the family.",
+          "type": "string",
+          "const": "rotating"
         }
       ]
     },
@@ -741,8 +746,28 @@
       "description": "Refresh-token handling for token responses.",
       "type": "object",
       "properties": {
+        "gracePeriodSeconds": {
+          "description": "`rotating` only: seconds during which an already-rotated handle is still answered with the\nsame successor, so concurrent tabs and retried requests are safe. 1 to 300; defaults to 30.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 300,
+          "minimum": 1
+        },
+        "maxLifetimeSeconds": {
+          "description": "`rotating` only: absolute lifetime of a refresh-token family in seconds, measured from the\noriginal sign-in. After it a refresh fails with `invalid_grant`. At least\n`gracePeriodSeconds`; defaults to 2592000 (30 days).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 315360000,
+          "minimum": 1
+        },
         "mode": {
-          "description": "`passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque\nhandle in its place, so a refresh token that leaves the relying party cannot be used\nat the upstream directly.",
+          "description": "`passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque\nhandle in its place, so a refresh token that leaves the relying party cannot be used\nat the upstream directly. `rotating` returns single-use handles whose state lives in the\ntransient store, so a replayed handle is detected and revokes its whole token family;\nit requires a store shared by all serving instances.",
           "$ref": "#/$defs/RefreshTokenModeSpec",
           "default": "passthrough"
         }

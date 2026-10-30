@@ -14,8 +14,8 @@ use serde::{
 use serde_json::value::RawValue;
 use std::fmt;
 
-/// Recognizable, versioned prefix of every handle. The remainder is a sealer envelope.
-const HANDLE_PREFIX: &str = "rrt1.";
+/// Recognizable, versioned prefix of every sealed handle. The remainder is a sealer envelope.
+pub(crate) const HANDLE_PREFIX: &str = "rrt1.";
 const REFRESH_TOKEN_MEMBER: &str = "refresh_token";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,7 +28,6 @@ struct RefreshHandle {
 #[derive(Debug)]
 pub(crate) struct OpenedHandle {
     pub upstream_token: String,
-    #[allow(dead_code)]
     pub issued_at: u64,
 }
 
@@ -93,7 +92,7 @@ pub(crate) enum SubstitutionError {
 
 /// Whether `body` names a `refresh_token` as a member or field (`refresh_token=`,
 /// `"refresh_token":`), which a body that is not a JSON object must not be allowed to carry.
-fn names_refresh_token(body: &[u8]) -> bool {
+pub(crate) fn names_refresh_token(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body);
     text.match_indices(REFRESH_TOKEN_MEMBER).any(|(at, name)| {
         text[at + name.len()..]
@@ -152,6 +151,42 @@ pub(crate) fn seal_token_response(
     serde_json::to_vec(&members)
         .map(Some)
         .map_err(|_| SubstitutionError::Sealing)
+}
+
+/// The first non-empty string `refresh_token` member of a 2xx JSON object body.
+pub(crate) fn upstream_refresh_token(status: u16, body: &[u8]) -> Option<String> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let members = serde_json::from_slice::<Members>(body).ok()?;
+    members
+        .0
+        .iter()
+        .filter(|(name, _)| name == REFRESH_TOKEN_MEMBER)
+        .filter_map(|(_, value)| serde_json::from_str::<String>(value.get()).ok())
+        .find(|token| !token.is_empty())
+}
+
+/// Sets the `refresh_token` member of a 2xx JSON object body to `token`: every
+/// existing member is replaced in place, and one is appended when there is none. Other members
+/// keep their order and bytes. `None` means the body is not a 2xx JSON object.
+pub(crate) fn with_refresh_token(status: u16, body: &[u8], token: &str) -> Option<Vec<u8>> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let mut members = serde_json::from_slice::<Members>(body).ok()?;
+    let value = RawValue::from_string(serde_json::to_string(token).ok()?).ok()?;
+    let mut replaced = false;
+    for (name, existing) in &mut members.0 {
+        if name == REFRESH_TOKEN_MEMBER {
+            *existing = value.clone();
+            replaced = true;
+        }
+    }
+    if !replaced {
+        members.0.push((REFRESH_TOKEN_MEMBER.to_owned(), value));
+    }
+    serde_json::to_vec(&members).ok()
 }
 
 /// The members of a JSON object in document order, with values kept verbatim.
@@ -308,6 +343,40 @@ mod tests {
                 Err(SubstitutionError::UnrecognizedBody),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn refresh_token_is_read_and_set_in_place_or_appended() {
+        let body = br#"{"a":1,"refresh_token":"old","b":[1, 2]}"#;
+        assert_eq!(upstream_refresh_token(200, body).as_deref(), Some("old"));
+        assert_eq!(
+            with_refresh_token(200, body, "new").unwrap(),
+            br#"{"a":1,"refresh_token":"new","b":[1, 2]}"#
+        );
+        let without = br#"{"a":1}"#;
+        assert_eq!(upstream_refresh_token(200, without), None);
+        assert_eq!(
+            with_refresh_token(200, without, "new").unwrap(),
+            br#"{"a":1,"refresh_token":"new"}"#
+        );
+        for empty in [
+            &br#"{"refresh_token":""}"#[..],
+            br#"{"refresh_token":null}"#,
+        ] {
+            assert_eq!(upstream_refresh_token(200, empty), None);
+            assert_eq!(
+                with_refresh_token(200, empty, "new").unwrap(),
+                br#"{"refresh_token":"new"}"#
+            );
+        }
+        for (status, body) in [
+            (400, &br#"{"refresh_token":"x"}"#[..]),
+            (200, br#"["refresh_token"]"#),
+            (200, b"not json"),
+        ] {
+            assert_eq!(upstream_refresh_token(status, body), None);
+            assert_eq!(with_refresh_token(status, body, "n"), None);
         }
     }
 
