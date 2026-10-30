@@ -134,6 +134,12 @@ the snapshot age before every invocation and synchronously reloads providers onc
 snapshot. Consequently, an SSM update normally becomes visible to each active environment on its
 first invocation after the TTL expires; no background timer is required while Lambda is frozen.
 
+Lambda scales out into several execution environments, and the default in-memory store cannot
+see codes redeemed in another one. To make each authorization code single-use across all
+environments, create the DynamoDB table described in the
+[Transient store reference](/oauthrelay/reference/transient-store/), grant the function role
+access to it, and set `OAUTHRELAY_STORE=dynamodb` and `OAUTHRELAY_STORE_DYNAMODB_TABLE`.
+
 ### 3. Cognito OIDC provider
 
 Add an OIDC provider to each user pool using manual input. Keep trust fields pointed at Google and

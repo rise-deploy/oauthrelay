@@ -17,11 +17,12 @@ continuing to trust the upstream issuer.
 
 ```text
 crates/
-  oauthrelay-core/          protocol engine, resources, resolver seams, router, sealing
+  oauthrelay-core/          protocol engine, resources, resolver and transient-store seams, router, sealing
   oauthrelay-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
   oauthrelay-provider-file/ multi-document YAML provider and composable secret resolution
   oauthrelay-provider-ssm/  SSM resource discovery and AWS secret backend
   oauthrelay-provider-kubernetes/ Namespaced CR discovery and Kubernetes Secret backend
+  oauthrelay-store-dynamodb/ Amazon DynamoDB transient store
   oauthrelay/               provider wiring, native server, Lambda runtime, schema CLI
 ```
 
@@ -141,8 +142,41 @@ unvalidated redirect URI is never reflected into a response.
   upstream token, so forwarding one only leaks it.
 - Discovery and JWKS responses are cached for bounded TTLs.
 
-The standalone binary supplies an in-memory replay cache. An embedding without a replay cache
-accepts a sealed authorization code for its five-minute cryptographic lifetime.
+## Transient store
+
+Sealed envelopes carry their own state, so the router remembers only the facts that must outlive a
+request. Those live behind one seam, `TransientStore`, selected through `RelayConfig.store`:
+
+```rust
+#[async_trait]
+pub trait TransientStore: Send + Sync + 'static {
+    async fn put_if_absent(&self, key: &str, value: &[u8], ttl: Duration) -> Result<bool, StoreError>;
+    async fn get(&self, key: &str) -> Result<Option<Entry>, StoreError>;
+    async fn compare_and_swap(&self, key: &str, expected: &[u8], new: &[u8], ttl: Duration)
+        -> Result<bool, StoreError>;
+    async fn delete(&self, key: &str) -> Result<(), StoreError>;
+}
+```
+
+Every write carries a TTL, values are opaque bytes, and operations on one key are linearizable
+across all instances sharing the backend. Callers namespace keys by purpose (`replay:` today,
+`refresh:` for stateful refresh-token rotation); backends never interpret keys. An expired record
+is absent for reads and conditional writes even when the backend has not yet deleted it. A backend
+error means the outcome is unknown and callers fail closed. The rustdoc on the trait states the
+full contract and the intended rotation record layout.
+
+Replay protection uses `put_if_absent` on `replay:code:{envelope id}` for authorization codes and
+`replay:client-assertion:{digest}` for `requireSingleUse` client assertions. An unavailable store
+makes the token endpoint return HTTP 503 `server_error` without consuming the code, and fails
+client-assertion authentication.
+
+The standalone binary selects the backend with `OAUTHRELAY_STORE`. `memory` (default) is
+process-local and protects one process or one Lambda execution environment. `dynamodb`
+(`oauthrelay-store-dynamodb`, behind the `aws` feature) shares state across replicas and Lambda
+environments through conditional `PutItem` and strongly consistent `GetItem`, with `expires_at`
+epoch seconds as the table's TTL attribute and an explicit expiry check on every read. An
+embedding without a store accepts a sealed authorization code for its five-minute cryptographic
+lifetime and rejects `requireSingleUse` client assertions.
 
 ## Configuration resources
 
