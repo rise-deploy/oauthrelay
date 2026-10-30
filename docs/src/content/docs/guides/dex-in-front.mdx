@@ -1,0 +1,243 @@
+---
+title: "Dex in front of oauthrelay: per-client claim policies"
+description: Give each Dex client its own ID-token admission policy by routing it to a dedicated oauthrelay relay over one shared IdP client.
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../components/Mermaid.astro';
+
+Applications keep integrating with [Dex](https://dexidp.io/) as usual: Dex issuer, their own Dex
+client, Dex refresh tokens, Dex claim shapes. oauthrelay sits between Dex and the identity provider
+(IdP), one relay per claim policy, all relays sharing one `Upstream`. Dex binds each client to
+exactly one connector, so the policy a client gets is enforced by Dex's routing rather than by the
+application.
+
+Use this when different applications need different claim filters at the IdP boundary, the
+applications cannot filter on their own, and you want a single IdP client registration for all of
+them.
+
+<Mermaid
+  label="Two Dex clients are each bound to one Dex connector. Each connector points at its own oauthrelay relay, and both relays share one upstream IdP client."
+  chart={`flowchart LR
+    A[App A<br/>Dex client app-a]
+    B[App B<br/>Dex client app-b]
+    D[Dex]
+    RA[oauthrelay relay-a<br/>policy A]
+    RB[oauthrelay relay-b<br/>policy B]
+    I[IdP<br/>one client]
+
+    A --> D
+    B --> D
+    D -->|connector relay-a| RA
+    D -->|connector relay-b| RB
+    RA --> I
+    RB --> I`}
+/>
+
+## Requirements
+
+- **Dex 2.46.0 or later.** The OAuth2 client option `allowedConnectors` was added in 2.46.0 and is
+  enforced on every token grant in the same release. Earlier versions let any client pass
+  `connector_id` or pick any connector, so the binding that selects the policy would be advisory
+  only.
+- oauthrelay reachable from Dex over HTTPS. Dex also needs to reach the IdP's JWKS endpoint, because
+  relay metadata keeps the IdP's `jwks_uri`.
+- One IdP OAuth client whose redirect URI is the oauthrelay callback for the shared upstream,
+  `{OAUTHRELAY_PUBLIC_URL}/upstream/{upstream-name}/callback`. Both relays use this one callback.
+  This guide uses `https://login.example.com/oidc/upstream/idp/callback`.
+
+The hostnames below are used throughout: Dex at `https://dex.example.com/dex`, oauthrelay at
+`OAUTHRELAY_PUBLIC_URL=https://login.example.com/oidc`, and the IdP at `https://idp.example.com`.
+
+## Worked example
+
+App A is for engineering staff and App B for partner users. Both sign in through the same IdP.
+
+### oauthrelay resources
+
+One upstream holds the IdP client. Each relay carries one policy.
+
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: idp
+spec:
+  issuerUrl: https://idp.example.com
+  oauthClient:
+    clientId: dex-relay
+    clientSecret:
+      valueFrom:
+        env:
+          name: IDP_CLIENT_SECRET
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: relay-a
+spec:
+  upstreamRef:
+    name: idp
+  scopes:
+    allowed: [openid, profile, email, offline_access]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    - uri: https://dex.example.com/dex/callback
+  idTokenPolicy:
+    required:
+      department:
+        stringIn: [engineering, platform]
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: relay-b
+spec:
+  upstreamRef:
+    name: idp
+  scopes:
+    allowed: [openid, profile, email, offline_access]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    - uri: https://dex.example.com/dex/callback
+  idTokenPolicy:
+    required:
+      email_verified:
+        booleanEquals: true
+      email:
+        stringLike: "*@partner.example.org"
+```
+
+- `UpstreamClient` makes the relay accept the IdP client's ID and secret from Dex. This is the
+  fitting choice because Dex validates the ID token's `aud` against its connector `clientID`, and
+  the ID token the IdP issued names the IdP client. The Dex connector therefore has to be
+  configured with that same client ID. oauthrelay reads client credentials from the token request
+  body only, so the connector sets `basicAuthUnsupported: true`.
+- The `uri` redirect entry is Dex's callback, `{Dex issuer}/callback`, matched exactly.
+- Every scope Dex requests must be in `scopes.allowed`; a scope outside it is rejected. Add
+  `offline_access` if Dex requests it from your IdP, and any extra scope you add to a connector's
+  `scopes`.
+- `idTokenPolicy` matchers read top-level claims that are strings or booleans. `department` here
+  stands for any string claim your IdP puts in the ID token. An array-valued claim such as `groups`
+  does not match any operator; see [Limitations](#limitations).
+- `refreshTokens.mode` stays at its default, `passthrough`. The refresh tokens oauthrelay would wrap
+  are held by Dex on the server side rather than by browsers, so sealing them adds nothing.
+
+See [ID-token admission policy](/oauthrelay/configuration/#id-token-admission-policy) for the
+operators and evaluation rules.
+
+### Dex configuration
+
+Each connector points at one relay. Dex fetches discovery from the relay, which keeps the IdP's
+issuer and JWKS and rewrites only the authorization and token endpoints. `issuerAlias` carries the
+IdP issuer that the discovery document and the ID token's `iss` contain, so Dex's issuer validation
+passes.
+
+```yaml
+connectors:
+  - type: oidc
+    id: relay-a
+    name: Staff sign-in
+    config:
+      issuer: https://login.example.com/oidc/relay/relay-a
+      issuerAlias: https://idp.example.com
+      clientID: dex-relay
+      clientSecret: $IDP_CLIENT_SECRET
+      redirectURI: https://dex.example.com/dex/callback
+      basicAuthUnsupported: true
+      scopes: [profile, email]
+  - type: oidc
+    id: relay-b
+    name: Partner sign-in
+    config:
+      issuer: https://login.example.com/oidc/relay/relay-b
+      issuerAlias: https://idp.example.com
+      clientID: dex-relay
+      clientSecret: $IDP_CLIENT_SECRET
+      redirectURI: https://dex.example.com/dex/callback
+      basicAuthUnsupported: true
+      scopes: [profile, email]
+
+staticClients:
+  - id: app-a
+    name: App A
+    secret: $APP_A_CLIENT_SECRET
+    redirectURIs:
+      - https://app-a.example.com/callback
+    allowedConnectors: [relay-a]
+  - id: app-b
+    name: App B
+    secret: $APP_B_CLIENT_SECRET
+    redirectURIs:
+      - https://app-b.example.com/callback
+    allowedConnectors: [relay-b]
+```
+
+Both connectors share the IdP client ID and secret. Only `issuer` differs, and with it the relay,
+and so the policy.
+
+Instead of `issuerAlias`, a connector can keep the IdP as its issuer and override just the two
+endpoints. Dex then does not fetch discovery from oauthrelay:
+
+```yaml
+config:
+  issuer: https://idp.example.com
+  providerDiscoveryOverrides:
+    authURL: https://login.example.com/oidc/relay/relay-a/authorize
+    tokenURL: https://login.example.com/oidc/relay/relay-a/token
+```
+
+## How a login flows
+
+1. App A sends the browser to Dex with its own Dex client. `allowedConnectors` leaves `relay-a` as
+   the only connector, so Dex goes straight to it.
+2. Dex redirects to `relay-a`'s authorization endpoint with Dex's callback as `redirect_uri`.
+   oauthrelay checks the redirect and scopes against the relay and redirects to the IdP with its
+   own callback.
+3. The user authenticates at the IdP, which returns to the oauthrelay callback. oauthrelay exchanges
+   the code with the IdP and redirects to Dex's callback with a single-use relay code.
+4. Dex posts that code to `relay-a`'s token endpoint with the IdP client's credentials. oauthrelay
+   verifies the IdP's ID token and evaluates `idTokenPolicy`.
+5. On success the response is the IdP's, byte for byte. Dex validates the ID token against the IdP
+   issuer and JWKS.
+6. Dex issues its own code and tokens to App A, which validates them against the Dex issuer.
+
+A policy rejection happens in step 4. oauthrelay answers the token request with `invalid_grant`
+and returns no tokens, so Dex cannot complete the connector login and shows an error page for the
+failed sign-in. The application only sees what Dex reports for a failed login. Enable
+`OAUTHRELAY_LOG=info,oauthrelay::id_token_policy=debug` to see which matcher failed and why.
+
+## Limitations
+
+- **Admission happens at sign-in only.** Refresh grants do not evaluate the policy. Dex holds the
+  IdP refresh token and uses it to refresh the user's claims, so a user who loses the
+  required claim keeps their session until Dex's refresh-token lifetime ends. Bound it with
+  `expiry.refreshTokens.absoluteLifetime` in the Dex configuration.
+- **Dex before 2.46.0 only advises.** Without `allowedConnectors` enforcement, nothing stops a
+  client from selecting another connector and its more permissive policy.
+- **Claim shape.** `idTokenPolicy` compares string and boolean claims. A group filter on an
+  array-valued `groups` claim is not expressible. If the policy is only about groups, Dex's own
+  connector option `allowedGroups` does it without oauthrelay, together with
+  `insecureEnableGroups` and the `groups` scope.
+- **IdP claims only.** The policy sees the IdP's ID token, not UserInfo and not claims Dex adds or
+  maps afterwards.
+
+## Alternative: oauthrelay in front of Dex
+
+The reverse layout is `Client → oauthrelay relay → Dex → IdP`. The relay's `Upstream` is Dex, with
+one Dex client and Dex's callback pointing at the oauthrelay upstream callback. There is no Dex
+version requirement and a single Dex client suffices. In exchange, every application is re-pointed
+at a relay and must support manual OIDC endpoint configuration: relay metadata advertises Dex's
+issuer, so `iss` and `aud` are Dex's and the Dex client's, as described in the
+[relay trust model](/oauthrelay/relay-model/). Policies can use only the claims Dex itself emits.
+
+Choose it when Dex cannot be upgraded, or when an application wants oauthrelay's own features
+directly: redirect policies, `PrivateKeyJwt` client authentication, or sealed and rotating refresh
+tokens for browser clients.
+
+See [Configuration](/oauthrelay/configuration/) for the complete `Upstream` and `Relay` field
+reference, and the [Dex OIDC connector documentation](https://dexidp.io/docs/connectors/oidc/) for
+the connector options used here.
