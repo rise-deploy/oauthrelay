@@ -26,8 +26,11 @@ for namespace selection, refresh settings, CRD installation, and deployment exam
 | `OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE` | no | pod or kubeconfig namespace | Single namespace consumed by the Kubernetes provider. |
 | `OAUTHRELAY_PROVIDER_KUBERNETES_REFRESH` | no | `60s` | Secret refresh and failed-compilation retry interval. |
 | `OAUTHRELAY_LAMBDA_CONFIG_TTL` | no | `60s` | Maximum Lambda snapshot age before invocation-driven refresh. |
-| `OAUTHRELAY_STORE` | no | `memory` | Transient store backend for single-use state: `memory` or `dynamodb`. |
+| `OAUTHRELAY_STORE` | no | `memory` | Transient store backend for single-use state: `memory`, `dynamodb`, or `kubernetes`. |
 | `OAUTHRELAY_STORE_DYNAMODB_TABLE` | with `dynamodb` | — | DynamoDB table holding transient records; see [Transient store](/oauthrelay/reference/transient-store/). |
+| `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | no | `transientrecords.oauthrelay.dev` | Resource holding the records of the `kubernetes` store. |
+| `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` | no | provider, pod, or kubeconfig namespace | Namespace holding the records of the `kubernetes` store. |
+| `OAUTHRELAY_STORE_KUBERNETES_SWEEP` | no | `60s` | Interval at which the `kubernetes` store deletes expired records, or `off`. |
 | `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` | no | `false` | Treat `localhost` as an alias for configured IP-literal loopback redirect matchers. |
 | `OAUTHRELAY_LOG` | no | `info` | `tracing` filter. |
 
@@ -38,7 +41,8 @@ Provider collision precedence is File, SSM, then Kubernetes.
 ## Build features
 
 The standalone crate enables `aws`, `lambda`, and `kubernetes` by default. `aws` supplies SSM resource
-discovery, AWS secret resolution for all providers, and the DynamoDB transient store. A native File-only build without AWS
+discovery, AWS secret resolution for all providers, and the DynamoDB transient store. `kubernetes` supplies the
+Kubernetes provider and the Kubernetes transient store. A native File-only build without AWS
 SDK dependencies uses `--no-default-features`; in that build, File resources can use inline,
 environment, and file secrets, while AWS secret references fail configuration validation.
 
@@ -106,4 +110,5 @@ after envelopes created with it have expired.
 The standalone runtime records only used authorization-code envelope IDs, in the
 [transient store](/oauthrelay/reference/transient-store/). With the default memory store, codes are
 single-use within one native process or one warm Lambda execution environment. Set
-`OAUTHRELAY_STORE=dynamodb` for single use across replicas, Lambda environments, and restarts.
+`OAUTHRELAY_STORE=dynamodb` or `kubernetes` for single use across replicas and restarts; use
+`dynamodb` on Lambda.

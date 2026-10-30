@@ -6,6 +6,7 @@ members = [
   "crates/oauthrelay-provider-ssm",
   "crates/oauthrelay-provider-kubernetes",
   "crates/oauthrelay-store-dynamodb",
+  "crates/oauthrelay-store-kubernetes",
   "crates/oauthrelay",
 ]
 resolver = "2"

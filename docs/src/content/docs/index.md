@@ -31,8 +31,8 @@ Several relays can share one upstream without creating additional provider callb
   sources.
 - [Runtime and deployment](/oauthrelay/reference/runtime/) covers native, container, and Lambda
   execution.
-- [Transient store](/oauthrelay/reference/transient-store/) covers single-use state: the memory and
-  DynamoDB backends.
+- [Transient store](/oauthrelay/reference/transient-store/) covers single-use state: the memory,
+  DynamoDB, and Kubernetes backends.
 - [HTTP endpoints](/oauthrelay/reference/http-endpoints/) describes relay, callback, metadata, and
   health routes.
 

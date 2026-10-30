@@ -1,6 +1,6 @@
 ---
 title: Transient store
-description: Choose where oauthrelay records single-use state, and provision the DynamoDB table.
+description: Choose where oauthrelay records single-use state, and provision the DynamoDB table or Kubernetes resource.
 ---
 
 oauthrelay keeps no database. Authorization codes, flow state, and other envelopes are sealed and
@@ -17,8 +17,13 @@ Select a backend with `OAUTHRELAY_STORE`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OAUTHRELAY_STORE` | `memory` | `memory` or `dynamodb`. |
+| `OAUTHRELAY_STORE` | `memory` | `memory`, `dynamodb`, or `kubernetes`. |
 | `OAUTHRELAY_STORE_DYNAMODB_TABLE` | — | DynamoDB table name. Required with `dynamodb`, rejected otherwise. |
+| `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | `transientrecords.oauthrelay.dev` | Resource that holds the records. Only valid with `kubernetes`. |
+| `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` | see [Kubernetes](#kubernetes) | Namespace that holds the records. Only valid with `kubernetes`. |
+| `OAUTHRELAY_STORE_KUBERNETES_SWEEP` | `60s` | How often expired records are deleted, or `off`. Only valid with `kubernetes`. |
+
+Settings for a backend that is not selected are rejected at startup rather than ignored.
 
 Replay records are small and short-lived: an authorization code is retained for five minutes, a
 client assertion until its expiry plus clock skew. Refresh-token records live as long as the
@@ -168,6 +173,116 @@ customer-managed KMS key.
   `server_error` and the authorization code stays unconsumed, so the client can retry. A
   `requireSingleUse` client assertion that cannot be recorded is rejected as an authentication
   failure.
+
+## Kubernetes
+
+`OAUTHRELAY_STORE=kubernetes` keeps every record as a namespaced custom resource, so an oauthrelay
+deployment inside a cluster can run several replicas without DynamoDB. It needs the `kubernetes`
+build feature, which the default build includes, and works with any configuration provider. It is
+never implied by `OAUTHRELAY_PROVIDER_KUBERNETES=true`: selecting it also means granting the RBAC
+below, so you choose it explicitly.
+
+```console
+export OAUTHRELAY_STORE=kubernetes
+```
+
+oauthrelay authenticates like the [Kubernetes provider](/oauthrelay/reference/kubernetes-provider/#namespace-and-credentials):
+with its service account in a pod, otherwise with the active kubeconfig. Records live in one
+namespace, chosen in this order: `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE`, the provider namespace
+(`OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE`, when the Kubernetes provider is enabled), then the
+pod or kubeconfig namespace. At startup oauthrelay lists the resource once and refuses to start,
+with the resource and namespace in the message, if the CRD is not installed or the credentials may
+not list it.
+
+### Install the CRD and grant access
+
+`oauthrelay crds` prints the `TransientRecord` definition together with the provider's. The
+[generated bundle](https://github.com/rise-deploy/oauthrelay/blob/develop/deploy/oauthrelay.crds.yaml)
+installs both:
+
+```sh
+kubectl apply --server-side -f oauthrelay.crds.yaml
+kubectl wait --for=condition=Established --timeout=60s crd/transientrecords.oauthrelay.dev
+```
+
+The service account needs these verbs in the records' namespace. The Role in the
+[deployment example](https://github.com/rise-deploy/oauthrelay/blob/develop/deploy/kubernetes.yaml)
+already includes the rule.
+
+```yaml
+rules:
+  - apiGroups: [oauthrelay.dev]
+    resources: [transientrecords]
+    verbs: [get, list, create, update, delete]
+```
+
+Grant that only to oauthrelay. Anyone who can delete or edit `TransientRecord` objects can make a
+used authorization code usable again or un-revoke a refresh-token family, so the namespace's write
+access is as sensitive as the store itself. Reading is far less sensitive: values are sealed with
+`OAUTHRELAY_SEAL_KEY` and bound to their key, and keys hold hashes and random identifiers.
+
+### Records
+
+Each record is one `TransientRecord` (`oauthrelay.dev/v1alpha1`):
+
+| Field | Meaning |
+| --- | --- |
+| `metadata.name` | `oauthrelay-` plus the lowercase base32 of the key's SHA-256: 63 characters, a valid name for any key. |
+| `metadata.labels` | `app.kubernetes.io/managed-by: oauthrelay`, and `oauthrelay.dev/purpose` with the key's first segment (`replay`, `refresh`). |
+| `spec.key` | The store key, for inspection. |
+| `spec.value` | The value, base64. |
+| `spec.expiresAt` | Expiry, RFC 3339 with millisecond precision. |
+
+```console
+$ kubectl -n oauthrelay get transientrecords -l oauthrelay.dev/purpose=refresh
+NAME                                                              EXPIRES
+oauthrelay-ic2idwnc3abyaqmxw55xhuecxwilgrg5uvwduxthintqsmw723da   2026-12-01T09:30:12.481Z
+```
+
+### Expiry and the sweeper
+
+Kubernetes has no server-side TTL, and correctness never depends on deletion: reads compare
+`spec.expiresAt` with the clock, and a write treats an expired record as absent and takes it over.
+Deleting expired records only keeps etcd small. Every replica runs a sweeper for that, by default
+every 60 seconds (`OAUTHRELAY_STORE_KUBERNETES_SWEEP`; `off` disables it, for example when
+another job cleans up). A sweep lists the records oauthrelay wrote (label selector
+`app.kubernetes.io/managed-by=oauthrelay`, 500 per page) and deletes each expired one with a
+`resourceVersion` precondition, so a record that another replica renewed between the list and the
+delete is kept. Replicas sweeping at once is harmless: deletes are idempotent. The sweeper does
+not run on Lambda, which freezes the process between invocations.
+
+### Rotating refresh tokens and sizing
+
+The Kubernetes store suits moderate refresh traffic. Every operation is a request to the API
+server and every record an object in etcd, which the cluster shares with everything else it runs.
+
+| Per refresh grant | Operations |
+| --- | --- |
+| Rotation | 2 reads (handle, revoked marker) and 5 writes (claim, response, successor, tombstone swap, head pointer; see [DynamoDB sizing](#sizing-for-rotating-refresh-tokens)) |
+| Duplicate within the grace period | 3 reads, no writes |
+
+Each rotation leaves a tombstone object until the family ends, so a session that refreshes hourly
+leaves about 720 of them over the default 30-day family. An object weighs roughly 1 to 2 KB in
+etcd including its metadata, so 1,000 such sessions hold about 720,000 objects, on the order of a
+gigabyte. Set a shorter `maxLifetimeSeconds` on relays that use this backend (seven days cuts the
+figure to about 170 per session), and use [DynamoDB](#dynamodb) when refresh volumes are high.
+
+### Consistency and failures
+
+- A record is created with `POST`, and exactly one concurrent creator succeeds. A replacement is
+  a `PUT` that carries the `resourceVersion` that was read, and Kubernetes rejects it with 409 if
+  the object changed in between, so `compare_and_swap` and the takeover of an expired record each
+  succeed for exactly one of any set of concurrent callers across all replicas.
+- Reads are quorum reads: a `GET` without a `resourceVersion` is served from etcd's current state.
+- A 409 can also be what a write reports when its response was lost and the request was retried.
+  When the record read back is live and holds exactly the value the call wrote, the write is
+  treated as successful. This relies on callers writing values that are unique to the writer,
+  which oauthrelay does (see [DynamoDB behavior](#behavior)).
+- Records keep millisecond precision. Expiry is judged by the reading instance's clock, so keep
+  instance clocks synchronized.
+- If the API server is unreachable or denies a request, a token request that needs the store
+  fails closed with HTTP 503 `server_error` and the authorization code stays unconsumed, exactly
+  as with DynamoDB.
 
 ## Embedding the core
 

@@ -362,7 +362,8 @@ refresh token and the client must always store the latest one.
   `rotating` back to `sealed`, or to `passthrough`, every `rrt2.` handle is rejected with
   `invalid_grant` and users sign in again. Raw upstream tokens are rejected in both modes.
 - **A store is required.** A `rotating` relay needs a transient store shared by every serving
-  instance: use `OAUTHRELAY_STORE=dynamodb` for more than one replica or any Lambda deployment. With
+  instance: use `OAUTHRELAY_STORE=dynamodb` (or `kubernetes`, for moderate refresh volumes inside a
+  cluster) for more than one replica, and `dynamodb` for any Lambda deployment. With
   the default in-process `memory` store a handle only works on the instance that issued it and
   stops working when that process restarts. An embedding that supplies no store gets a logged
   HTTP 500 `server_error` from authorize and from both grants of a `rotating` relay.
@@ -431,8 +432,9 @@ plus clock skew. A missing or failing [transient store](/oauthrelay/reference/tr
 rejects authentication.
 
 The standalone server's default transient store is in memory: protection covers one process
-lifetime. Multiple replicas, Lambda instances, and restarts need `OAUTHRELAY_STORE=dynamodb` (or an
-embedded deployment supplying a shared durable `TransientStore`) to enforce single use across them.
+lifetime. Multiple replicas, Lambda instances, and restarts need `OAUTHRELAY_STORE=dynamodb` or
+`kubernetes` (or an embedded deployment supplying a shared durable `TransientStore`) to enforce
+single use across them.
 `requireSingleUse` authenticates the request; it does not sender-constrain upstream access tokens.
 
 Configure `jwksUrl` (an absolute HTTP(S) URL), `jwks` (an inline public JWKS object with a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate generated CRDs and the provider in a disposable Kind cluster."""
+"""Validate generated CRDs, the provider and the Kubernetes transient store in a disposable Kind cluster."""
 import os
 from pathlib import Path
 import subprocess
@@ -22,10 +22,15 @@ def main():
             kubectl = ["kubectl", "--kubeconfig", config, "--request-timeout=30s"]
             run(*kubectl, "apply", "--server-side", "-f", "deploy/oauthrelay.crds.yaml")
             run(*kubectl, "wait", "--for=condition=Established", "--timeout=60s",
-                "crd/upstreams.oauthrelay.dev", "crd/relays.oauthrelay.dev")
+                "crd/upstreams.oauthrelay.dev", "crd/relays.oauthrelay.dev",
+                "crd/transientrecords.oauthrelay.dev")
             env = dict(os.environ, RUSTC_WRAPPER="", OAUTHRELAY_KUBERNETES_TEST_KUBECONFIG=config)
             run("cargo", "test", "--locked", "-p", "oauthrelay-provider-kubernetes",
                 "--test", "kubernetes", "--", "--ignored", "--nocapture", timeout=600, env=env)
+            # One test at a time: the sweeper tests would otherwise delete each other's records.
+            run("cargo", "test", "--locked", "-p", "oauthrelay-store-kubernetes",
+                "--test", "kubernetes", "--", "--ignored", "--nocapture", "--test-threads=1",
+                timeout=600, env=env)
         finally:
             run("kind", "delete", "cluster", "--name", name, timeout=120)
 

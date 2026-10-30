@@ -100,9 +100,10 @@ crates/oauthrelay-provider-file/ File configuration provider
 crates/oauthrelay-provider-ssm/  AWS SSM and Secrets Manager provider
 crates/oauthrelay-provider-kubernetes/ Namespaced Kubernetes provider
 crates/oauthrelay-store-dynamodb/ Amazon DynamoDB transient store
+crates/oauthrelay-store-kubernetes/ Kubernetes custom-resource transient store
 crates/oauthrelay/               standalone native and Lambda runtime
 ```
 
 The core exposes resolver and transient-store seams for hosts that need database-backed
 configuration or distributed single-use authorization codes. The standalone binary offers an
-in-memory store (default) and a DynamoDB store for this state.
+in-memory store (default), a DynamoDB store, and a Kubernetes store for this state.

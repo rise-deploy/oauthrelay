@@ -2567,6 +2567,7 @@ dependencies = [
  "oauthrelay-provider-kubernetes",
  "oauthrelay-provider-ssm",
  "oauthrelay-store-dynamodb",
+ "oauthrelay-store-kubernetes",
  "reqwest",
  "serde",
  "serde_json",
@@ -2690,6 +2691,30 @@ dependencies = [
  "oauthrelay-core",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "oauthrelay-store-kubernetes"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "http-body-util",
+ "k8s-openapi",
+ "kube",
+ "oauthrelay-core",
+ "schemars",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "serde_urlencoded",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
