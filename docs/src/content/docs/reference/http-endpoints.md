@@ -10,8 +10,8 @@ upstream name `U`, oauthrelay serves:
 | --- | --- |
 | `GET {B}/relay/{R}/authorize` | Validates redirect and scope policy, creates independent upstream state and S256 PKCE, then redirects to the upstream. |
 | `GET {B}/upstream/{U}/callback` | Validates upstream-bound state, exchanges the upstream code, and returns a sealed code to the originating relay redirect. |
-| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. A relay with `refreshTokens.mode: sealed` replaces only the `refresh_token` member. |
-| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. A `sealed` relay opens the presented handle first. |
+| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. A relay with `refreshTokens.mode: sealed` or `rotating` replaces only the `refresh_token` member. |
+| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. A `sealed` relay opens the presented handle first; a `rotating` relay claims it and returns a successor handle. |
 | `OPTIONS {B}/relay/{R}/token` | Returns CORS headers only for an allowed origin. |
 | `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
 | `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
@@ -80,6 +80,32 @@ the upstream and reads any 2xx body as JSON whatever its content type; a 2xx bod
 JSON object but contains a `refresh_token` field (for example form-encoded) is answered with 502
 `server_error` and is never returned. A refresh token with a handle prefix (`rrt<N>.`) is never sent
 to the upstream in any mode, including `passthrough`; it is `invalid_grant`.
+
+### Rotating refresh tokens
+
+With `refreshTokens.mode: rotating` (see
+[Rotating refresh tokens](/oauthrelay/configuration/#rotating-refresh-tokens)) handles begin with
+`rrt2.` and are single use. A successful refresh response always contains a successor handle,
+even when the provider returned none; present that one next.
+
+```json
+{"access_token":"ya29.…","refresh_token":"rrt2.Zk3…","expires_in":3599,"token_type":"Bearer"}
+```
+
+| Situation | Response |
+| --- | --- |
+| Handle unknown, expired, revoked, past the family's maximum lifetime, not issued by this relay, or stored under a seal key that is no longer configured | 400 `invalid_grant`; the provider is not contacted. |
+| Handle already used, within `gracePeriodSeconds` of its rotation | The response of that rotation again, with the same successor handle. |
+| Handle already used, after the grace period | 400 `invalid_grant`, and the whole family is revoked. |
+| Another request is rotating the same handle and does not finish within five seconds | 503 `temporarily_unavailable` with `Retry-After: 1`; retry. |
+| Provider unreachable or answers an error | The provider's error, or 502 `server_error`; the handle stays usable. |
+| Provider answers `invalid_grant` | The provider's error, and the family is revoked. |
+| Provider answers success without a JSON object body | 502 `server_error`; the handle stays usable. |
+| Transient store unreachable | 503 `server_error`. |
+| `rrt1.` handle from this relay when it was `sealed` | Accepted once; the response carries an `rrt2.` handle in a new family. |
+
+A relay in this mode with no transient store configured returns 500 `server_error` from the
+authorize endpoint and both grants and logs the cause.
 
 ## Transparent metadata
 

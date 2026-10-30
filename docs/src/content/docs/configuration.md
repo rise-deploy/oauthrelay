@@ -92,7 +92,9 @@ upstream-owned by the relay contract.
 | `spec.scopes.allowed` | no | unrestricted | Complete allow-list for configured and requested scopes. Every default scope must be allowed. |
 | `spec.requiredIdTokenClaims` | no | `{}` | Exact string values required in the verified upstream ID token. |
 | `spec.idTokenPolicy` | no | omitted | Typed claim rules for initial sign-in; all rules also compose with `requiredIdTokenClaims`. |
-| `spec.refreshTokens.mode` | no | `passthrough` | `passthrough` returns upstream refresh tokens unchanged; `sealed` returns [sealed handles](#refresh-tokens) instead. |
+| `spec.refreshTokens.mode` | no | `passthrough` | `passthrough` returns upstream refresh tokens unchanged; `sealed` returns [sealed handles](#refresh-tokens) instead; `rotating` returns [single-use handles](#rotating-refresh-tokens) and needs a shared [transient store](/oauthrelay/reference/transient-store/). |
+| `spec.refreshTokens.gracePeriodSeconds` | no | `30` | `rotating` only, 1 to 300. How long an already-used handle is still answered with the same successor. |
+| `spec.refreshTokens.maxLifetimeSeconds` | no | `2592000` (30 days) | `rotating` only, at least `gracePeriodSeconds`. Absolute lifetime of a refresh-token family from the original sign-in. |
 | `spec.clientAuthentication` | yes | — | Authentication policy for requests to the relay token endpoint. |
 | `spec.redirectPolicy` | yes | — | Non-empty list of explicit application redirect matchers. |
 
@@ -266,6 +268,76 @@ relying party keeps using its current handle.
   form-encoded or other non-JSON body that contains a `refresh_token` cannot be rewritten, so the
   relay fails closed with HTTP 502 `server_error` instead of returning the raw token. Provider
   errors (non-2xx) pass through unchanged; an unreachable provider is a 502 `server_error`.
+
+### Rotating refresh tokens
+
+`sealed` handles are stateless, so a leaked handle works for as long as the upstream token does.
+Set `refreshTokens.mode: rotating` to make every handle single use and to detect theft:
+
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  oauthClient:
+    clientId: 123456789.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: spa
+spec:
+  upstreamRef:
+    name: google
+  refreshTokens:
+    mode: rotating
+    gracePeriodSeconds: 30
+    maxLifetimeSeconds: 2592000
+  clientAuthentication:
+    type: Public
+  redirectPolicy:
+    - origin: https://app.example.com
+```
+
+In `rotating` mode the code grant returns a handle that starts with `rrt2.`: 32 random bytes that
+mean nothing outside the relay. The upstream token lives, encrypted with `OAUTHRELAY_SEAL_KEY` and
+bound to the relay, in the [transient store](/oauthrelay/reference/transient-store/). Every
+refresh grant presents a handle, refreshes upstream, and returns a **new** handle in the same
+`refresh_token` member; the presented handle is spent. If the upstream does not rotate its own
+token, the relay wraps the same upstream token in the new handle, so the response always carries a
+refresh token and the client must always store the latest one.
+
+- **Grace period.** Browsers with several tabs, and clients that retry after a lost response, can
+  present the same handle twice. Within `gracePeriodSeconds` of the rotation the second request
+  gets the same response, and the same successor handle, without reaching the provider. Requests
+  that arrive while the first is still in flight wait up to five seconds for it; if it is slower
+  they get HTTP 503 `temporarily_unavailable` with `Retry-After` and should retry.
+- **Reuse detection.** A spent handle presented after the grace period means two parties hold the
+  same token. The relay revokes the whole family, including the newest handle, and answers
+  `invalid_grant`; the user signs in again. The relay logs a `refresh_token_reuse` security event
+  (target `oauthrelay::security`) with the relay name and a hash of the family, never a token.
+- **Maximum lifetime.** A family ends `maxLifetimeSeconds` after the sign-in that created it,
+  however actively it is used. After that a refresh fails with `invalid_grant`.
+- **Upstream errors.** A network error or provider error response is returned to the client and
+  leaves the handle usable for a retry. A provider `invalid_grant` revokes the family.
+- **Switching modes.** A relay changed from `sealed` to `rotating` accepts the `rrt1.` handles it
+  issued earlier once and replaces them with `rrt2.` handles, so users stay signed in. Changed from
+  `rotating` back to `sealed`, or to `passthrough`, every `rrt2.` handle is rejected with
+  `invalid_grant` and users sign in again. Raw upstream tokens are rejected in both modes.
+- **A store is required.** A `rotating` relay needs a transient store shared by every serving
+  instance: use `OAUTHRELAY_STORE=dynamodb` for more than one replica or any Lambda deployment. With
+  the default in-process `memory` store a handle only works on the instance that issued it and
+  stops working when that process restarts. An embedding that supplies no store gets a logged
+  HTTP 500 `server_error` from authorize and from both grants of a `rotating` relay.
+- If the store is unreachable, refresh grants fail closed with HTTP 503 `server_error`.
+
+Rotation settings are rejected on a relay that is not `rotating`.
 
 ## Client authentication
 
