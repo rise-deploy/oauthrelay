@@ -214,6 +214,24 @@ and a dot (such as `rrt1.`) is a relay handle, never an upstream token, and is n
 the provider as-is. A handle the relay's mode can open is opened (see the modes below); any other
 handle is answered with `invalid_grant`.
 
+### Security profile
+
+| | `passthrough` | `sealed` | `rotating` |
+|---|---|---|---|
+| The client holds | the upstream token | an `rrt1.` handle | an `rrt2.` handle |
+| Usable at the provider directly | yes | no | no |
+| A leaked token works through the relay | until the provider expires it | until the provider expires it | until the legitimate client next refreshes; if the thief refreshed first, that refresh revokes the family |
+| Theft detection | none | none | reuse after the grace period revokes the family |
+| Lifetime bound set by the relay | none | none | `maxLifetimeSeconds` |
+| Revoke every token at once | at the provider | replace the seal key | replace the seal key |
+| Needs a store | no | no | yes |
+
+`sealed` hides the upstream token but does not shorten the life of a leaked handle; use `rotating`
+when a stolen refresh token has to stop working. In both, the relay holds the upstream token only
+encrypted with `OAUTHRELAY_SEAL_KEY`, so the store or a captured handle reveals nothing without
+the key. Within `gracePeriodSeconds` of a rotation, anyone presenting the spent handle gets the
+same successor, so the grace window is the one span in which a thief goes undetected.
+
 Set `refreshTokens.mode: sealed` to keep upstream refresh tokens inside the relay:
 
 ```yaml oauthrelay-config
