@@ -1103,6 +1103,80 @@ impl TransientStore for FlakyStore {
     }
 }
 
+/// Resolves a failed `put_if_absent` the way the DynamoDB store resolves an ambiguous conditional
+/// write: a live record holding exactly the bytes being written counts as this caller's own write.
+#[derive(Default)]
+struct ValueResolvingStore(MemoryStore);
+
+#[async_trait::async_trait]
+impl TransientStore for ValueResolvingStore {
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<bool, crate::StoreError> {
+        if self.0.put_if_absent(key, value, ttl).await? {
+            return Ok(true);
+        }
+        Ok(self
+            .0
+            .get(key)
+            .await?
+            .is_some_and(|entry| entry.value == value))
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<crate::Entry>, crate::StoreError> {
+        self.0.get(key).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: &[u8],
+        new: &[u8],
+        ttl: Duration,
+    ) -> Result<bool, crate::StoreError> {
+        self.0.compare_and_swap(key, expected, new, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), crate::StoreError> {
+        self.0.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn code_replay_is_rejected_by_a_store_that_resolves_writes_by_value() {
+    let (app, _, task, _) = setup_with_store(
+        "google",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+        RefreshTokens::default(),
+        Arc::new(ValueResolvingStore::default()),
+    )
+    .await;
+    let verifier = "a-public-verifier-with-enough-entropy-123456789";
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(verifier))).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", "https://app.example/callback"),
+        ("code_verifier", verifier),
+    ])
+    .unwrap();
+    assert!(post_token(&app, "google", &form)
+        .await
+        .status()
+        .is_success());
+    let replay = post_token(&app, "google", &form).await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+    assert_eq!(body["error_description"], "code was already used");
+    task.abort();
+}
+
 #[tokio::test]
 async fn store_failure_is_retryable_and_leaves_the_code_unconsumed() {
     let (app, _, task, _) = setup_with_store(
@@ -2522,7 +2596,8 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     let source = ClientJwks::Inline(json!({"keys": [{"kty":"RSA",
         "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
         "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]}));
-    let cache = Arc::new(MemoryStore::default());
+    // Resolves writes by value like the DynamoDB store, so a constant replay marker would pass.
+    let cache = Arc::new(ValueResolvingStore::default());
     let make_state = |store| AppState {
         resolver: Arc::new(ProviderSnapshot::default()),
         cfg: Arc::new(RelayConfig {

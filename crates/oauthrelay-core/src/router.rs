@@ -799,8 +799,11 @@ async fn exchange_sealed_code(
             "{REPLAY_CODE_PREFIX}{}",
             URL_SAFE_NO_PAD.encode(envelope.envelope_id)
         );
+        // A random marker keeps the value unique to this redemption, as the store contract
+        // requires: a backend that resolves an ambiguous conditional write by comparing values
+        // would otherwise accept a replay of the same code as its own earlier write.
         match store
-            .put_if_absent(&key, b"1", Duration::from_secs(CODE_TTL))
+            .put_if_absent(&key, &random_array::<16>(), Duration::from_secs(CODE_TTL))
             .await
         {
             Ok(true) => {}
@@ -1296,8 +1299,9 @@ async fn verify_private_key_jwt(
             .saturating_add(validation.leeway)
             .saturating_sub(unix_now())
             .saturating_add(1);
+        // Unique to this presentation, as for authorization codes.
         match store
-            .put_if_absent(&key, b"1", Duration::from_secs(ttl))
+            .put_if_absent(&key, &random_array::<16>(), Duration::from_secs(ttl))
             .await
         {
             Ok(true) => {}
