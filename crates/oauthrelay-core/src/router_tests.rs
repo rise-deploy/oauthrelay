@@ -1804,6 +1804,58 @@ async fn id_token_policy_enforces_verified_domain_or_guest_at_code_redemption() 
 }
 
 #[tokio::test]
+async fn id_token_policy_requires_group_membership_from_array_claims() {
+    let policy: crate::IdTokenPolicy = serde_json::from_value(json!({
+        "required": {"groups": {"arrayContainsAny": ["admins", "ops"]}}
+    }))
+    .unwrap();
+    let (app, fixture, task, redirect_uri, _) =
+        setup_signed_policy(RelayProfile::Google, HashMap::new(), Some(policy)).await;
+    for (overrides, accepted) in [
+        (json!({"groups": ["eng", "ops"]}), true),
+        (json!({"groups": ["admins"]}), true),
+        (json!({"groups": ["eng"]}), false),
+        (json!({"groups": []}), false),
+        (json!({"groups": "ops"}), false),
+        (json!({"groups": ["ops", 1]}), false),
+        (json!({}), false),
+    ] {
+        *fixture.claim_overrides.lock().unwrap() = overrides.as_object().unwrap().clone();
+        let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .unwrap();
+        let response = post_token(&app, "profile", &form).await;
+        assert_eq!(
+            response.status(),
+            if accepted {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{overrides}"
+        );
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        if accepted {
+            assert!(body.get("id_token").is_some());
+        } else {
+            assert_eq!(body["error"], "invalid_grant");
+            assert!(body.get("id_token").is_none());
+            assert!(body.get("access_token").is_none());
+            assert!(body.get("refresh_token").is_none());
+            let replay = post_token(&app, "profile", &form).await;
+            let replay_body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+            assert_eq!(replay_body["error_description"], "code was already used");
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
 async fn string_like_policy_applies_only_to_initial_admission() {
     let policy: crate::IdTokenPolicy = serde_json::from_value(json!({
         "required": {"email": {"stringLike": "*@example.com"}}

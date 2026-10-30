@@ -49,6 +49,25 @@ pub enum IdTokenClaimMatcher {
         #[serde(rename = "booleanEquals")]
         value: bool,
     },
+    /// The claim is an array of strings and at least one listed value is an element
+    /// (case-sensitive).
+    ArrayContainsAny {
+        #[serde(rename = "arrayContainsAny")]
+        #[schemars(length(min = 1))]
+        values: Vec<String>,
+    },
+    /// The claim is an array of strings and every listed value is an element
+    /// (case-sensitive).
+    ArrayContainsAll {
+        #[serde(rename = "arrayContainsAll")]
+        #[schemars(length(min = 1))]
+        values: Vec<String>,
+    },
+    /// The claim is an array of strings and at least one element matches the `stringLike` glob.
+    ArrayLikeAny {
+        #[serde(rename = "arrayLikeAny")]
+        pattern: String,
+    },
 }
 
 impl IdTokenPolicy {
@@ -100,8 +119,13 @@ fn validate_set(rules: &IdTokenClaimSet) -> Result<(), String> {
         if claim.is_empty() {
             return Err("idTokenPolicy must not contain an empty claim name".into());
         }
-        if matches!(matcher, IdTokenClaimMatcher::StringIn { values } if values.is_empty()) {
-            return Err("idTokenPolicy.stringIn must not be empty".into());
+        if let Some(values) = matcher.value_list() {
+            if values.is_empty() {
+                return Err(format!(
+                    "idTokenPolicy.{} must not be empty",
+                    matcher.operator()
+                ));
+            }
         }
     }
     Ok(())
@@ -137,6 +161,19 @@ impl IdTokenClaimMatcher {
             Self::StringIn { .. } => "stringIn",
             Self::StringLike { .. } => "stringLike",
             Self::BooleanEquals { .. } => "booleanEquals",
+            Self::ArrayContainsAny { .. } => "arrayContainsAny",
+            Self::ArrayContainsAll { .. } => "arrayContainsAll",
+            Self::ArrayLikeAny { .. } => "arrayLikeAny",
+        }
+    }
+
+    /// The configured list of a list-valued operator.
+    fn value_list(&self) -> Option<&[String]> {
+        match self {
+            Self::StringIn { values }
+            | Self::ArrayContainsAny { values }
+            | Self::ArrayContainsAll { values } => Some(values),
+            _ => None,
         }
     }
 
@@ -149,6 +186,27 @@ impl IdTokenClaimMatcher {
                 Some(actual) => actual == *value,
                 None => return (false, "wrong_type"),
             },
+            Self::ArrayContainsAny { .. }
+            | Self::ArrayContainsAll { .. }
+            | Self::ArrayLikeAny { .. } => {
+                let Some(elements) = string_array(actual) else {
+                    return (false, "wrong_type");
+                };
+                // An empty array never satisfies an array operator.
+                !elements.is_empty()
+                    && match self {
+                        Self::ArrayContainsAny { values } => elements
+                            .iter()
+                            .any(|element| values.iter().any(|value| value == element)),
+                        Self::ArrayContainsAll { values } => values
+                            .iter()
+                            .all(|value| elements.iter().any(|element| element == value)),
+                        Self::ArrayLikeAny { pattern } => {
+                            elements.iter().any(|element| string_like(pattern, element))
+                        }
+                        _ => unreachable!(),
+                    }
+            }
             _ => {
                 let Some(actual) = actual.as_str() else {
                     return (false, "wrong_type");
@@ -157,12 +215,21 @@ impl IdTokenClaimMatcher {
                     Self::StringEquals { value } => actual == value,
                     Self::StringIn { values } => values.iter().any(|value| value == actual),
                     Self::StringLike { pattern } => string_like(pattern, actual),
-                    Self::BooleanEquals { .. } => unreachable!(),
+                    _ => unreachable!(),
                 }
             }
         };
         (matched, if matched { "matched" } else { "value_mismatch" })
     }
+}
+
+/// The elements of a JSON array whose elements are all strings.
+fn string_array(value: &Value) -> Option<Vec<&str>> {
+    value
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
 }
 
 fn string_like(pattern: &str, value: &str) -> bool {
@@ -271,6 +338,8 @@ mod tests {
             json!({"anyOf": null}),
             json!({"required": {"": {"stringEquals": "x"}}}),
             json!({"required": {"email": {"stringIn": []}}}),
+            json!({"required": {"groups": {"arrayContainsAny": []}}}),
+            json!({"required": {"groups": {"arrayContainsAll": []}}}),
         ] {
             let policy: IdTokenPolicy = serde_json::from_value(value).unwrap();
             assert!(policy.validate().is_err());
@@ -279,10 +348,151 @@ mod tests {
             json!({"required": {"email": {"stringEquals": "x", "stringLike": "*"}}}),
             json!({"required": {"email": {"stringRegex": ".*"}}}),
             json!({"required": {"email": {"stringIn": ["x", true]}}}),
+            json!({"required": {"groups": {"arrayContainsAny": ["x", 1]}}}),
+            json!({"required": {"groups": {"arrayContainsAll": "x"}}}),
+            json!({"required": {"groups": {"arrayLikeAny": ["x"]}}}),
+            json!({"required": {"groups": {"arrayContainsAny": ["x"], "arrayContainsAll": ["x"]}}}),
+            json!({"required": {"groups": {"arrayContainsAny": ["x"], "stringIn": ["x"]}}}),
             json!({"required": {"email_verified": {"booleanEquals": "true"}}}),
             json!({"required": {"email": {"stringEquals": "x"}}, "unknown": true}),
         ] {
             assert!(serde_json::from_value::<IdTokenPolicy>(value).is_err());
+        }
+    }
+
+    fn matcher(value: Value) -> IdTokenClaimMatcher {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn array_operators_match_string_array_claims() {
+        let any = matcher(json!({"arrayContainsAny": ["admins", "ops"]}));
+        let all = matcher(json!({"arrayContainsAll": ["admins", "ops"]}));
+        let like = matcher(json!({"arrayLikeAny": "team-*"}));
+        for (claim, any_result, all_result, like_result) in [
+            (json!(["admins"]), true, false, false),
+            (json!(["ops", "other"]), true, false, false),
+            (json!(["ops", "admins"]), true, true, false),
+            (json!(["admins", "ops", "team-a"]), true, true, true),
+            (json!(["Admins"]), false, false, false),
+            (json!(["other"]), false, false, false),
+            (json!(["team-a"]), false, false, true),
+            (json!(["x-team-a"]), false, false, false),
+            (json!([]), false, false, false),
+        ] {
+            for (matcher, expected) in
+                [(&any, any_result), (&all, all_result), (&like, like_result)]
+            {
+                assert_eq!(
+                    matcher.evaluate(Some(&claim)),
+                    (
+                        expected,
+                        if expected {
+                            "matched"
+                        } else {
+                            "value_mismatch"
+                        }
+                    ),
+                    "{} {claim}",
+                    matcher.operator()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn array_operators_fail_closed_on_wrong_types() {
+        for matcher in [
+            matcher(json!({"arrayContainsAny": ["admins"]})),
+            matcher(json!({"arrayContainsAll": ["admins"]})),
+            matcher(json!({"arrayLikeAny": "*"})),
+        ] {
+            assert_eq!(matcher.evaluate(None), (false, "missing_claim"));
+            for claim in [
+                json!("admins"),
+                json!(true),
+                json!(1),
+                json!(null),
+                json!({"admins": true}),
+                json!(["admins", 1]),
+                json!(["admins", null]),
+                json!(["admins", ["nested"]]),
+                json!([true]),
+            ] {
+                assert_eq!(
+                    matcher.evaluate(Some(&claim)),
+                    (false, "wrong_type"),
+                    "{} {claim}",
+                    matcher.operator()
+                );
+            }
+        }
+        for matcher in [
+            matcher(json!({"stringEquals": "admins"})),
+            matcher(json!({"stringIn": ["admins"]})),
+            matcher(json!({"stringLike": "*"})),
+        ] {
+            assert_eq!(
+                matcher.evaluate(Some(&json!(["admins"]))),
+                (false, "wrong_type")
+            );
+        }
+    }
+
+    #[test]
+    fn groups_policy_composes_with_required_and_any_of() {
+        let policy: IdTokenPolicy = serde_json::from_value(json!({
+            "required": {
+                "email_verified": {"booleanEquals": true},
+                "groups": {"arrayContainsAny": ["admins", "ops"]}
+            },
+            "anyOf": [
+                {"groups": {"arrayContainsAll": ["eng", "oncall"]}},
+                {"groups": {"arrayLikeAny": "platform-*"}}
+            ]
+        }))
+        .unwrap();
+        policy.validate().unwrap();
+        for (claims, accepted) in [
+            (
+                json!({"email_verified": true, "groups": ["ops", "eng", "oncall"]}),
+                true,
+            ),
+            (
+                json!({"email_verified": true, "groups": ["admins", "platform-sre"]}),
+                true,
+            ),
+            (
+                json!({"email_verified": true, "groups": ["admins", "eng"]}),
+                false,
+            ),
+            (
+                json!({"email_verified": false, "groups": ["ops", "platform-sre"]}),
+                false,
+            ),
+            (json!({"email_verified": true, "groups": []}), false),
+            (json!({"email_verified": true}), false),
+            (json!({"email_verified": true, "groups": "ops"}), false),
+        ] {
+            assert_eq!(policy.evaluate(&claims, "app", "idp"), accepted, "{claims}");
+        }
+    }
+
+    #[test]
+    fn array_operators_round_trip_and_appear_in_the_schema() {
+        let value = json!({
+            "required": {
+                "a": {"arrayContainsAny": ["x", "y"]},
+                "b": {"arrayContainsAll": ["x"]},
+                "c": {"arrayLikeAny": "team-*"}
+            }
+        });
+        let policy: IdTokenPolicy = serde_json::from_value(value.clone()).unwrap();
+        policy.validate().unwrap();
+        assert_eq!(serde_json::to_value(&policy).unwrap(), value);
+        let schema = serde_json::to_string(&schemars::schema_for!(IdTokenPolicy)).unwrap();
+        for operator in ["arrayContainsAny", "arrayContainsAll", "arrayLikeAny"] {
+            assert!(schema.contains(operator), "{operator}");
         }
     }
 
@@ -408,13 +618,20 @@ mod tests {
             "anyOf": [
                 {"email": {"stringLike": "private-*@example.com"}},
                 {"email": {"stringEquals": "private-expected@example.com"}},
-                {"missing": {"stringIn": ["private-list-entry"]}}
+                {"missing": {"stringIn": ["private-list-entry"]}},
+                {"groups": {"arrayContainsAny": ["private-group"]}},
+                {"groups": {"arrayContainsAll": ["private-group"]}},
+                {"groups": {"arrayLikeAny": "private-*"}}
             ]
         }))
         .unwrap();
         tracing::subscriber::with_default(subscriber, || {
             assert!(policy.evaluate(
-                &json!({"email_verified": true, "email": "private-user@example.com"}),
+                &json!({
+                    "email_verified": true,
+                    "email": "private-user@example.com",
+                    "groups": ["private-group"]
+                }),
                 "test-app",
                 "test-google"
             ));
@@ -427,11 +644,15 @@ mod tests {
             "stringEquals",
             "stringIn",
             "booleanEquals",
+            "arrayContainsAny",
+            "arrayContainsAll",
+            "arrayLikeAny",
             "matched=true",
             "matched=false",
             "missing_claim",
             "value_mismatch",
             "branch=2",
+            "branch=5",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }

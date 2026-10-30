@@ -1499,6 +1499,15 @@ spec:
                           - allOf:
                             - not:
                                 required:
+                                - arrayContainsAll
+                            - not:
+                                required:
+                                - arrayContainsAny
+                            - not:
+                                required:
+                                - arrayLikeAny
+                            - not:
+                                required:
                                 - booleanEquals
                             - not:
                                 required:
@@ -1512,6 +1521,15 @@ spec:
                             - stringEquals
                         - allOf:
                           - allOf:
+                            - not:
+                                required:
+                                - arrayContainsAll
+                            - not:
+                                required:
+                                - arrayContainsAny
+                            - not:
+                                required:
+                                - arrayLikeAny
                             - not:
                                 required:
                                 - booleanEquals
@@ -1531,6 +1549,15 @@ spec:
                           - allOf:
                             - not:
                                 required:
+                                - arrayContainsAll
+                            - not:
+                                required:
+                                - arrayContainsAny
+                            - not:
+                                required:
+                                - arrayLikeAny
+                            - not:
+                                required:
                                 - booleanEquals
                             - not:
                                 required:
@@ -1546,6 +1573,15 @@ spec:
                           - allOf:
                             - not:
                                 required:
+                                - arrayContainsAll
+                            - not:
+                                required:
+                                - arrayContainsAny
+                            - not:
+                                required:
+                                - arrayLikeAny
+                            - not:
+                                required:
                                 - stringEquals
                             - not:
                                 required:
@@ -1557,8 +1593,96 @@ spec:
                               booleanEquals: {}
                             required:
                             - booleanEquals
+                        - allOf:
+                          - allOf:
+                            - not:
+                                required:
+                                - arrayContainsAll
+                            - not:
+                                required:
+                                - arrayLikeAny
+                            - not:
+                                required:
+                                - booleanEquals
+                            - not:
+                                required:
+                                - stringEquals
+                            - not:
+                                required:
+                                - stringIn
+                            - not:
+                                required:
+                                - stringLike
+                            properties:
+                              arrayContainsAny:
+                                items: {}
+                                minItems: 1
+                            required:
+                            - arrayContainsAny
+                        - allOf:
+                          - allOf:
+                            - not:
+                                required:
+                                - arrayContainsAny
+                            - not:
+                                required:
+                                - arrayLikeAny
+                            - not:
+                                required:
+                                - booleanEquals
+                            - not:
+                                required:
+                                - stringEquals
+                            - not:
+                                required:
+                                - stringIn
+                            - not:
+                                required:
+                                - stringLike
+                            properties:
+                              arrayContainsAll:
+                                items: {}
+                                minItems: 1
+                            required:
+                            - arrayContainsAll
+                        - allOf:
+                          - allOf:
+                            - not:
+                                required:
+                                - arrayContainsAll
+                            - not:
+                                required:
+                                - arrayContainsAny
+                            - not:
+                                required:
+                                - booleanEquals
+                            - not:
+                                required:
+                                - stringEquals
+                            - not:
+                                required:
+                                - stringIn
+                            - not:
+                                required:
+                                - stringLike
+                            properties:
+                              arrayLikeAny: {}
+                            required:
+                            - arrayLikeAny
                         description: Exactly one typed comparison of a top-level ID-token claim.
                         properties:
+                          arrayContainsAll:
+                            items:
+                              type: string
+                            minItems: 1
+                            type: array
+                          arrayContainsAny:
+                            items:
+                              type: string
+                            minItems: 1
+                            type: array
+                          arrayLikeAny:
+                            type: string
                           booleanEquals:
                             type: boolean
                           stringEquals:
@@ -1584,6 +1708,15 @@ spec:
                         - allOf:
                           - not:
                               required:
+                              - arrayContainsAll
+                          - not:
+                              required:
+                              - arrayContainsAny
+                          - not:
+                              required:
+                              - arrayLikeAny
+                          - not:
+                              required:
                               - booleanEquals
                           - not:
                               required:
@@ -1597,6 +1730,15 @@ spec:
                           - stringEquals
                       - allOf:
                         - allOf:
+                          - not:
+                              required:
+                              - arrayContainsAll
+                          - not:
+                              required:
+                              - arrayContainsAny
+                          - not:
+                              required:
+                              - arrayLikeAny
                           - not:
                               required:
                               - booleanEquals
@@ -1616,6 +1758,15 @@ spec:
                         - allOf:
                           - not:
                               required:
+                              - arrayContainsAll
+                          - not:
+                              required:
+                              - arrayContainsAny
+                          - not:
+                              required:
+                              - arrayLikeAny
+                          - not:
+                              required:
                               - booleanEquals
                           - not:
                               required:
@@ -1631,6 +1782,15 @@ spec:
                         - allOf:
                           - not:
                               required:
+                              - arrayContainsAll
+                          - not:
+                              required:
+                              - arrayContainsAny
+                          - not:
+                              required:
+                              - arrayLikeAny
+                          - not:
+                              required:
                               - stringEquals
                           - not:
                               required:
@@ -1642,8 +1802,96 @@ spec:
                             booleanEquals: {}
                           required:
                           - booleanEquals
+                      - allOf:
+                        - allOf:
+                          - not:
+                              required:
+                              - arrayContainsAll
+                          - not:
+                              required:
+                              - arrayLikeAny
+                          - not:
+                              required:
+                              - booleanEquals
+                          - not:
+                              required:
+                              - stringEquals
+                          - not:
+                              required:
+                              - stringIn
+                          - not:
+                              required:
+                              - stringLike
+                          properties:
+                            arrayContainsAny:
+                              items: {}
+                              minItems: 1
+                          required:
+                          - arrayContainsAny
+                      - allOf:
+                        - allOf:
+                          - not:
+                              required:
+                              - arrayContainsAny
+                          - not:
+                              required:
+                              - arrayLikeAny
+                          - not:
+                              required:
+                              - booleanEquals
+                          - not:
+                              required:
+                              - stringEquals
+                          - not:
+                              required:
+                              - stringIn
+                          - not:
+                              required:
+                              - stringLike
+                          properties:
+                            arrayContainsAll:
+                              items: {}
+                              minItems: 1
+                          required:
+                          - arrayContainsAll
+                      - allOf:
+                        - allOf:
+                          - not:
+                              required:
+                              - arrayContainsAll
+                          - not:
+                              required:
+                              - arrayContainsAny
+                          - not:
+                              required:
+                              - booleanEquals
+                          - not:
+                              required:
+                              - stringEquals
+                          - not:
+                              required:
+                              - stringIn
+                          - not:
+                              required:
+                              - stringLike
+                          properties:
+                            arrayLikeAny: {}
+                          required:
+                          - arrayLikeAny
                       description: Exactly one typed comparison of a top-level ID-token claim.
                       properties:
+                        arrayContainsAll:
+                          items:
+                            type: string
+                          minItems: 1
+                          type: array
+                        arrayContainsAny:
+                          items:
+                            type: string
+                          minItems: 1
+                          type: array
+                        arrayLikeAny:
+                          type: string
                         booleanEquals:
                           type: boolean
                         stringEquals:

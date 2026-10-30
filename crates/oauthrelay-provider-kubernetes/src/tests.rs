@@ -92,6 +92,13 @@ fn crds_are_deterministic_namespaced_and_structural() {
             assert_eq!(policy["properties"]["anyOf"]["minItems"], 1);
             assert_eq!(policy["properties"]["anyOf"]["items"]["minProperties"], 1);
             assert_eq!(policy["properties"]["required"]["minProperties"], 1);
+            let matcher = &policy["properties"]["required"]["additionalProperties"]["properties"];
+            for operator in ["arrayContainsAny", "arrayContainsAll"] {
+                assert_eq!(matcher[operator]["type"], "array", "{operator}");
+                assert_eq!(matcher[operator]["minItems"], 1, "{operator}");
+                assert_eq!(matcher[operator]["items"]["type"], "string", "{operator}");
+            }
+            assert_eq!(matcher["arrayLikeAny"]["type"], "string");
         }
     }
 }

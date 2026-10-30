@@ -178,6 +178,9 @@ Each claim has exactly one operator:
 | `stringIn` | non-empty string list | Exact, case-sensitive membership. |
 | `stringLike` | string | Full-string, case-sensitive glob matching. |
 | `booleanEquals` | boolean | Exact JSON boolean equality; `true` does not match the string `"true"`. |
+| `arrayContainsAny` | non-empty string list | The claim is an array of strings and at least one listed value is an element (exact, case-sensitive). |
+| `arrayContainsAll` | non-empty string list | The claim is an array of strings and every listed value is an element (exact, case-sensitive). |
+| `arrayLikeAny` | string | The claim is an array of strings and at least one element matches the `stringLike` glob. |
 
 For `stringLike`, `*` matches zero or more Unicode characters and `?` matches exactly one. All
 other characters, including brackets and backslashes, are literals; there is no regex or escape
@@ -185,6 +188,26 @@ syntax, path-separator handling, or implicit email normalization. For example,
 `stringLike: "guest-?@example.net"` matches `guest-a@example.net`, but not `guest-ab@example.net`
 or `guest-a@example.net.evil`. Use Google's signed `hd` claim when checking Workspace membership;
 an email-address suffix alone does not establish it.
+
+The array operators are for claims such as `groups`. A claim that is absent, is not an array, or is
+an array with any non-string element fails the matcher (`wrong_type`), and the string operators
+likewise reject an array claim. An empty array never satisfies an array operator, including
+`arrayContainsAll`. `arrayLikeAny` uses the `stringLike` glob semantics for each element. For
+example, to admit verified users in the `admins` or `ops` group:
+
+```yaml
+idTokenPolicy:
+  required:
+    email_verified:
+      booleanEquals: true
+    groups:
+      arrayContainsAny:
+        - admins
+        - ops
+```
+
+Only top-level claims are addressed. The IdP must be configured to emit the claim in the ID token
+(for example, a `groups` claim or scope), and it must be an array of strings.
 
 Absent or null optional policy fields are omitted. Empty policies or sections, empty branches or
 membership lists, unknown operators, and multiple operators on one claim reject the candidate configuration. A denied

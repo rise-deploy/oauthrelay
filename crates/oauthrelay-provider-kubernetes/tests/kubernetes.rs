@@ -201,7 +201,10 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         "anyOf": [
             {"hd": {"stringEquals": "example.com"}},
             {"email": {"stringIn": ["guest@gmail.com"]}},
-            {"email": {"stringLike": "guest-?@example.net"}}
+            {"email": {"stringLike": "guest-?@example.net"}},
+            {"groups": {"arrayContainsAny": ["admins", "ops"]}},
+            {"groups": {"arrayContainsAll": ["eng", "oncall"]}},
+            {"groups": {"arrayLikeAny": "platform-*"}}
         ]
     });
     let mut expected = relay("policy", json!({"type":"Public"}));
@@ -221,6 +224,10 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         json!({"anyOf": []}),
         json!({"anyOf": [{}]}),
         json!({"required": {"email": {"stringIn": []}}}),
+        json!({"required": {"groups": {"arrayContainsAny": []}}}),
+        json!({"required": {"groups": {"arrayContainsAll": []}}}),
+        json!({"required": {"groups": {"arrayContainsAny": ["x"], "arrayLikeAny": "*"}}}),
+        json!({"required": {"groups": {"arrayLikeAny": ["x"]}}}),
         json!({"required": {"email": {"stringEquals": "x", "stringLike": "*"}}}),
         json!({"required": {"email_verified": {"booleanEquals": "true"}}}),
     ] {
