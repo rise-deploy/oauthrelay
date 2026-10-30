@@ -97,8 +97,9 @@ data:
       - id: oauthrelay-device
         name: oauthrelay device test
         public: true
+        # Dex derives the device flow's redirect from the issuer path: {issuer path}/device/callback.
         redirectURIs:
-          - /device/callback
+          - /dex/device/callback
 
     connectors:
       - type: mockCallback
