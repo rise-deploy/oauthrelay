@@ -1,6 +1,6 @@
 use crate::{
-    ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher, Relay,
-    ResourceKey, SecretString, Upstream,
+    ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher,
+    RefreshTokenMode, RefreshTokens, Relay, ResourceKey, SecretString, Upstream,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -141,11 +141,42 @@ pub struct RelayResourceSpec {
     /// Typed admission policy applied to the verified upstream ID token, in addition to requiredIdTokenClaims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token_policy: Option<IdTokenPolicy>,
+    /// How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.
+    #[serde(default, skip_serializing_if = "RefreshTokensSpec::is_default")]
+    pub refresh_tokens: RefreshTokensSpec,
     /// Authentication required at the relay token endpoint.
     pub client_authentication: ClientAuthentication,
     /// Explicit application redirect matchers.
     #[schemars(length(min = 1))]
     pub redirect_policy: Vec<RedirectPolicyEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Refresh-token handling for token responses.
+pub struct RefreshTokensSpec {
+    /// `passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque
+    /// handle in its place, so a refresh token that leaves the relying party cannot be used
+    /// at the upstream directly.
+    #[serde(default)]
+    pub mode: RefreshTokenModeSpec,
+}
+
+impl RefreshTokensSpec {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+/// How the relay presents upstream refresh tokens downstream.
+pub enum RefreshTokenModeSpec {
+    /// Return the upstream refresh token unchanged.
+    #[default]
+    Passthrough,
+    /// Replace the upstream refresh token with a handle sealed to this relay.
+    Sealed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -495,6 +526,12 @@ pub async fn compile_resources(
             allowed_scopes: resource.spec.scopes.allowed,
             required_id_token_claims: resource.spec.required_id_token_claims,
             id_token_policy: resource.spec.id_token_policy,
+            refresh_tokens: RefreshTokens {
+                mode: match resource.spec.refresh_tokens.mode {
+                    RefreshTokenModeSpec::Passthrough => RefreshTokenMode::Passthrough,
+                    RefreshTokenModeSpec::Sealed => RefreshTokenMode::Sealed,
+                },
+            },
             redirect_policy,
         };
         relay
@@ -597,6 +634,7 @@ mod tests {
                     scopes: ScopePolicy::default(),
                     required_id_token_claims: HashMap::new(),
                     id_token_policy: None,
+                    refresh_tokens: RefreshTokensSpec::default(),
                     client_authentication: ClientAuthentication::UpstreamClient,
                     redirect_policy: vec![RedirectPolicyEntry::Uri(UriRedirectPolicy {
                         uri: "https://app.example/callback".into(),
@@ -662,6 +700,41 @@ mod tests {
         };
         relay.spec.id_token_policy = Some(serde_json::from_value(serde_json::json!({})).unwrap());
         assert!(compile_resources(resources, &secrets).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn compiles_refresh_token_mode_and_defaults_to_passthrough() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let snapshot = compile_resources(resources.clone(), &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.relays.values().next().unwrap().refresh_tokens.mode,
+            RefreshTokenMode::Passthrough
+        );
+        let mut value = serde_json::to_value(&resources[1]).unwrap();
+        assert!(value["spec"].get("refreshTokens").is_none());
+        value["spec"]["refreshTokens"] = serde_json::json!({"mode": "sealed"});
+        let sealed: ResourceDocument = serde_json::from_value(value.clone()).unwrap();
+        let snapshot = compile_resources(vec![resources[0].clone(), sealed], &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.relays.values().next().unwrap().refresh_tokens.mode,
+            RefreshTokenMode::Sealed
+        );
+        for invalid in [
+            serde_json::json!({"mode": "rotating"}),
+            serde_json::json!({"mode": "sealed", "gracePeriod": "1m"}),
+        ] {
+            value["spec"]["refreshTokens"] = invalid;
+            assert!(serde_json::from_value::<ResourceDocument>(value.clone()).is_err());
+        }
     }
 
     #[test]

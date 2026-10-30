@@ -1,6 +1,8 @@
 use crate::{
-    model::valid_scope_token, ClientAuth, ClientJwks, Relay, ReplayCache, ResourceKey,
-    ResourceResolver, Sealer, Upstream,
+    model::valid_scope_token,
+    refresh_handle::{open_handle, seal_token_response},
+    ClientAuth, ClientJwks, RefreshTokenMode, Relay, ReplayCache, ResourceKey, ResourceResolver,
+    Sealer, Upstream,
 };
 use axum::{
     body::Body,
@@ -801,7 +803,22 @@ async fn exchange_sealed_code(
     if validation == Err(IdTokenValidationError::Rejected) {
         return required_claims_error();
     }
-    stored_response(envelope.upstream_response)
+    let mut stored = envelope.upstream_response;
+    if relay.refresh_tokens.mode == RefreshTokenMode::Sealed {
+        match seal_token_response(
+            state.cfg.sealer.as_ref(),
+            &relay.key,
+            stored.status,
+            stored.content_type.as_deref(),
+            &stored.body,
+            unix_now(),
+        ) {
+            Ok(Some(body)) => stored.body = body,
+            Ok(None) => {}
+            Err(()) => return sealing_failed(),
+        }
+    }
+    stored_response(stored)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -968,13 +985,28 @@ async fn refresh(
     upstream: &Upstream,
     form: &TokenRequest,
 ) -> Response {
-    if form.refresh_token.is_none() {
+    let Some(presented) = &form.refresh_token else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "refresh_token is required",
         );
-    }
+    };
+    let sealed = relay.refresh_tokens.mode == RefreshTokenMode::Sealed;
+    let upstream_token = if sealed {
+        match open_handle(state.cfg.sealer.as_ref(), &relay.key, presented) {
+            Ok(opened) => Some(opened.upstream_token),
+            Err(()) => {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "invalid refresh token",
+                )
+            }
+        }
+    } else {
+        None
+    };
     if form
         .scope
         .as_deref()
@@ -999,7 +1031,10 @@ async fn refresh(
                 "client_id" | "client_secret" | "client_assertion_type" | "client_assertion"
             )
         })
-        .cloned()
+        .map(|(name, value)| match (&upstream_token, name.as_str()) {
+            (Some(token), "refresh_token") => (name.clone(), token.clone()),
+            _ => (name.clone(), value.clone()),
+        })
         .collect();
     upstream_form.push(("client_id".into(), upstream.client_id.clone()));
     upstream_form.push((
@@ -1014,6 +1049,24 @@ async fn refresh(
         .send()
         .await
     {
+        Ok(response) if sealed => {
+            let Some(mut stored) = read_upstream_response(response).await else {
+                return StatusCode::BAD_GATEWAY.into_response();
+            };
+            match seal_token_response(
+                state.cfg.sealer.as_ref(),
+                &relay.key,
+                stored.status,
+                stored.content_type.as_deref(),
+                &stored.body,
+                unix_now(),
+            ) {
+                Ok(Some(body)) => stored.body = body,
+                Ok(None) => {}
+                Err(()) => return sealing_failed(),
+            }
+            stored_response(stored)
+        }
         Ok(response) => proxy_response(response).await,
         Err(_) => oauth_error(
             StatusCode::BAD_GATEWAY,
@@ -1434,6 +1487,21 @@ async fn cached_json_with_client(
     Ok(value)
 }
 
+async fn read_upstream_response(response: reqwest::Response) -> Option<StoredResponse> {
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.bytes().await.ok()?.to_vec();
+    Some(StoredResponse {
+        status,
+        content_type,
+        body,
+    })
+}
+
 async fn proxy_response(response: reqwest::Response) -> Response {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
@@ -1513,6 +1581,14 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
         Json(json!({ "error": error, "error_description": description })),
     )
         .into_response()
+}
+
+fn sealing_failed() -> Response {
+    oauth_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "token response could not be sealed",
+    )
 }
 
 fn required_claims_error() -> Response {

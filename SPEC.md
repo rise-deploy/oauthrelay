@@ -48,13 +48,22 @@ pub struct Relay {
     pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
     pub allowed_scopes: Option<Vec<String>>,
+    pub refresh_tokens: RefreshTokens,
     pub redirect_policy: Vec<RedirectMatcher>,
+}
+
+pub struct RefreshTokens {
+    pub mode: RefreshTokenMode, // Passthrough (default) | Sealed
 }
 ```
 
 `Upstream` owns the external authorization-server connection, OAuth client credentials, and
-provider callback. `Relay` owns transparent-relay scope policy, downstream authentication, and
-redirect policy.
+provider callback. `Relay` owns transparent-relay scope policy, downstream authentication,
+refresh-token handling, and redirect policy.
+
+`RefreshTokens` is a struct so that further refresh-token policy can be added per relay without
+changing the resource shape. `Passthrough` returns upstream refresh tokens unchanged. `Sealed`
+returns sealed handles instead (see protocol invariants).
 
 `ClientAuth` supports:
 
@@ -79,8 +88,8 @@ For public base URL `B`, relay key `R`, and upstream key `U`:
 | --- | --- |
 | `GET {B}/relay/{R}/authorize` | Validates redirect and downstream PKCE, applies relay scope policy, creates independent upstream state and PKCE, and redirects to the referenced upstream. |
 | `GET {B}/upstream/{U}/callback` | Unseals upstream-bound state, resolves the originating relay, exchanges the upstream code, and returns to the relay's validated application redirect. |
-| `POST {B}/relay/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged. |
-| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. |
+| `POST {B}/relay/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged (a `sealed` relay replaces only `refresh_token`). |
+| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. A `sealed` relay first opens the presented handle. |
 | `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
 | `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
 | `GET /healthz` | Standalone runtime liveness. |
@@ -105,7 +114,24 @@ unvalidated redirect URI is never reflected into a response.
 - Upstream-owned authorization parameters are replaced rather than forwarded.
 - Other authorization and grant extensions are preserved.
 - OIDC request objects are rejected because their routing fields conflict with proxy ownership.
-- Upstream token response status, content type, and bytes are preserved.
+- Upstream token response status, content type, and bytes are preserved, except for the
+  `refresh_token` member of a `sealed` relay (below).
+- A `sealed` relay never returns an upstream refresh token. In every successful (2xx) JSON token
+  response, from the authorization-code grant and the refresh grant alike, the string
+  `refresh_token` member is replaced by a handle: `rrt1.` followed by an XChaCha20-Poly1305
+  envelope of the upstream token and an issued-at time, sealed with associated data
+  `refresh:{relay key}`. The prefix versions the format; the associated data binds the handle to
+  its relay and purpose, so handles are not interchangeable between relays or with flow and code
+  envelopes. Member order, all other members, status, and content type are preserved; only
+  whitespace between members is normalized. Non-2xx, non-JSON, and responses without a non-empty
+  string `refresh_token` pass through unchanged. A response whose handle cannot be sealed is a
+  `server_error`; the upstream token is never returned instead.
+- A `sealed` relay accepts only its own handles at the refresh grant: it opens the handle and
+  forwards the upstream token. A raw upstream token, a handle of another relay or installation, or
+  a tampered handle is `invalid_grant` and is not forwarded. When the upstream refresh response
+  omits `refresh_token`, so does the relay's, and the client keeps its handle. Handles follow
+  seal-key rotation: they open under the current or previous key. Switching a relay to `sealed`
+  invalidates the refresh tokens it issued earlier; clients must re-authenticate.
 - Discovery and JWKS responses are cached for bounded TTLs.
 
 The standalone binary supplies an in-memory replay cache. An embedding without a replay cache
@@ -148,6 +174,8 @@ spec:
   redirectPolicy:
     - uri: https://app.example.com/oauth/callback
 ```
+
+`spec.refreshTokens.mode` is `passthrough` (default) or `sealed`.
 
 Unknown fields, kinds, API versions, duplicate identities, invalid URLs, invalid origins, invalid
 scope tokens, and dangling references reject the candidate snapshot.
