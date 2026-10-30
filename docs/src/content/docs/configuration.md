@@ -92,6 +92,7 @@ upstream-owned by the relay contract.
 | `spec.scopes.allowed` | no | unrestricted | Complete allow-list for configured and requested scopes. Every default scope must be allowed. |
 | `spec.requiredIdTokenClaims` | no | `{}` | Exact string values required in the verified upstream ID token. |
 | `spec.idTokenPolicy` | no | omitted | Typed claim rules for initial sign-in; all rules also compose with `requiredIdTokenClaims`. |
+| `spec.refreshTokens.mode` | no | `passthrough` | `passthrough` returns upstream refresh tokens unchanged; `sealed` returns [sealed handles](#refresh-tokens) instead. |
 | `spec.clientAuthentication` | yes | — | Authentication policy for requests to the relay token endpoint. |
 | `spec.redirectPolicy` | yes | — | Non-empty list of explicit application redirect matchers. |
 
@@ -199,6 +200,72 @@ the relay, upstream, section, claim name, operator, and branch index where appli
 not include actual claim values, configured comparison values or patterns, or tokens. Invalid
 tokens produce a final rejection result without evaluating their untrusted claims. Exchanges
 without an admission policy or without a successful upstream response log a `skipped` outcome.
+
+## Refresh tokens
+
+By default a relay is transparent: the upstream refresh token reaches the relying party and comes
+back at the refresh grant. For a `Public` relay the relying party is typically a browser, so a
+refresh token that leaks from it can be refreshed through the relay indefinitely.
+
+In every mode, including `passthrough`, a refresh token that starts with `rrt` followed by digits
+and a dot (such as `rrt1.`) is a relay handle, never an upstream token. The relay answers
+`invalid_grant` and does not forward it to the provider.
+
+Set `refreshTokens.mode: sealed` to keep upstream refresh tokens inside the relay:
+
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  oauthClient:
+    clientId: 123456789.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: spa
+spec:
+  upstreamRef:
+    name: google
+  refreshTokens:
+    mode: sealed
+  clientAuthentication:
+    type: Public
+  redirectPolicy:
+    - origin: https://app.example.com
+```
+
+In `sealed` mode every successful JSON token response, from the authorization-code grant and from
+the refresh grant, has its `refresh_token` replaced by an opaque handle that starts with `rrt1.`.
+The handle contains the upstream token encrypted with `OAUTHRELAY_SEAL_KEY`, bound to the relay
+name, so only this relay can open it. At the refresh grant the relay opens the handle and sends
+the upstream token to the provider. Status, content type, member order, and every other member of
+the response are preserved. Non-2xx responses, and successful responses that carry no
+`refresh_token`, are returned unchanged. When a refresh response omits `refresh_token`, the
+relying party keeps using its current handle.
+
+- A refresh token that is not a handle of this relay, such as a raw upstream token or a handle
+  issued by another relay, is rejected with `invalid_grant`. Switching an existing relay to
+  `sealed` therefore requires its users to sign in again.
+- Handles open under `OAUTHRELAY_SEAL_KEY` and `OAUTHRELAY_SEAL_KEY_PREVIOUS`, so seal-key rotation
+  keeps them valid until the previous key is removed. Replacing the key without keeping the old
+  one as the previous key invalidates every handle.
+- A handle carries no expiry and is not single-use: it stays valid for as long as the upstream
+  token does. Sealing prevents a leaked handle from being used at the provider directly; it does
+  not make the handle unusable at the relay. Providers that rotate refresh tokens return a new
+  upstream token, which the relay seals into a new handle.
+- The relay asks the provider for JSON (`Accept: application/json`) and reads any successful
+  response body as a JSON object, whatever its content type. A provider that still answers with a
+  form-encoded or other non-JSON body that contains a `refresh_token` cannot be rewritten, so the
+  relay fails closed with HTTP 502 `server_error` instead of returning the raw token. Provider
+  errors (non-2xx) pass through unchanged; an unreachable provider is a 502 `server_error`.
 
 ## Client authentication
 

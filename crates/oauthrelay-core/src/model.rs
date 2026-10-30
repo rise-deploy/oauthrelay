@@ -124,7 +124,26 @@ pub struct Relay {
     pub required_id_token_claims: HashMap<String, String>,
     #[serde(default)]
     pub id_token_policy: Option<crate::IdTokenPolicy>,
+    #[serde(default)]
+    pub refresh_tokens: RefreshTokens,
     pub redirect_policy: Vec<RedirectMatcher>,
+}
+
+/// How a relay hands upstream refresh tokens to downstream clients.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct RefreshTokens {
+    #[serde(default)]
+    pub mode: RefreshTokenMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshTokenMode {
+    /// The upstream refresh token is returned to the client unchanged.
+    #[default]
+    Passthrough,
+    /// Token responses carry a sealed handle that only this relay can open.
+    Sealed,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -499,6 +518,7 @@ mod tests {
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
             id_token_policy: None,
+            refresh_tokens: RefreshTokens::default(),
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb?channel=stable&next=%2Fhome")
                     .unwrap(),
@@ -577,6 +597,7 @@ mod tests {
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
             id_token_policy: None,
+            refresh_tokens: RefreshTokens::default(),
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb").unwrap(),
                 RedirectMatcher::origin("https://preview.example").unwrap(),

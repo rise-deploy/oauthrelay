@@ -23,6 +23,7 @@ mod config;
 mod id_token_policy;
 mod jwks;
 mod model;
+mod refresh_handle;
 mod resolver;
 mod router;
 mod seal;

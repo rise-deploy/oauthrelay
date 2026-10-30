@@ -1,6 +1,8 @@
 use crate::{
-    model::valid_scope_token, ClientAuth, ClientJwks, Relay, ReplayCache, ResourceKey,
-    ResourceResolver, Sealer, Upstream,
+    model::valid_scope_token,
+    refresh_handle::{has_handle_prefix, open_handle, seal_token_response, SubstitutionError},
+    ClientAuth, ClientJwks, RefreshTokenMode, Relay, ReplayCache, ResourceKey, ResourceResolver,
+    Sealer, Upstream,
 };
 use axum::{
     body::Body,
@@ -576,6 +578,7 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
         .cfg
         .http
         .post(endpoints.token_endpoint)
+        .header(header::ACCEPT, "application/json")
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -801,7 +804,21 @@ async fn exchange_sealed_code(
     if validation == Err(IdTokenValidationError::Rejected) {
         return required_claims_error();
     }
-    stored_response(envelope.upstream_response)
+    let mut stored = envelope.upstream_response;
+    if relay.refresh_tokens.mode == RefreshTokenMode::Sealed {
+        match seal_token_response(
+            state.cfg.sealer.as_ref(),
+            &relay.key,
+            stored.status,
+            &stored.body,
+            unix_now(),
+        ) {
+            Ok(Some(body)) => stored.body = body,
+            Ok(None) => {}
+            Err(error) => return substitution_failed(relay, error),
+        }
+    }
+    stored_response(stored)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -968,13 +985,37 @@ async fn refresh(
     upstream: &Upstream,
     form: &TokenRequest,
 ) -> Response {
-    if form.refresh_token.is_none() {
+    let Some(presented) = &form.refresh_token else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "refresh_token is required",
         );
+    };
+    let sealed = relay.refresh_tokens.mode == RefreshTokenMode::Sealed;
+    // A handle is never an upstream token, so it is never forwarded, in any mode. Sealed mode
+    // opens its own handles below; everything else with a handle prefix ends here.
+    if !sealed && has_handle_prefix(presented) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "invalid refresh token",
+        );
     }
+    let upstream_token = if sealed {
+        match open_handle(state.cfg.sealer.as_ref(), &relay.key, presented) {
+            Ok(opened) => Some(opened.upstream_token),
+            Err(()) => {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "invalid refresh token",
+                )
+            }
+        }
+    } else {
+        None
+    };
     if form
         .scope
         .as_deref()
@@ -999,7 +1040,10 @@ async fn refresh(
                 "client_id" | "client_secret" | "client_assertion_type" | "client_assertion"
             )
         })
-        .cloned()
+        .map(|(name, value)| match (&upstream_token, name.as_str()) {
+            (Some(token), "refresh_token") => (name.clone(), token.clone()),
+            _ => (name.clone(), value.clone()),
+        })
         .collect();
     upstream_form.push(("client_id".into(), upstream.client_id.clone()));
     upstream_form.push((
@@ -1010,16 +1054,30 @@ async fn refresh(
         .cfg
         .http
         .post(endpoints.token_endpoint)
+        .header(header::ACCEPT, "application/json")
         .form(&upstream_form)
         .send()
         .await
     {
+        Ok(response) if sealed => {
+            let Some(mut stored) = read_upstream_response(response).await else {
+                return upstream_request_failed();
+            };
+            match seal_token_response(
+                state.cfg.sealer.as_ref(),
+                &relay.key,
+                stored.status,
+                &stored.body,
+                unix_now(),
+            ) {
+                Ok(Some(body)) => stored.body = body,
+                Ok(None) => {}
+                Err(error) => return substitution_failed(relay, error),
+            }
+            stored_response(stored)
+        }
         Ok(response) => proxy_response(response).await,
-        Err(_) => oauth_error(
-            StatusCode::BAD_GATEWAY,
-            "server_error",
-            "upstream request failed",
-        ),
+        Err(_) => upstream_request_failed(),
     }
 }
 
@@ -1434,6 +1492,21 @@ async fn cached_json_with_client(
     Ok(value)
 }
 
+async fn read_upstream_response(response: reqwest::Response) -> Option<StoredResponse> {
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.bytes().await.ok()?.to_vec();
+    Some(StoredResponse {
+        status,
+        content_type,
+        body,
+    })
+}
+
 async fn proxy_response(response: reqwest::Response) -> Response {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
@@ -1513,6 +1586,37 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
         Json(json!({ "error": error, "error_description": description })),
     )
         .into_response()
+}
+
+fn upstream_request_failed() -> Response {
+    oauth_error(
+        StatusCode::BAD_GATEWAY,
+        "server_error",
+        "upstream request failed",
+    )
+}
+
+/// The upstream token response cannot be returned because it would expose the upstream refresh
+/// token: sealing failed, or the body is not a JSON object yet carries one.
+fn substitution_failed(relay: &Relay, error: SubstitutionError) -> Response {
+    match error {
+        SubstitutionError::Sealing => oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "token response could not be sealed",
+        ),
+        SubstitutionError::UnrecognizedBody => {
+            tracing::error!(
+                relay = %relay.key,
+                "upstream token response is not a JSON object but appears to carry a refresh token; refusing to return it"
+            );
+            oauth_error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                "upstream token response could not be processed",
+            )
+        }
+    }
 }
 
 fn required_claims_error() -> Response {

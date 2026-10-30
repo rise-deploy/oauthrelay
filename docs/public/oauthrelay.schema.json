@@ -722,6 +722,33 @@
         "valueFrom"
       ]
     },
+    "RefreshTokenModeSpec": {
+      "description": "How the relay presents upstream refresh tokens downstream.",
+      "oneOf": [
+        {
+          "description": "Return the upstream refresh token unchanged.",
+          "type": "string",
+          "const": "passthrough"
+        },
+        {
+          "description": "Replace the upstream refresh token with a handle sealed to this relay.",
+          "type": "string",
+          "const": "sealed"
+        }
+      ]
+    },
+    "RefreshTokensSpec": {
+      "description": "Refresh-token handling for token responses.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "`passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque\nhandle in its place, so a refresh token that leaves the relying party cannot be used\nat the upstream directly.",
+          "$ref": "#/$defs/RefreshTokenModeSpec",
+          "default": "passthrough"
+        }
+      },
+      "additionalProperties": false
+    },
     "RelayResourceSpec": {
       "description": "Transparent-relay policy and upstream reference.",
       "type": "object",
@@ -748,6 +775,10 @@
             "$ref": "#/$defs/RedirectPolicyEntry"
           },
           "minItems": 1
+        },
+        "refreshTokens": {
+          "description": "How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.",
+          "$ref": "#/$defs/RefreshTokensSpec"
         },
         "requiredIdTokenClaims": {
           "description": "Exact string values required in the verified upstream ID token.",
