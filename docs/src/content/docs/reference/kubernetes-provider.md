@@ -30,8 +30,11 @@ Generate the definitions from the same binary build that will serve the resource
 oauthrelay crds > oauthrelay.crds.yaml
 kubectl apply --server-side -f oauthrelay.crds.yaml
 kubectl wait --for=condition=Established --timeout=60s \
-  crd/upstreams.oauthrelay.dev crd/relays.oauthrelay.dev
+  crd/upstreams.oauthrelay.dev crd/relays.oauthrelay.dev crd/transientrecords.oauthrelay.dev
 ```
+
+The bundle also installs `transientrecords.oauthrelay.dev`, which only the
+[Kubernetes transient store](/oauthrelay/reference/transient-store/#kubernetes) uses.
 
 The command requires no credentials or runtime environment variables. The
 [generated CRD bundle](https://github.com/rise-deploy/oauthrelay/blob/develop/deploy/oauthrelay.crds.yaml)
@@ -128,3 +131,8 @@ Secrets within the namespace. Kubernetes authorizes Secret metadata watches usin
 resource permissions; these permissions also allow reading Secret contents in that namespace.
 A namespace override requires a RoleBinding in the target namespace referencing the pod's
 ServiceAccount.
+
+The Role also grants `get`, `list`, `create`, `update`, and `delete` on `transientrecords` for
+`OAUTHRELAY_STORE=kubernetes`. The provider does not need it, and `OAUTHRELAY_PROVIDER_KUBERNETES`
+never enables the store: choose the backend explicitly, see
+[Transient store](/oauthrelay/reference/transient-store/#kubernetes). Drop the rule if you do.

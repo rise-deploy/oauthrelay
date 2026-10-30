@@ -112,7 +112,11 @@ async fn main() -> anyhow::Result<()> {
     if env::args().nth(1).as_deref() == Some("crds") {
         #[cfg(feature = "kubernetes")]
         {
-            print!("{}", oauthrelay_provider_kubernetes::crds_yaml()?);
+            print!(
+                "{}---\n{}",
+                oauthrelay_provider_kubernetes::crds_yaml()?,
+                oauthrelay_store_kubernetes::crds_yaml()?
+            );
             return Ok(());
         }
         #[cfg(not(feature = "kubernetes"))]
@@ -205,21 +209,63 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Debug, Eq, PartialEq)]
 enum StoreConfig {
     Memory,
-    DynamoDb { table: String },
+    DynamoDb {
+        table: String,
+    },
+    Kubernetes {
+        /// The `plural.group` resource name, validated where the store crate is linked; `None`
+        /// is the store's own `TransientRecord`.
+        resource: Option<String>,
+        /// `None` follows the provider namespace, then the pod or kubeconfig namespace, except
+        /// for Dex's resource, which has no fallback and needs Dex's namespace named.
+        namespace: Option<String>,
+        /// `None` disables the sweeper.
+        sweep: Option<Duration>,
+    },
 }
 
-fn parse_store_config(kind: Option<&str>, table: Option<&str>) -> anyhow::Result<StoreConfig> {
-    match kind {
-        None | Some("memory") => {
-            if table.is_some() {
-                return Err(anyhow!(
-                    "OAUTHRELAY_STORE_DYNAMODB_TABLE requires OAUTHRELAY_STORE=dynamodb"
-                ));
-            }
-            Ok(StoreConfig::Memory)
+const DEFAULT_KUBERNETES_SWEEP: Duration = Duration::from_secs(60);
+
+/// The raw values of the `OAUTHRELAY_STORE*` environment variables.
+#[derive(Default)]
+struct StoreEnv<'a> {
+    kind: Option<&'a str>,
+    dynamodb_table: Option<&'a str>,
+    kubernetes_resource: Option<&'a str>,
+    kubernetes_namespace: Option<&'a str>,
+    kubernetes_sweep: Option<&'a str>,
+}
+
+fn parse_store_config(env: StoreEnv<'_>) -> anyhow::Result<StoreConfig> {
+    // Settings of a backend that is not selected are rejected rather than silently ignored.
+    if env.kind != Some("dynamodb") && env.dynamodb_table.is_some() {
+        return Err(anyhow!(
+            "OAUTHRELAY_STORE_DYNAMODB_TABLE requires OAUTHRELAY_STORE=dynamodb"
+        ));
+    }
+    if env.kind != Some("kubernetes") {
+        let kubernetes_settings = [
+            (
+                "OAUTHRELAY_STORE_KUBERNETES_RESOURCE",
+                env.kubernetes_resource,
+            ),
+            (
+                "OAUTHRELAY_STORE_KUBERNETES_NAMESPACE",
+                env.kubernetes_namespace,
+            ),
+            ("OAUTHRELAY_STORE_KUBERNETES_SWEEP", env.kubernetes_sweep),
+        ];
+        if let Some((name, _)) = kubernetes_settings
+            .iter()
+            .find(|(_, value)| value.is_some())
+        {
+            return Err(anyhow!("{name} requires OAUTHRELAY_STORE=kubernetes"));
         }
+    }
+    match env.kind {
+        None | Some("memory") => Ok(StoreConfig::Memory),
         Some("dynamodb") => {
-            let table = table.ok_or_else(|| {
+            let table = env.dynamodb_table.ok_or_else(|| {
                 anyhow!("OAUTHRELAY_STORE=dynamodb requires OAUTHRELAY_STORE_DYNAMODB_TABLE")
             })?;
             let valid = (3..=255).contains(&table.len())
@@ -235,16 +281,44 @@ fn parse_store_config(kind: Option<&str>, table: Option<&str>) -> anyhow::Result
                 table: table.to_owned(),
             })
         }
+        Some("kubernetes") => {
+            let sweep = match env.kubernetes_sweep {
+                None => Some(DEFAULT_KUBERNETES_SWEEP),
+                Some("off") => None,
+                Some(value) => Some(parse_duration("OAUTHRELAY_STORE_KUBERNETES_SWEEP", value)?),
+            };
+            Ok(StoreConfig::Kubernetes {
+                resource: env.kubernetes_resource.map(str::to_owned),
+                namespace: env.kubernetes_namespace.map(str::to_owned),
+                sweep,
+            })
+        }
         Some(other) => Err(anyhow!(
-            "OAUTHRELAY_STORE must be memory or dynamodb, got {other:?}"
+            "OAUTHRELAY_STORE must be memory, dynamodb or kubernetes, got {other:?}"
         )),
     }
 }
 
 async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
-    let kind = env::var("OAUTHRELAY_STORE").ok();
-    let table = env::var("OAUTHRELAY_STORE_DYNAMODB_TABLE").ok();
-    match parse_store_config(kind.as_deref(), table.as_deref())? {
+    let read = |name: &str| env::var(name).ok();
+    let (kind, table) = (
+        read("OAUTHRELAY_STORE"),
+        read("OAUTHRELAY_STORE_DYNAMODB_TABLE"),
+    );
+    let (resource, namespace, sweep) = (
+        read("OAUTHRELAY_STORE_KUBERNETES_RESOURCE"),
+        read("OAUTHRELAY_STORE_KUBERNETES_NAMESPACE"),
+        read("OAUTHRELAY_STORE_KUBERNETES_SWEEP"),
+    );
+    let config = parse_store_config(StoreEnv {
+        kind: kind.as_deref(),
+        dynamodb_table: table.as_deref(),
+        kubernetes_resource: resource.as_deref(),
+        kubernetes_namespace: namespace.as_deref(),
+        kubernetes_sweep: sweep.as_deref(),
+    })?;
+    reject_kubernetes_on_lambda(&config, is_lambda_runtime())?;
+    match config {
         StoreConfig::Memory => {
             if is_lambda_runtime() {
                 tracing::warn!(
@@ -265,6 +339,120 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
         StoreConfig::DynamoDb { .. } => Err(anyhow!(
             "OAUTHRELAY_STORE=dynamodb requires the oauthrelay aws feature"
         )),
+        #[cfg(feature = "kubernetes")]
+        StoreConfig::Kubernetes {
+            resource,
+            namespace,
+            sweep,
+        } => {
+            use oauthrelay_store_kubernetes::{
+                KubeClient, KubernetesStore, RecordMapping, DEX_MINIMUM_VERSION,
+            };
+            let mapping = kubernetes_mapping(resource.as_deref())?;
+            let mut config = kube_config().await?;
+            // The store bounds its own requests (`OPERATION_DEADLINE`). Kube's default retry
+            // layer would instead retry 429, 503 and 504 for as long as the server keeps
+            // answering them, honouring `Retry-After`: a stalled token request, and a claim
+            // that outlives its lease.
+            config.default_retry = false;
+            // The provider's namespace is the natural home for records when it is enabled.
+            let provider_namespace = if bool_env("OAUTHRELAY_PROVIDER_KUBERNETES", false)? {
+                env::var("OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE").ok()
+            } else {
+                None
+            };
+            let namespace = kubernetes_store_namespace(
+                mapping,
+                namespace.as_deref(),
+                provider_namespace.as_deref(),
+                &config.default_namespace,
+            )?;
+            if mapping == RecordMapping::DexAuthCode {
+                tracing::warn!(
+                    minimum_dex_version = DEX_MINIMUM_VERSION,
+                    %namespace,
+                    "the Dex AuthCode store requires Dex {DEX_MINIMUM_VERSION} or later in that namespace; oauthrelay cannot detect Dex's version, and older Dex releases let anyone who knows a record's name redeem it through the device callback"
+                );
+            }
+            let client =
+                KubeClient::new(kube::Client::try_from(config)?, namespace.clone(), mapping);
+            let mut store = KubernetesStore::new(Arc::new(client));
+            store.probe().await?;
+            if let Some(interval) = sweep {
+                store = store.with_sweeper(interval);
+            }
+            tracing::info!(resource = mapping.resource_name(), %namespace, sweep = ?sweep, "using Kubernetes transient store");
+            Ok(Arc::new(store))
+        }
+        #[cfg(not(feature = "kubernetes"))]
+        StoreConfig::Kubernetes { .. } => Err(anyhow!(
+            "OAUTHRELAY_STORE=kubernetes requires the oauthrelay kubernetes feature"
+        )),
+    }
+}
+
+/// Lambda freezes the process between invocations, so no background sweeper would run, and the
+/// Kubernetes store has no other way to delete expired records.
+fn reject_kubernetes_on_lambda(config: &StoreConfig, lambda: bool) -> anyhow::Result<()> {
+    if lambda && matches!(config, StoreConfig::Kubernetes { .. }) {
+        return Err(anyhow!(
+            "OAUTHRELAY_STORE=kubernetes is not supported on AWS Lambda: the process is frozen between invocations, so nothing would delete expired records. Use OAUTHRELAY_STORE=dynamodb, whose TTL deletes them"
+        ));
+    }
+    Ok(())
+}
+
+/// The namespace for the Kubernetes store's records: `explicit` (`OAUTHRELAY_STORE_KUBERNETES_NAMESPACE`),
+/// then the provider's, then the pod or kubeconfig `default`.
+///
+/// Dex's records live in Dex's namespace and nowhere else, because that is where Dex's garbage
+/// collector runs, so that mapping accepts only an explicit namespace.
+#[cfg(feature = "kubernetes")]
+fn kubernetes_store_namespace(
+    mapping: oauthrelay_store_kubernetes::RecordMapping,
+    explicit: Option<&str>,
+    provider: Option<&str>,
+    default: &str,
+) -> anyhow::Result<String> {
+    if mapping.needs_explicit_namespace() && explicit.is_none() {
+        return Err(anyhow!(
+            "OAUTHRELAY_STORE_KUBERNETES_RESOURCE={} requires OAUTHRELAY_STORE_KUBERNETES_NAMESPACE to name Dex's namespace: Dex garbage-collects expired authcodes only there, so it is never inferred from the provider or pod namespace",
+            mapping.resource_name()
+        ));
+    }
+    oauthrelay_provider_kubernetes::select_namespace(explicit.or(provider), default)
+}
+
+/// The store's mapping for `OAUTHRELAY_STORE_KUBERNETES_RESOURCE`.
+#[cfg(feature = "kubernetes")]
+fn kubernetes_mapping(
+    resource: Option<&str>,
+) -> anyhow::Result<oauthrelay_store_kubernetes::RecordMapping> {
+    use oauthrelay_store_kubernetes::RecordMapping;
+    let Some(name) = resource else {
+        return Ok(RecordMapping::TransientRecord);
+    };
+    RecordMapping::from_resource_name(name).ok_or_else(|| {
+        let supported: Vec<_> = RecordMapping::ALL
+            .iter()
+            .map(|mapping| mapping.resource_name())
+            .collect();
+        anyhow!(
+            "OAUTHRELAY_STORE_KUBERNETES_RESOURCE must be one of {}, got {name:?}",
+            supported.join(", ")
+        )
+    })
+}
+
+/// Credentials for the cluster: the pod's service account in a pod, else the active kubeconfig.
+#[cfg(feature = "kubernetes")]
+async fn kube_config() -> anyhow::Result<kube::Config> {
+    if env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        kube::Config::incluster().context("load in-cluster Kubernetes credentials")
+    } else {
+        kube::Config::from_kubeconfig(&Default::default())
+            .await
+            .context("load Kubernetes kubeconfig")
     }
 }
 
@@ -317,13 +505,7 @@ async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> 
             use oauthrelay_provider_kubernetes::{
                 select_namespace, KubernetesProvider, DEFAULT_REFRESH_INTERVAL,
             };
-            let config = if env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-                kube::Config::incluster().context("load in-cluster Kubernetes credentials")?
-            } else {
-                kube::Config::from_kubeconfig(&Default::default())
-                    .await
-                    .context("load Kubernetes kubeconfig")?
-            };
+            let config = kube_config().await?;
             let namespace = select_namespace(
                 env::var("OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE")
                     .ok()
@@ -706,28 +888,247 @@ mod tests {
         assert!(parse_duration("TEST", &format!("{}h", largest_hours + 1)).is_err());
     }
 
+    fn store_env(kind: Option<&str>) -> StoreEnv<'_> {
+        StoreEnv {
+            kind,
+            ..StoreEnv::default()
+        }
+    }
+
     #[test]
     fn store_defaults_to_memory_and_validates_selection() {
-        assert_eq!(parse_store_config(None, None).unwrap(), StoreConfig::Memory);
         assert_eq!(
-            parse_store_config(Some("memory"), None).unwrap(),
+            parse_store_config(store_env(None)).unwrap(),
             StoreConfig::Memory
         );
         assert_eq!(
-            parse_store_config(Some("dynamodb"), Some("oauthrelay-store")).unwrap(),
+            parse_store_config(store_env(Some("memory"))).unwrap(),
+            StoreConfig::Memory
+        );
+        assert_eq!(
+            parse_store_config(StoreEnv {
+                dynamodb_table: Some("oauthrelay-store"),
+                ..store_env(Some("dynamodb"))
+            })
+            .unwrap(),
             StoreConfig::DynamoDb {
                 table: "oauthrelay-store".into()
             }
         );
-        assert!(parse_store_config(Some("dynamodb"), None).is_err());
-        assert!(parse_store_config(Some("redis"), None).is_err());
-        assert!(parse_store_config(None, Some("oauthrelay-store")).is_err());
-        assert!(parse_store_config(Some("memory"), Some("oauthrelay-store")).is_err());
+        assert!(parse_store_config(store_env(Some("dynamodb"))).is_err());
+        assert!(parse_store_config(store_env(Some("redis"))).is_err());
+        for kind in [None, Some("memory"), Some("kubernetes")] {
+            assert!(
+                parse_store_config(StoreEnv {
+                    dynamodb_table: Some("oauthrelay-store"),
+                    ..store_env(kind)
+                })
+                .is_err(),
+                "{kind:?}"
+            );
+        }
         for table in ["", "ab", "has space", "slash/name", &"t".repeat(256)] {
             assert!(
-                parse_store_config(Some("dynamodb"), Some(table)).is_err(),
+                parse_store_config(StoreEnv {
+                    dynamodb_table: Some(table),
+                    ..store_env(Some("dynamodb"))
+                })
+                .is_err(),
                 "{table:?}"
             );
+        }
+    }
+
+    #[test]
+    fn kubernetes_store_has_defaults_and_validates_its_settings() {
+        assert_eq!(
+            parse_store_config(store_env(Some("kubernetes"))).unwrap(),
+            StoreConfig::Kubernetes {
+                resource: None,
+                namespace: None,
+                sweep: Some(Duration::from_secs(60)),
+            }
+        );
+        assert_eq!(
+            parse_store_config(StoreEnv {
+                kubernetes_resource: Some("transientrecords.oauthrelay.dev"),
+                kubernetes_namespace: Some("relay-state"),
+                kubernetes_sweep: Some("5m"),
+                ..store_env(Some("kubernetes"))
+            })
+            .unwrap(),
+            StoreConfig::Kubernetes {
+                resource: Some("transientrecords.oauthrelay.dev".into()),
+                namespace: Some("relay-state".into()),
+                sweep: Some(Duration::from_secs(300)),
+            }
+        );
+        assert_eq!(
+            parse_store_config(StoreEnv {
+                kubernetes_sweep: Some("off"),
+                ..store_env(Some("kubernetes"))
+            })
+            .unwrap(),
+            StoreConfig::Kubernetes {
+                resource: None,
+                namespace: None,
+                sweep: None,
+            }
+        );
+        for sweep in ["", "0s", "60", "Off", "1d"] {
+            assert!(
+                parse_store_config(StoreEnv {
+                    kubernetes_sweep: Some(sweep),
+                    ..store_env(Some("kubernetes"))
+                })
+                .is_err(),
+                "{sweep:?}"
+            );
+        }
+        assert_eq!(
+            parse_store_config(StoreEnv {
+                kubernetes_resource: Some("authcodes.dex.coreos.com"),
+                kubernetes_namespace: Some("dex"),
+                ..store_env(Some("kubernetes"))
+            })
+            .unwrap(),
+            StoreConfig::Kubernetes {
+                resource: Some("authcodes.dex.coreos.com".into()),
+                namespace: Some("dex".into()),
+                sweep: Some(Duration::from_secs(60)),
+            }
+        );
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn kubernetes_resource_names_select_a_store_mapping() {
+        use oauthrelay_store_kubernetes::RecordMapping;
+        assert_eq!(
+            kubernetes_mapping(None).unwrap(),
+            RecordMapping::TransientRecord
+        );
+        for mapping in RecordMapping::ALL {
+            assert_eq!(
+                kubernetes_mapping(Some(mapping.resource_name())).unwrap(),
+                mapping
+            );
+        }
+        for resource in [
+            "",
+            "relays.oauthrelay.dev",
+            "transientrecords",
+            "authcodes",
+            "refreshtokens.dex.coreos.com",
+            "AuthCodes.dex.coreos.com",
+        ] {
+            let error = kubernetes_mapping(Some(resource)).unwrap_err().to_string();
+            assert!(
+                error.contains("transientrecords.oauthrelay.dev, authcodes.dex.coreos.com"),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn the_dex_mapping_requires_an_explicit_namespace() {
+        use oauthrelay_store_kubernetes::RecordMapping;
+        let dex = RecordMapping::DexAuthCode;
+        for (provider, default) in [(None, "oauthrelay"), (Some("relay-state"), "oauthrelay")] {
+            let error = kubernetes_store_namespace(dex, None, provider, default)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("OAUTHRELAY_STORE_KUBERNETES_NAMESPACE") && error.contains("Dex"),
+                "{error}"
+            );
+        }
+        // An explicit namespace wins over the provider's and the default.
+        assert_eq!(
+            kubernetes_store_namespace(dex, Some("dex"), Some("relay-state"), "oauthrelay")
+                .unwrap(),
+            "dex"
+        );
+        assert!(kubernetes_store_namespace(dex, Some("Not A Namespace"), None, "x").is_err());
+        // The default mapping keeps falling back to the provider, then the pod namespace.
+        let record = RecordMapping::TransientRecord;
+        assert_eq!(
+            kubernetes_store_namespace(record, None, Some("relay-state"), "oauthrelay").unwrap(),
+            "relay-state"
+        );
+        assert_eq!(
+            kubernetes_store_namespace(record, None, None, "oauthrelay").unwrap(),
+            "oauthrelay"
+        );
+        assert_eq!(
+            kubernetes_store_namespace(record, Some("explicit"), Some("relay-state"), "x").unwrap(),
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn the_kubernetes_store_is_rejected_on_lambda() {
+        let kubernetes = parse_store_config(store_env(Some("kubernetes"))).unwrap();
+        let error = reject_kubernetes_on_lambda(&kubernetes, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported on AWS Lambda"), "{error}");
+        assert!(error.contains("OAUTHRELAY_STORE=dynamodb"), "{error}");
+        // An explicit sweep setting does not make it acceptable.
+        let swept = parse_store_config(StoreEnv {
+            kubernetes_sweep: Some("30s"),
+            ..store_env(Some("kubernetes"))
+        })
+        .unwrap();
+        assert!(reject_kubernetes_on_lambda(&swept, true).is_err());
+        assert!(reject_kubernetes_on_lambda(&kubernetes, false).is_ok());
+        for kind in [None, Some("memory")] {
+            let config = parse_store_config(store_env(kind)).unwrap();
+            assert!(reject_kubernetes_on_lambda(&config, true).is_ok());
+        }
+        let dynamodb = parse_store_config(StoreEnv {
+            dynamodb_table: Some("oauthrelay-store"),
+            ..store_env(Some("dynamodb"))
+        })
+        .unwrap();
+        assert!(reject_kubernetes_on_lambda(&dynamodb, true).is_ok());
+    }
+
+    #[test]
+    fn kubernetes_store_settings_require_the_kubernetes_store() {
+        for kind in [None, Some("memory"), Some("dynamodb")] {
+            let table = (kind == Some("dynamodb")).then_some("oauthrelay-store");
+            for (variable, env) in [
+                (
+                    "OAUTHRELAY_STORE_KUBERNETES_RESOURCE",
+                    StoreEnv {
+                        kubernetes_resource: Some("transientrecords.oauthrelay.dev"),
+                        dynamodb_table: table,
+                        ..store_env(kind)
+                    },
+                ),
+                (
+                    "OAUTHRELAY_STORE_KUBERNETES_NAMESPACE",
+                    StoreEnv {
+                        kubernetes_namespace: Some("relay-state"),
+                        dynamodb_table: table,
+                        ..store_env(kind)
+                    },
+                ),
+                (
+                    "OAUTHRELAY_STORE_KUBERNETES_SWEEP",
+                    StoreEnv {
+                        kubernetes_sweep: Some("off"),
+                        dynamodb_table: table,
+                        ..store_env(kind)
+                    },
+                ),
+            ] {
+                let error = parse_store_config(env).unwrap_err().to_string();
+                assert!(error.contains(variable), "{kind:?}: {error}");
+                assert!(error.contains("OAUTHRELAY_STORE=kubernetes"), "{error}");
+            }
         }
     }
 

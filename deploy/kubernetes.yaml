@@ -21,6 +21,19 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, list, watch]
+  # Only needed with OAUTHRELAY_STORE=kubernetes, which keeps its records as TransientRecords.
+  - apiGroups: [oauthrelay.dev]
+    resources: [transientrecords]
+    verbs: [get, list, create, update, delete]
+  # OAUTHRELAY_STORE_KUBERNETES_RESOURCE=authcodes.dex.coreos.com keeps the records as Dex
+  # AuthCodes instead; it requires Dex 2.46.0 or later and
+  # OAUTHRELAY_STORE_KUBERNETES_NAMESPACE set to Dex's namespace. That rule belongs in Dex's
+  # namespace, in a Role and RoleBinding for this ServiceAccount there, and it also lets
+  # oauthrelay read Dex's live authorization codes: read the Transient store reference first.
+  #
+  #   - apiGroups: [dex.coreos.com]
+  #     resources: [authcodes]
+  #     verbs: [get, list, create, update, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -43,7 +56,9 @@ metadata:
   namespace: oauthrelay
 spec:
   # The default in-memory transient store only enforces single-use authorization codes within one
-  # replica. Before scaling out, set OAUTHRELAY_STORE=dynamodb (see the Transient store reference).
+  # replica. Before scaling out, set OAUTHRELAY_STORE=kubernetes (records live in this namespace;
+  # the Role above already allows it) or OAUTHRELAY_STORE=dynamodb. See the Transient store
+  # reference.
   replicas: 1
   selector:
     matchLabels:

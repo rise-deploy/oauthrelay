@@ -45,6 +45,7 @@ configuration; Amazon Cognito is one example.
 - [Getting started](https://rise-deploy.github.io/oauthrelay/getting-started/)
 - [Relay trust model](https://rise-deploy.github.io/oauthrelay/relay-model/)
 - [Cognito relay to Google](https://rise-deploy.github.io/oauthrelay/guides/cognito-google-relay/)
+- [Dex in front of oauthrelay](https://rise-deploy.github.io/oauthrelay/guides/dex-in-front/)
 - [Configuration reference](https://rise-deploy.github.io/oauthrelay/configuration/)
 - [File provider](https://rise-deploy.github.io/oauthrelay/reference/file-provider/)
 - [Kubernetes provider](https://rise-deploy.github.io/oauthrelay/reference/kubernetes-provider/)
@@ -89,7 +90,8 @@ annotated `v<version>` tag, pushes to `origin`, and creates a GitHub release wit
 The regular test suite uses in-process OAuth/OIDC fixtures. `mise run e2e` runs the standalone
 binary through a complete authorization-code and refresh flow against a pinned Dex container. No
 test contacts Google or Amazon Cognito. `mise run kubernetes:test` validates generated CRDs and
-namespace-scoped configuration watches in a disposable Kind cluster.
+namespace-scoped configuration watches in a disposable Kind cluster, and runs the Kubernetes
+transient store, including its Dex `AuthCode` mapping against a real Dex.
 
 The workspace contains:
 
@@ -100,9 +102,10 @@ crates/oauthrelay-provider-file/ File configuration provider
 crates/oauthrelay-provider-ssm/  AWS SSM and Secrets Manager provider
 crates/oauthrelay-provider-kubernetes/ Namespaced Kubernetes provider
 crates/oauthrelay-store-dynamodb/ Amazon DynamoDB transient store
+crates/oauthrelay-store-kubernetes/ Kubernetes custom-resource transient store
 crates/oauthrelay/               standalone native and Lambda runtime
 ```
 
 The core exposes resolver and transient-store seams for hosts that need database-backed
 configuration or distributed single-use authorization codes. The standalone binary offers an
-in-memory store (default) and a DynamoDB store for this state.
+in-memory store (default), a DynamoDB store, and a Kubernetes store for this state.

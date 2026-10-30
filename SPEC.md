@@ -23,6 +23,7 @@ crates/
   oauthrelay-provider-ssm/  SSM resource discovery and AWS secret backend
   oauthrelay-provider-kubernetes/ Namespaced CR discovery and Kubernetes Secret backend
   oauthrelay-store-dynamodb/ Amazon DynamoDB transient store
+  oauthrelay-store-kubernetes/ Kubernetes custom-resource transient store
   oauthrelay/               provider wiring, native server, Lambda runtime, schema CLI
 ```
 
@@ -238,8 +239,9 @@ across all instances sharing the backend. Callers namespace keys by purpose (`re
 `refresh:`); backends never interpret keys. An expired record
 is absent for reads and conditional writes even when the backend has not yet deleted it. Callers write values unique
 to the writer (sealed with a random nonce, or carrying a random claim id): DynamoDB asks for the
-existing item when a condition fails and counts a failure against the value it just wrote as
-success, since SDK retries can report a failure for a write that applied. A backend
+existing item when a condition fails, and the Kubernetes store re-reads the object after a 409,
+and each counts a failure against the value it just wrote as success, since a retried request can
+report a failure for a write that applied. A backend
 error means the outcome is unknown and callers fail closed. The rustdoc on the trait states the
 full contract and the rotation protocol built on it.
 
@@ -260,8 +262,21 @@ The standalone binary selects the backend with `OAUTHRELAY_STORE`. `memory` (def
 process-local and protects one process or one Lambda execution environment. `dynamodb`
 (`oauthrelay-store-dynamodb`, behind the `aws` feature) shares state across replicas and Lambda
 environments through conditional `PutItem` and strongly consistent `GetItem`, with `expires_at`
-epoch seconds as the table's TTL attribute and an explicit expiry check on every read. An
-embedding without a store accepts a sealed authorization code for its five-minute cryptographic
+epoch seconds as the table's TTL attribute and an explicit expiry check on every read. `kubernetes`
+(`oauthrelay-store-kubernetes`, behind the `kubernetes` feature) keeps each record as a namespaced
+`TransientRecord` object named by a hash of the key, with the object's `resourceVersion` as the
+compare-and-swap primitive (`POST` to create, `PUT` and `DELETE` conditional on the version read),
+quorum reads, and an `expiresAt` check on every read; a sweeper on every replica deletes expired
+objects, listing only the `oauthrelay.dev/expires-hour` buckets that can hold expired records and
+deleting only those expired for more than 30 seconds. Every store operation fails with a backend
+error after 10 seconds, and the backend is not available on Lambda, which cannot run the sweeper.
+It suits moderate refresh traffic; each rotation is five reads and five writes against the API
+server (three `compare_and_swap` calls, each a `GET` plus a `PUT`, two creates, and two plain
+reads). The same records can instead be Dex `AuthCode` objects
+(`OAUTHRELAY_STORE_KUBERNETES_RESOURCE=authcodes.dex.coreos.com`, with
+`OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` set to Dex's namespace), an opt-in that requires Dex 2.46.0
+or later, which binds its device callback to the code's client, and that widens the service
+account's read access to Dex's live codes. An embedding without a store accepts a sealed authorization code for its five-minute cryptographic
 lifetime and rejects `requireSingleUse` client assertions.
 
 ## Configuration resources

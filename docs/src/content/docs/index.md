@@ -21,6 +21,8 @@ Several relays can share one upstream without creating additional provider callb
 - [Relay trust model](/oauthrelay/relay-model/) explains the endpoint and token-trust boundaries.
 - [Cognito relay to Google](/oauthrelay/guides/cognito-google-relay/) applies one stable Google
   callback to any number of Cognito user pools.
+- [Dex in front of oauthrelay](/oauthrelay/guides/dex-in-front/) gives each Dex client its own
+  ID-token claim policy through a dedicated relay.
 
 ## Reference
 
@@ -31,8 +33,8 @@ Several relays can share one upstream without creating additional provider callb
   sources.
 - [Runtime and deployment](/oauthrelay/reference/runtime/) covers native, container, and Lambda
   execution.
-- [Transient store](/oauthrelay/reference/transient-store/) covers single-use state: the memory and
-  DynamoDB backends.
+- [Transient store](/oauthrelay/reference/transient-store/) covers single-use state: the memory,
+  DynamoDB, and Kubernetes backends.
 - [HTTP endpoints](/oauthrelay/reference/http-endpoints/) describes relay, callback, metadata, and
   health routes.
 
