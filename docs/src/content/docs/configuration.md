@@ -382,6 +382,24 @@ Rotation settings are rejected on a relay that is not `rotating`.
 
 `spec.clientAuthentication` selects how a relying party authenticates to the relay token endpoint.
 
+`UpstreamClient` and `ClientSecret` accept the client ID and secret in either of the two forms of
+[RFC 6749 section 2.3.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1), and a request
+must use exactly one:
+
+- Form fields `client_id` and `client_secret` in the request body.
+- An `Authorization: Basic` header carrying `base64(urlencode(client_id):urlencode(client_secret))`,
+  where each credential is form-urlencoded (`application/x-www-form-urlencoded`) before the two are
+  joined with `:`. Characters such as `:`, `+`, `%`, or non-ASCII must therefore be percent-encoded.
+  This is the default of many OIDC clients, such as Dex's OIDC connector. A `client_id` form field
+  that repeats the header's identifies the client and is allowed.
+
+A request that carries the header and a `client_secret`, a client assertion, or a different
+`client_id` in the body is rejected with `400 invalid_request`. A header that is not valid Basic
+credentials is rejected with `401 invalid_client`; so are wrong credentials. Both `401` answers to a
+header carry `WWW-Authenticate: Basic realm="oauthrelay"`, while failures of body credentials do not.
+`Public` takes no secret in either form, and `PrivateKeyJwt` authenticates with its assertion alone
+and ignores the `Authorization` header.
+
 ### UpstreamClient
 
 The relying party presents the referenced upstream's client ID and secret. This is useful when a
@@ -394,8 +412,9 @@ clientAuthentication:
 
 ### Public
 
-Client authentication credentials are not accepted. `client_id`, when present, is a public
-identifier rather than a credential. Every authorization-code flow must use S256 PKCE.
+Client authentication credentials are not accepted: a `client_secret`, a client assertion, or an
+`Authorization: Basic` header is answered with `401 invalid_client`. `client_id`, when present, is a
+public identifier rather than a credential. Every authorization-code flow must use S256 PKCE.
 
 ```yaml
 clientAuthentication:
