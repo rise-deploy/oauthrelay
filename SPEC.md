@@ -120,11 +120,13 @@ unvalidated redirect URI is never reflected into a response.
   exactly one method: form fields `client_id` and `client_secret`, or `Authorization: Basic` with
   the form-urlencoded ID and secret joined by `:` and base64-encoded (RFC 6749 section 2.3.1),
   decoded strictly. Header credentials combined with a body `client_secret`, client assertion, or
-  differing `client_id` are `invalid_request`. A header that is not valid Basic credentials, or
-  wrong credentials, are `invalid_client`, and a header failure carries
-  `WWW-Authenticate: Basic realm="oauthrelay"`. `Public` rejects a Basic header like a body secret;
-  `PrivateKeyJwt` ignores the `Authorization` header. The relying party's header is never forwarded
-  upstream.
+  differing `client_id` are `invalid_request`. A Basic header that is not valid credentials,
+  several `Authorization` headers, or wrong credentials are `invalid_client`, and a header failure
+  carries `WWW-Authenticate: Basic realm="oauthrelay"`. An `Authorization` header of another scheme
+  is not a client credential and leaves body credentials in force. `Public` rejects a Basic header
+  with a non-empty secret like a body secret, while an empty secret only identifies the client like
+  a body `client_id`; `PrivateKeyJwt` ignores the `Authorization` header. The relying party's header
+  is never forwarded upstream. CORS allows only `Content-Type`, so browsers cannot send Basic.
 - Upstream-owned authorization parameters are replaced rather than forwarded.
 - Other authorization and grant extensions are preserved.
 - OIDC request objects are rejected because their routing fields conflict with proxy ownership.

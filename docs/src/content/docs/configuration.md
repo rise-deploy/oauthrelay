@@ -394,11 +394,20 @@ must use exactly one:
   that repeats the header's identifies the client and is allowed.
 
 A request that carries the header and a `client_secret`, a client assertion, or a different
-`client_id` in the body is rejected with `400 invalid_request`. A header that is not valid Basic
-credentials is rejected with `401 invalid_client`; so are wrong credentials. Both `401` answers to a
-header carry `WWW-Authenticate: Basic realm="oauthrelay"`, while failures of body credentials do not.
-`Public` takes no secret in either form, and `PrivateKeyJwt` authenticates with its assertion alone
-and ignores the `Authorization` header.
+`client_id` in the body is rejected with `400 invalid_request`. A `Basic` header that is not valid
+credentials, or several `Authorization` headers, are rejected with `401 invalid_client`; so are wrong
+credentials. Both `401` answers to a header carry `WWW-Authenticate: Basic realm="oauthrelay"`, while
+failures of body credentials do not. An `Authorization` header of another scheme, such as a gateway's
+`Bearer` or SigV4 header, is not a client credential: the body credentials are used as usual.
+
+`Public` takes no secret in either form, so a `client_secret` or a Basic header with a non-empty
+secret is `401 invalid_client`. A Basic header with an empty secret (`base64(client_id:)`, which some
+clients send for public clients) only identifies the client, like a body `client_id`; a body
+`client_id` that differs from the header's is rejected. `PrivateKeyJwt` authenticates with its
+assertion alone and ignores the `Authorization` header.
+
+The token endpoint's CORS policy allows only the `Content-Type` request header, so browser relying
+parties cannot send `Authorization: Basic`; they are `Public` clients.
 
 ### UpstreamClient
 

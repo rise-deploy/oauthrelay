@@ -1320,14 +1320,26 @@ fn password_credentials(
     headers: &HeaderMap,
     form: &TokenRequest,
 ) -> Result<(String, String, bool), AuthFailure> {
-    let Some(authorization) = authorization_header(headers) else {
-        return Ok((
+    let body = || {
+        Ok((
             form.client_id.clone().unwrap_or_default(),
             form.client_secret.clone().unwrap_or_default(),
             false,
-        ));
+        ))
     };
-    let (id, secret) = parse_basic_credentials(authorization)
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(first) = values.next() else {
+        return body();
+    };
+    // Several `Authorization` headers are unusable rather than a choice among them.
+    if values.next().is_some() {
+        return Err(AuthFailure::InvalidClient { via_header: true });
+    }
+    // Other schemes (a gateway's Bearer or SigV4 header) are not client credentials.
+    if basic_scheme(first.as_bytes()).is_none() {
+        return body();
+    }
+    let (id, secret) = parse_basic_credentials(first.as_bytes())
         .ok_or(AuthFailure::InvalidClient { via_header: true })?;
     // A body `client_id` that repeats the header's is identification, not a second credential.
     let repeats_id = form
@@ -1344,27 +1356,19 @@ fn password_credentials(
     Ok((id, secret, true))
 }
 
-/// The request's `Authorization` header value. Several headers are reported as one unusable
-/// value rather than picking among them.
-fn authorization_header(headers: &HeaderMap) -> Option<&[u8]> {
-    let mut values = headers.get_all(header::AUTHORIZATION).iter();
-    let first = values.next()?;
-    Some(if values.next().is_some() {
-        b""
-    } else {
-        first.as_bytes()
-    })
+/// The remainder of an `Authorization` value after the case-insensitive `Basic` scheme, or `None`
+/// for any other scheme.
+fn basic_scheme(value: &[u8]) -> Option<&[u8]> {
+    let (scheme, rest) = value.split_at_checked(5)?;
+    (scheme.eq_ignore_ascii_case(b"basic") && rest.first().is_none_or(|byte| *byte == b' '))
+        .then_some(rest)
 }
 
 /// Decodes `Basic base64(urlencode(id):urlencode(secret))` (RFC 6749 section 2.3.1). Anything that
 /// is not exactly that, including invalid base64, a missing colon, malformed percent-encoding and
 /// non-UTF-8 bytes, yields `None`.
 fn parse_basic_credentials(value: &[u8]) -> Option<(String, String)> {
-    let (scheme, rest) = value.split_at_checked(5)?;
-    if !scheme.eq_ignore_ascii_case(b"basic") {
-        return None;
-    }
-    let token = rest.strip_prefix(b" ")?.trim_ascii_start();
+    let token = basic_scheme(value)?.strip_prefix(b" ")?.trim_ascii_start();
     let decoded = STANDARD.decode(token).ok()?;
     let colon = decoded.iter().position(|byte| *byte == b':')?;
     Some((
@@ -1392,13 +1396,29 @@ fn form_urldecode(input: &[u8]) -> Option<String> {
     String::from_utf8(output).ok()
 }
 
-fn has_basic_authorization(headers: &HeaderMap) -> bool {
-    headers.get_all(header::AUTHORIZATION).iter().any(|value| {
-        value
-            .as_bytes()
-            .get(..5)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"basic"))
-    })
+/// Whether a public client may proceed. A Basic header with an empty secret only identifies the
+/// client, like a body `client_id`; any secret, malformed Basic value or repeated header fails.
+fn public_client_header_allowed(headers: &HeaderMap, form: &TokenRequest) -> bool {
+    let mut basic = headers
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .filter(|value| basic_scheme(value.as_bytes()).is_some());
+    let Some(value) = basic.next() else {
+        return true;
+    };
+    if basic.next().is_some() {
+        return false;
+    }
+    match parse_basic_credentials(value.as_bytes()) {
+        Some((id, secret)) => {
+            secret.is_empty()
+                && form
+                    .client_id
+                    .as_deref()
+                    .is_none_or(|body_id| constant_eq(body_id.as_bytes(), id.as_bytes()))
+        }
+        None => false,
+    }
 }
 
 async fn authenticate(
@@ -1423,14 +1443,17 @@ async fn authenticate(
             password(&upstream.client_id, upstream.client_secret.expose())
         }
         ClientAuth::Public => {
-            let via_header = has_basic_authorization(headers);
             if form.client_secret.is_none()
                 && form.client_assertion_type.is_none()
                 && form.client_assertion.is_none()
-                && !via_header
+                && public_client_header_allowed(headers, form)
             {
                 Ok(())
             } else {
+                let via_header = headers
+                    .get_all(header::AUTHORIZATION)
+                    .iter()
+                    .any(|value| basic_scheme(value.as_bytes()).is_some());
                 Err(AuthFailure::InvalidClient { via_header })
             }
         }

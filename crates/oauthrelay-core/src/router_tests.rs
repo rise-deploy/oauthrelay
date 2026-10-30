@@ -3440,7 +3440,6 @@ async fn malformed_authorization_headers_are_invalid_client_with_a_challenge() {
     let (app, _, task) = setup("github", APPLICATION_AUTH(), KeyStrategy::SingleSegment).await;
     let valid = basic_header("application", "application-secret");
     let malformed: Vec<Vec<Vec<u8>>> = vec![
-        vec![b"Bearer application-secret".to_vec()],
         vec![b"Basic".to_vec()],
         vec![b"Basic ".to_vec()],
         vec![b"Basic !!!not-base64!!!".to_vec()],
@@ -3476,6 +3475,39 @@ async fn malformed_authorization_headers_are_invalid_client_with_a_challenge() {
 }
 
 #[tokio::test]
+async fn non_basic_authorization_headers_leave_body_credentials_working() {
+    for auth in [APPLICATION_AUTH(), ClientAuth::UpstreamClient] {
+        let (id, secret) = match &auth {
+            ClientAuth::UpstreamClient => ("upstream-client", "upstream-secret"),
+            _ => ("application", "application-secret"),
+        };
+        let (app, _, task) = setup("github", auth, KeyStrategy::SingleSegment).await;
+        let form = format!(
+            "grant_type=refresh_token&refresh_token=refresh&client_id={id}&client_secret={secret}"
+        );
+        for value in [
+            &b"Bearer gateway-token"[..],
+            b"AWS4-HMAC-SHA256 Credential=x/y, Signature=z",
+            b"Basicish abc",
+        ] {
+            let response = post_token_with_authorization(&app, "github", &[value], &form).await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{value:?}");
+        }
+        // Without body credentials the request is simply unauthenticated, without a challenge.
+        let response = post_token_with_authorization(
+            &app,
+            "github",
+            &[b"Bearer gateway-token"],
+            "grant_type=refresh_token&refresh_token=refresh",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn basic_authorization_accepts_any_scheme_case_and_both_space_encodings() {
     let auth = ClientAuth::ClientSecret {
         client_id: "application".into(),
@@ -3500,8 +3532,8 @@ async fn basic_authorization_accepts_any_scheme_case_and_both_space_encodings() 
 
 #[tokio::test]
 async fn basic_credentials_round_trip_special_characters() {
-    let id = "client:id/with space";
-    let secret = "se+cret %/é:&=\u{1f512}";
+    let id = "client/id with space";
+    let secret = "a+b";
     let auth = ClientAuth::ClientSecret {
         client_id: id.into(),
         client_secret: SecretString::new(secret),
@@ -3512,11 +3544,36 @@ async fn basic_credentials_round_trip_special_characters() {
     let response =
         post_token_with_authorization(&app, "github", &[basic.as_bytes()], refresh).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    // The same credentials without the percent-encoding are a different secret.
+    // Unencoded, `+` decodes to a space, which is a different secret.
     let unencoded = basic_header_for_raw(format!("{id}:{secret}").as_bytes());
     let response =
         post_token_with_authorization(&app, "github", &[unencoded.as_bytes()], refresh).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let encoded = basic_header_for_raw(b"client%2Fid+with+space:a%2Bb");
+    let response =
+        post_token_with_authorization(&app, "github", &[encoded.as_bytes()], refresh).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    task.abort();
+}
+
+#[tokio::test]
+async fn basic_credentials_round_trip_reserved_and_non_ascii_characters() {
+    let id = "client:id/with space";
+    let secret = "se+cret %/é:&=\u{1f512}";
+    let auth = ClientAuth::ClientSecret {
+        client_id: id.into(),
+        client_secret: SecretString::new(secret),
+    };
+    let (app, _, task) = setup("github", auth, KeyStrategy::SingleSegment).await;
+    let basic = basic_header(id, secret);
+    let response = post_token_with_authorization(
+        &app,
+        "github",
+        &[basic.as_bytes()],
+        "grant_type=refresh_token&refresh_token=refresh",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
     task.abort();
 }
 
@@ -3526,8 +3583,8 @@ async fn public_relay_rejects_a_basic_authorization_header() {
     let refresh = "grant_type=refresh_token&refresh_token=refresh";
     for value in [
         basic_header("public-application", "secret"),
-        basic_header("public-application", ""),
         "basic !!!".to_owned(),
+        "Basic".to_owned(),
     ] {
         let response =
             post_token_with_authorization(&app, "google", &[value.as_bytes()], refresh).await;
@@ -3541,6 +3598,38 @@ async fn public_relay_rejects_a_basic_authorization_header() {
     // Other schemes are not client credentials and are ignored, as the relay never reads them.
     let response = post_token_with_authorization(&app, "google", &[b"Bearer token"], refresh).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    task.abort();
+}
+
+#[tokio::test]
+async fn public_relay_treats_a_basic_header_with_an_empty_secret_as_identification() {
+    let (app, _, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
+    let refresh = "grant_type=refresh_token&refresh_token=refresh";
+    let basic = basic_header("public-application", "");
+    let response =
+        post_token_with_authorization(&app, "google", &[basic.as_bytes()], refresh).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // A repeated body `client_id` is allowed; a different one conflicts.
+    let same = format!("{refresh}&client_id=public-application");
+    let response = post_token_with_authorization(&app, "google", &[basic.as_bytes()], &same).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let other = format!("{refresh}&client_id=another-client");
+    let response = post_token_with_authorization(&app, "google", &[basic.as_bytes()], &other).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // A body secret alongside is still rejected, as without the header.
+    let secret = format!("{refresh}&client_secret=x");
+    let response =
+        post_token_with_authorization(&app, "google", &[basic.as_bytes()], &secret).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Repeated Basic headers are unusable.
+    let response = post_token_with_authorization(
+        &app,
+        "google",
+        &[basic.as_bytes(), basic.as_bytes()],
+        refresh,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     task.abort();
 }
 
