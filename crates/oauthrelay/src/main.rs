@@ -213,29 +213,14 @@ enum StoreConfig {
         table: String,
     },
     Kubernetes {
-        resource: KubernetesResource,
+        /// The `plural.group` resource name, validated where the store crate is linked; `None`
+        /// is the store's own `TransientRecord`.
+        resource: Option<String>,
         /// `None` follows the provider namespace, then the pod or kubeconfig namespace.
         namespace: Option<String>,
         /// `None` disables the sweeper.
         sweep: Option<Duration>,
     },
-}
-
-/// The resource the Kubernetes store keeps its records in.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum KubernetesResource {
-    TransientRecord,
-    DexAuthCode,
-}
-
-impl KubernetesResource {
-    fn parse(name: &str) -> Option<Self> {
-        match name {
-            "transientrecords.oauthrelay.dev" => Some(Self::TransientRecord),
-            "authcodes.dex.coreos.com" => Some(Self::DexAuthCode),
-            _ => None,
-        }
-    }
 }
 
 const DEFAULT_KUBERNETES_SWEEP: Duration = Duration::from_secs(60);
@@ -296,21 +281,13 @@ fn parse_store_config(env: StoreEnv<'_>) -> anyhow::Result<StoreConfig> {
             })
         }
         Some("kubernetes") => {
-            let resource = match env.kubernetes_resource {
-                None => KubernetesResource::TransientRecord,
-                Some(name) => KubernetesResource::parse(name).ok_or_else(|| {
-                    anyhow!(
-                        "OAUTHRELAY_STORE_KUBERNETES_RESOURCE must be transientrecords.oauthrelay.dev or authcodes.dex.coreos.com, got {name:?}"
-                    )
-                })?,
-            };
             let sweep = match env.kubernetes_sweep {
                 None => Some(DEFAULT_KUBERNETES_SWEEP),
                 Some("off") => None,
                 Some(value) => Some(parse_duration("OAUTHRELAY_STORE_KUBERNETES_SWEEP", value)?),
             };
             Ok(StoreConfig::Kubernetes {
-                resource,
+                resource: env.kubernetes_resource.map(str::to_owned),
                 namespace: env.kubernetes_namespace.map(str::to_owned),
                 sweep,
             })
@@ -339,6 +316,7 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
         kubernetes_namespace: namespace.as_deref(),
         kubernetes_sweep: sweep.as_deref(),
     })?;
+    reject_kubernetes_on_lambda(&config, is_lambda_runtime())?;
     match config {
         StoreConfig::Memory => {
             if is_lambda_runtime() {
@@ -367,8 +345,14 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
             sweep,
         } => {
             use oauthrelay_provider_kubernetes::select_namespace;
-            use oauthrelay_store_kubernetes::{KubeClient, KubernetesStore, RecordMapping};
-            let config = kube_config().await?;
+            use oauthrelay_store_kubernetes::{KubeClient, KubernetesStore};
+            let mapping = kubernetes_mapping(resource.as_deref())?;
+            let mut config = kube_config().await?;
+            // The store bounds its own requests (`OPERATION_DEADLINE`). Kube's default retry
+            // layer would instead retry 429, 503 and 504 for as long as the server keeps
+            // answering them, honouring `Retry-After`: a stalled token request, and a claim
+            // that outlives its lease.
+            config.default_retry = false;
             // The provider's namespace is the natural home for records when it is enabled.
             let provider_namespace = if bool_env("OAUTHRELAY_PROVIDER_KUBERNETES", false)? {
                 env::var("OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE").ok()
@@ -379,20 +363,10 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
                 namespace.as_deref().or(provider_namespace.as_deref()),
                 &config.default_namespace,
             )?;
-            let mapping = match resource {
-                KubernetesResource::TransientRecord => RecordMapping::TransientRecord,
-                KubernetesResource::DexAuthCode => RecordMapping::DexAuthCode,
-            };
             let client =
                 KubeClient::new(kube::Client::try_from(config)?, namespace.clone(), mapping);
             let mut store = KubernetesStore::new(Arc::new(client));
             store.probe().await?;
-            let sweep = if is_lambda_runtime() {
-                // Lambda freezes the process between invocations, so a background task would not run.
-                None
-            } else {
-                sweep
-            };
             if let Some(interval) = sweep {
                 store = store.with_sweeper(interval);
             }
@@ -404,6 +378,38 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
             "OAUTHRELAY_STORE=kubernetes requires the oauthrelay kubernetes feature"
         )),
     }
+}
+
+/// Lambda freezes the process between invocations, so no background sweeper would run, and the
+/// Kubernetes store has no other way to delete expired records.
+fn reject_kubernetes_on_lambda(config: &StoreConfig, lambda: bool) -> anyhow::Result<()> {
+    if lambda && matches!(config, StoreConfig::Kubernetes { .. }) {
+        return Err(anyhow!(
+            "OAUTHRELAY_STORE=kubernetes is not supported on AWS Lambda: the process is frozen between invocations, so nothing would delete expired records. Use OAUTHRELAY_STORE=dynamodb, whose TTL deletes them"
+        ));
+    }
+    Ok(())
+}
+
+/// The store's mapping for `OAUTHRELAY_STORE_KUBERNETES_RESOURCE`.
+#[cfg(feature = "kubernetes")]
+fn kubernetes_mapping(
+    resource: Option<&str>,
+) -> anyhow::Result<oauthrelay_store_kubernetes::RecordMapping> {
+    use oauthrelay_store_kubernetes::RecordMapping;
+    let Some(name) = resource else {
+        return Ok(RecordMapping::TransientRecord);
+    };
+    RecordMapping::from_resource_name(name).ok_or_else(|| {
+        let supported: Vec<_> = RecordMapping::ALL
+            .iter()
+            .map(|mapping| mapping.resource_name())
+            .collect();
+        anyhow!(
+            "OAUTHRELAY_STORE_KUBERNETES_RESOURCE must be one of {}, got {name:?}",
+            supported.join(", ")
+        )
+    })
 }
 
 /// Credentials for the cluster: the pod's service account in a pod, else the active kubeconfig.
@@ -904,7 +910,7 @@ mod tests {
         assert_eq!(
             parse_store_config(store_env(Some("kubernetes"))).unwrap(),
             StoreConfig::Kubernetes {
-                resource: KubernetesResource::TransientRecord,
+                resource: None,
                 namespace: None,
                 sweep: Some(Duration::from_secs(60)),
             }
@@ -918,7 +924,7 @@ mod tests {
             })
             .unwrap(),
             StoreConfig::Kubernetes {
-                resource: KubernetesResource::TransientRecord,
+                resource: Some("transientrecords.oauthrelay.dev".into()),
                 namespace: Some("relay-state".into()),
                 sweep: Some(Duration::from_secs(300)),
             }
@@ -930,7 +936,7 @@ mod tests {
             })
             .unwrap(),
             StoreConfig::Kubernetes {
-                resource: KubernetesResource::TransientRecord,
+                resource: None,
                 namespace: None,
                 sweep: None,
             }
@@ -953,11 +959,27 @@ mod tests {
             })
             .unwrap(),
             StoreConfig::Kubernetes {
-                resource: KubernetesResource::DexAuthCode,
+                resource: Some("authcodes.dex.coreos.com".into()),
                 namespace: Some("dex".into()),
                 sweep: Some(Duration::from_secs(60)),
             }
         );
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn kubernetes_resource_names_select_a_store_mapping() {
+        use oauthrelay_store_kubernetes::RecordMapping;
+        assert_eq!(
+            kubernetes_mapping(None).unwrap(),
+            RecordMapping::TransientRecord
+        );
+        for mapping in RecordMapping::ALL {
+            assert_eq!(
+                kubernetes_mapping(Some(mapping.resource_name())).unwrap(),
+                mapping
+            );
+        }
         for resource in [
             "",
             "relays.oauthrelay.dev",
@@ -966,15 +988,40 @@ mod tests {
             "refreshtokens.dex.coreos.com",
             "AuthCodes.dex.coreos.com",
         ] {
+            let error = kubernetes_mapping(Some(resource)).unwrap_err().to_string();
             assert!(
-                parse_store_config(StoreEnv {
-                    kubernetes_resource: Some(resource),
-                    ..store_env(Some("kubernetes"))
-                })
-                .is_err(),
-                "{resource:?}"
+                error.contains("transientrecords.oauthrelay.dev, authcodes.dex.coreos.com"),
+                "{error}"
             );
         }
+    }
+
+    #[test]
+    fn the_kubernetes_store_is_rejected_on_lambda() {
+        let kubernetes = parse_store_config(store_env(Some("kubernetes"))).unwrap();
+        let error = reject_kubernetes_on_lambda(&kubernetes, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported on AWS Lambda"), "{error}");
+        assert!(error.contains("OAUTHRELAY_STORE=dynamodb"), "{error}");
+        // An explicit sweep setting does not make it acceptable.
+        let swept = parse_store_config(StoreEnv {
+            kubernetes_sweep: Some("30s"),
+            ..store_env(Some("kubernetes"))
+        })
+        .unwrap();
+        assert!(reject_kubernetes_on_lambda(&swept, true).is_err());
+        assert!(reject_kubernetes_on_lambda(&kubernetes, false).is_ok());
+        for kind in [None, Some("memory")] {
+            let config = parse_store_config(store_env(kind)).unwrap();
+            assert!(reject_kubernetes_on_lambda(&config, true).is_ok());
+        }
+        let dynamodb = parse_store_config(StoreEnv {
+            dynamodb_table: Some("oauthrelay-store"),
+            ..store_env(Some("dynamodb"))
+        })
+        .unwrap();
+        assert!(reject_kubernetes_on_lambda(&dynamodb, true).is_ok());
     }
 
     #[test]
