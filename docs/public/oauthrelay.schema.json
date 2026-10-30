@@ -155,7 +155,7 @@
               "type": "string"
             },
             "requireSingleUse": {
-              "description": "Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.\nRequires a replay cache shared by all serving instances; false permits reusable workload JWTs.",
+              "description": "Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.\nRequires a transient store shared by all serving instances; false permits reusable workload JWTs.",
               "type": "boolean"
             },
             "subject": {

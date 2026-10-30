@@ -1,8 +1,8 @@
 use crate::{
     model::valid_scope_token,
     refresh_handle::{has_handle_prefix, open_handle, seal_token_response, SubstitutionError},
-    ClientAuth, ClientJwks, RefreshTokenMode, Relay, ReplayCache, ResourceKey, ResourceResolver,
-    Sealer, Upstream,
+    ClientAuth, ClientJwks, RefreshTokenMode, Relay, ResourceKey, ResourceResolver, Sealer,
+    TransientStore, Upstream,
 };
 use axum::{
     body::Body,
@@ -25,6 +25,9 @@ use url::Url;
 
 const FLOW_TTL: u64 = 10 * 60;
 const CODE_TTL: u64 = 5 * 60;
+/// Key namespaces in the transient store, owned here rather than by the backends.
+const REPLAY_CODE_PREFIX: &str = "replay:code:";
+const REPLAY_ASSERTION_PREFIX: &str = "replay:client-assertion:";
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
@@ -53,7 +56,10 @@ impl Default for ClientAssertionHttpClient {
 pub struct RelayConfig {
     pub public_url: Url,
     pub sealer: Arc<dyn Sealer>,
-    pub replay_cache: Option<Arc<dyn ReplayCache>>,
+    /// Shared state for single-use enforcement. Without one, authorization codes stay valid for
+    /// their five-minute lifetime and `requireSingleUse` client assertions are rejected. Every
+    /// serving instance must share the same backing store to get deployment-wide guarantees.
+    pub store: Option<Arc<dyn TransientStore>>,
     pub http: reqwest::Client,
     pub client_assertion_http: ClientAssertionHttpClient,
     pub allow_localhost_loopback: bool,
@@ -788,16 +794,34 @@ async fn exchange_sealed_code(
             "ID token validation is unavailable",
         );
     }
-    if let Some(cache) = &state.cfg.replay_cache {
-        let id = URL_SAFE_NO_PAD.encode(envelope.envelope_id);
-        match cache.first_use(&id, Duration::from_secs(CODE_TTL)).await {
+    if let Some(store) = &state.cfg.store {
+        let key = format!(
+            "{REPLAY_CODE_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(envelope.envelope_id)
+        );
+        // A random marker keeps the value unique to this redemption, as the store contract
+        // requires: a backend that resolves an ambiguous conditional write by comparing values
+        // would otherwise accept a replay of the same code as its own earlier write.
+        match store
+            .put_if_absent(&key, &random_array::<16>(), Duration::from_secs(CODE_TTL))
+            .await
+        {
             Ok(true) => {}
-            _ => {
+            Ok(false) => {
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
                     "code was already used",
                 )
+            }
+            Err(error) => {
+                // The code stays unconsumed, so the client may retry once the store recovers.
+                tracing::error!(?error, "authorization-code replay check failed");
+                return oauth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "replay protection is unavailable",
+                );
             }
         }
     }
@@ -1264,10 +1288,10 @@ async fn verify_private_key_jwt(
         if expires_at <= issued_at || expires_at - issued_at > 300 {
             return Err(());
         }
-        let cache = state.cfg.replay_cache.as_ref().ok_or(())?;
+        let store = state.cfg.store.as_ref().ok_or(())?;
         let identity = serde_json::to_vec(&(issuer, subject, audience, jti)).map_err(|_| ())?;
-        let id = format!(
-            "client-assertion:{}",
+        let key = format!(
+            "{REPLAY_ASSERTION_PREFIX}{}",
             URL_SAFE_NO_PAD.encode(Sha256::digest(identity))
         );
         // Retain through the entire acceptance window, including expiration clock skew.
@@ -1275,12 +1299,17 @@ async fn verify_private_key_jwt(
             .saturating_add(validation.leeway)
             .saturating_sub(unix_now())
             .saturating_add(1);
-        if !cache
-            .first_use(&id, Duration::from_secs(ttl))
+        // Unique to this presentation, as for authorization codes.
+        match store
+            .put_if_absent(&key, &random_array::<16>(), Duration::from_secs(ttl))
             .await
-            .map_err(|_| ())?
         {
-            return Err(());
+            Ok(true) => {}
+            Ok(false) => return Err(()),
+            Err(error) => {
+                tracing::error!(?error, "client assertion replay check failed");
+                return Err(());
+            }
         }
     }
     Ok(())

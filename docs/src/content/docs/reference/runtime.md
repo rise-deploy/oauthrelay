@@ -26,6 +26,8 @@ for namespace selection, refresh settings, CRD installation, and deployment exam
 | `OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE` | no | pod or kubeconfig namespace | Single namespace consumed by the Kubernetes provider. |
 | `OAUTHRELAY_PROVIDER_KUBERNETES_REFRESH` | no | `60s` | Secret refresh and failed-compilation retry interval. |
 | `OAUTHRELAY_LAMBDA_CONFIG_TTL` | no | `60s` | Maximum Lambda snapshot age before invocation-driven refresh. |
+| `OAUTHRELAY_STORE` | no | `memory` | Transient store backend for single-use state: `memory` or `dynamodb`. |
+| `OAUTHRELAY_STORE_DYNAMODB_TABLE` | with `dynamodb` | — | DynamoDB table holding transient records; see [Transient store](/oauthrelay/reference/transient-store/). |
 | `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` | no | `false` | Treat `localhost` as an alias for configured IP-literal loopback redirect matchers. |
 | `OAUTHRELAY_LOG` | no | `info` | `tracing` filter. |
 
@@ -36,7 +38,7 @@ Provider collision precedence is File, SSM, then Kubernetes.
 ## Build features
 
 The standalone crate enables `aws`, `lambda`, and `kubernetes` by default. `aws` supplies SSM resource
-discovery and AWS secret resolution for all providers. A native File-only build without AWS
+discovery, AWS secret resolution for all providers, and the DynamoDB transient store. A native File-only build without AWS
 SDK dependencies uses `--no-default-features`; in that build, File resources can use inline,
 environment, and file secrets, while AWS secret references fail configuration validation.
 
@@ -81,6 +83,13 @@ Configure an API Gateway HTTP API or Lambda Function URL to forward every oauthr
 function role needs the permissions documented by the selected provider. The default binary
 includes the Lambda Runtime API client.
 
+The default memory transient store lives inside one execution environment, and Lambda runs several
+at once under load, so an authorization code could be redeemed once in each. Set
+`OAUTHRELAY_STORE=dynamodb` and `OAUTHRELAY_STORE_DYNAMODB_TABLE`, and grant the function role the
+table permissions in [Transient store](/oauthrelay/reference/transient-store/), to make codes
+single-use across all environments. oauthrelay logs a warning at startup when it runs on Lambda
+with the memory store.
+
 ## Sealing-key rotation
 
 The ten-minute flow envelope is carried by the upstream OAuth `state` parameter. The five-minute
@@ -94,7 +103,7 @@ To rotate keys, set the new key as `OAUTHRELAY_SEAL_KEY` and the prior key as
 `OAUTHRELAY_SEAL_KEY_PREVIOUS`. Keep the prior key available for at least ten minutes, then remove it
 after envelopes created with it have expired.
 
-The standalone runtime stores only used authorization-code envelope IDs in an in-memory replay
-cache. Authorization codes are single-use within one native process or one warm Lambda execution
-environment. Deployments requiring global single-use semantics need a shared `ReplayCache`
-implementation through the embeddable core.
+The standalone runtime records only used authorization-code envelope IDs, in the
+[transient store](/oauthrelay/reference/transient-store/). With the default memory store, codes are
+single-use within one native process or one warm Lambda execution environment. Set
+`OAUTHRELAY_STORE=dynamodb` for single use across replicas, Lambda environments, and restarts.

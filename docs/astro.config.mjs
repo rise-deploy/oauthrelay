@@ -38,6 +38,7 @@ export default defineConfig({
             { label: 'AWS SSM provider', slug: 'reference/ssm-provider' },
             { label: 'Kubernetes provider', slug: 'reference/kubernetes-provider' },
             { label: 'Runtime and deployment', slug: 'reference/runtime' },
+            { label: 'Transient store', slug: 'reference/transient-store' },
             { label: 'HTTP endpoints', slug: 'reference/http-endpoints' },
           ],
         },

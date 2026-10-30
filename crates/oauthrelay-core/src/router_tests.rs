@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     refresh_handle::{open_handle, seal_handle},
-    ClientAuth, MemoryReplayCache, ProviderSnapshot, RedirectMatcher, RefreshTokenMode,
-    RefreshTokens, SecretString, Upstream, XChaChaSealer,
+    ClientAuth, MemoryStore, ProviderSnapshot, RedirectMatcher, RefreshTokenMode, RefreshTokens,
+    SecretString, Upstream, XChaChaSealer,
 };
 use axum::{
     body::Body,
@@ -443,7 +443,7 @@ async fn setup_signed_policy(
         RelayConfig {
             public_url: Url::parse("https://relay.example/").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
-            replay_cache: Some(Arc::new(MemoryReplayCache::default())),
+            store: Some(Arc::new(MemoryStore::default())),
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
@@ -493,6 +493,32 @@ async fn setup_with_refresh_tokens(
     allowed_scopes: Option<Vec<String>>,
     endpoint_configuration: EndpointConfiguration,
     refresh_tokens: RefreshTokens,
+) -> (
+    Router,
+    Arc<XChaChaSealer>,
+    tokio::task::JoinHandle<()>,
+    MockCapture,
+) {
+    setup_with_store(
+        key,
+        auth,
+        strategy,
+        allowed_scopes,
+        endpoint_configuration,
+        refresh_tokens,
+        Arc::new(MemoryStore::default()),
+    )
+    .await
+}
+
+async fn setup_with_store(
+    key: &str,
+    auth: ClientAuth,
+    strategy: KeyStrategy,
+    allowed_scopes: Option<Vec<String>>,
+    endpoint_configuration: EndpointConfiguration,
+    refresh_tokens: RefreshTokens,
+    store: Arc<dyn TransientStore>,
 ) -> (
     Router,
     Arc<XChaChaSealer>,
@@ -556,7 +582,7 @@ async fn setup_with_refresh_tokens(
         RelayConfig {
             public_url: Url::parse("https://relay.example/").unwrap(),
             sealer: sealer.clone(),
-            replay_cache: Some(Arc::new(MemoryReplayCache::default())),
+            store: Some(store),
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
@@ -614,7 +640,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
         RelayConfig {
             public_url: Url::parse("https://relay.example/custom/base").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
-            replay_cache: None,
+            store: None,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
@@ -1028,6 +1054,164 @@ async fn passthrough_mode_returns_the_upstream_refresh_token_unchanged() {
     assert_eq!(
         response_body(response).await,
         br#"{"token_type":"Bearer","refresh_token":"rotated","access_token":"refreshed","expires_in":3600}"#
+    );
+    task.abort();
+}
+
+/// Fails the first `put_if_absent`, then behaves like the wrapped store.
+struct FlakyStore {
+    inner: MemoryStore,
+    failures: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl TransientStore for FlakyStore {
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<bool, crate::StoreError> {
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(crate::StoreError::Backend(anyhow::anyhow!("unavailable")));
+        }
+        self.inner.put_if_absent(key, value, ttl).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<crate::Entry>, crate::StoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: &[u8],
+        new: &[u8],
+        ttl: Duration,
+    ) -> Result<bool, crate::StoreError> {
+        self.inner.compare_and_swap(key, expected, new, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), crate::StoreError> {
+        self.inner.delete(key).await
+    }
+}
+
+/// Resolves a failed `put_if_absent` the way the DynamoDB store resolves an ambiguous conditional
+/// write: a live record holding exactly the bytes being written counts as this caller's own write.
+#[derive(Default)]
+struct ValueResolvingStore(MemoryStore);
+
+#[async_trait::async_trait]
+impl TransientStore for ValueResolvingStore {
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<bool, crate::StoreError> {
+        if self.0.put_if_absent(key, value, ttl).await? {
+            return Ok(true);
+        }
+        Ok(self
+            .0
+            .get(key)
+            .await?
+            .is_some_and(|entry| entry.value == value))
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<crate::Entry>, crate::StoreError> {
+        self.0.get(key).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected: &[u8],
+        new: &[u8],
+        ttl: Duration,
+    ) -> Result<bool, crate::StoreError> {
+        self.0.compare_and_swap(key, expected, new, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), crate::StoreError> {
+        self.0.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn code_replay_is_rejected_by_a_store_that_resolves_writes_by_value() {
+    let (app, _, task, _) = setup_with_store(
+        "google",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+        RefreshTokens::default(),
+        Arc::new(ValueResolvingStore::default()),
+    )
+    .await;
+    let verifier = "a-public-verifier-with-enough-entropy-123456789";
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(verifier))).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", "https://app.example/callback"),
+        ("code_verifier", verifier),
+    ])
+    .unwrap();
+    assert!(post_token(&app, "google", &form)
+        .await
+        .status()
+        .is_success());
+    let replay = post_token(&app, "google", &form).await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+    assert_eq!(body["error_description"], "code was already used");
+    task.abort();
+}
+
+#[tokio::test]
+async fn store_failure_is_retryable_and_leaves_the_code_unconsumed() {
+    let (app, _, task, _) = setup_with_store(
+        "google",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+        RefreshTokens::default(),
+        Arc::new(FlakyStore {
+            inner: MemoryStore::default(),
+            failures: AtomicUsize::new(1),
+        }),
+    )
+    .await;
+    let verifier = "a-public-verifier-with-enough-entropy-123456789";
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(verifier))).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", "https://app.example/callback"),
+        ("code_verifier", verifier),
+    ])
+    .unwrap();
+    let unavailable = post_token(&app, "google", &form).await;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = serde_json::from_slice(&response_body(unavailable).await).unwrap();
+    assert_eq!(body["error"], "server_error");
+    assert_eq!(
+        post_token(&app, "google", &form).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        post_token(&app, "google", &form).await.status(),
+        StatusCode::BAD_REQUEST
     );
     task.abort();
 }
@@ -2412,13 +2596,14 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     let source = ClientJwks::Inline(json!({"keys": [{"kty":"RSA",
         "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
         "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]}));
-    let cache = Arc::new(MemoryReplayCache::default());
-    let make_state = |replay_cache| AppState {
+    // Resolves writes by value like the DynamoDB store, so a constant replay marker would pass.
+    let cache = Arc::new(ValueResolvingStore::default());
+    let make_state = |store| AppState {
         resolver: Arc::new(ProviderSnapshot::default()),
         cfg: Arc::new(RelayConfig {
             public_url: "https://relay.example/".parse().unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
-            replay_cache,
+            store,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
@@ -2427,9 +2612,9 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
         cache: Arc::new(Mutex::new(HashMap::new())),
         assertion_cache: Arc::default(),
     };
-    let state = make_state(Some(cache.clone() as Arc<dyn ReplayCache>));
+    let state = make_state(Some(cache.clone() as Arc<dyn TransientStore>));
     let other_instance = make_state(Some(cache));
-    let no_cache = make_state(None);
+    let no_store = make_state(None);
     let now = unix_now();
     let claims = json!({"iss":"client", "sub":"client", "aud":"relay",
         "iat":now, "exp":now + 300, "jti":"request-1"});
@@ -2463,7 +2648,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     }
     let assertion = sign(&claims);
     assert!(verify_private_key_jwt(
-        &no_cache,
+        &no_store,
         "relay",
         "client",
         "client",
@@ -2507,14 +2692,14 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     )
     .await
     .is_ok());
-    // Workload assertions remain reusable without a replay cache or per-request claims.
+    // Workload assertions remain reusable without a transient store or per-request claims.
     let mut workload = claims.clone();
     workload.as_object_mut().unwrap().remove("jti");
     workload.as_object_mut().unwrap().remove("iat");
     workload["exp"] = json!(now + 3600);
     for _ in 0..2 {
         assert!(verify_private_key_jwt(
-            &no_cache,
+            &no_store,
             "relay",
             "client",
             "client",
@@ -2533,7 +2718,7 @@ fn assertion_test_state() -> AppState {
         cfg: Arc::new(RelayConfig {
             public_url: "https://relay.example/".parse().unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
-            replay_cache: None,
+            store: None,
             http: reqwest::Client::new(),
             // Even a caller-supplied redirect policy cannot enable redirects for trust data.
             client_assertion_http: ClientAssertionHttpClient::new(

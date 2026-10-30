@@ -50,6 +50,7 @@ configuration; Amazon Cognito is one example.
 - [Kubernetes provider](https://rise-deploy.github.io/oauthrelay/reference/kubernetes-provider/)
 - [AWS SSM provider](https://rise-deploy.github.io/oauthrelay/reference/ssm-provider/)
 - [Runtime and deployment](https://rise-deploy.github.io/oauthrelay/reference/runtime/)
+- [Transient store](https://rise-deploy.github.io/oauthrelay/reference/transient-store/)
 - [HTTP endpoints](https://rise-deploy.github.io/oauthrelay/reference/http-endpoints/)
 
 The executable publishes its configuration contract directly:
@@ -98,8 +99,10 @@ crates/oauthrelay-secret-resolver/ shared inline, environment, file, and cloud s
 crates/oauthrelay-provider-file/ File configuration provider
 crates/oauthrelay-provider-ssm/  AWS SSM and Secrets Manager provider
 crates/oauthrelay-provider-kubernetes/ Namespaced Kubernetes provider
+crates/oauthrelay-store-dynamodb/ Amazon DynamoDB transient store
 crates/oauthrelay/               standalone native and Lambda runtime
 ```
 
-The core exposes resolver and replay-cache seams for hosts that need database-backed configuration
-or distributed single-use authorization codes.
+The core exposes resolver and transient-store seams for hosts that need database-backed
+configuration or distributed single-use authorization codes. The standalone binary offers an
+in-memory store (default) and a DynamoDB store for this state.
