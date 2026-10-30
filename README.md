@@ -90,7 +90,8 @@ annotated `v<version>` tag, pushes to `origin`, and creates a GitHub release wit
 The regular test suite uses in-process OAuth/OIDC fixtures. `mise run e2e` runs the standalone
 binary through a complete authorization-code and refresh flow against a pinned Dex container. No
 test contacts Google or Amazon Cognito. `mise run kubernetes:test` validates generated CRDs and
-namespace-scoped configuration watches in a disposable Kind cluster.
+namespace-scoped configuration watches in a disposable Kind cluster, and runs the Kubernetes
+transient store, including its Dex `AuthCode` mapping against a real Dex.
 
 The workspace contains:
 

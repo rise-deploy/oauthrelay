@@ -354,6 +354,11 @@ a URL a client could register; and the object has empty claims, so there is no i
 tokens for. On Dex before 2.46.0 the device callback skips the check that matters. The mapping
 also relies on no Dex client being configured with that ID.
 
+These behaviours are exercised against a real Dex (v2.46.1, Kubernetes storage) in the project's
+Kind CI job: Dex keeps working with the records present, its token endpoint and device callback
+refuse them, its garbage collector deletes expired ones, and expired Dex codes are still collected
+when more than 500 oauthrelay records are live.
+
 **Trust.** The service account needs `get`, `list`, `create`, `update`, and `delete` on `authcodes`
 in Dex's namespace, and Kubernetes RBAC cannot narrow that to the objects oauthrelay wrote. The
 same grant lets oauthrelay read Dex's own live authorization codes, which carry the user's claims
