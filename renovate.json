@@ -1,3 +1,93 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json"
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "lockFileMaintenance": {
+    "description": "Refresh transitive pins in Cargo.lock and docs/package-lock.json, which no package-file bump moves. Automerged once CI is green.",
+    "enabled": true,
+    "schedule": [
+      "* * 1 * *"
+    ],
+    "automerge": true
+  },
+  "packageRules": [
+    {
+      "description": "Automerge every update except major bumps once CI is green. A release must be three days old first, so a compromised or yanked version has time to be caught before it lands unattended.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "automerge": true,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Cargo treats a 0.x minor bump (0.22 to 0.23) as breaking, so it is reviewed like a major one. Patch bumps within 0.x stay automerged.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": [
+        "minor"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Group the Rust toolchain (mise.toml and the Dockerfile build image)",
+      "matchDepNames": [
+        "rust"
+      ],
+      "groupName": "rust"
+    },
+    {
+      "description": "Group non-major Rust dependency updates",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "matchCurrentVersion": "!/^0\\./",
+      "groupName": "Rust dependencies"
+    },
+    {
+      "description": "Group non-major npm dependency updates",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "npm dependencies"
+    },
+    {
+      "description": "Group non-major Docker image updates",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "Docker images"
+    },
+    {
+      "description": "Group non-major GitHub Actions updates",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "GitHub Actions"
+    }
+  ]
 }
