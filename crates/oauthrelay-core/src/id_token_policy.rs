@@ -490,10 +490,22 @@ mod tests {
         let policy: IdTokenPolicy = serde_json::from_value(value.clone()).unwrap();
         policy.validate().unwrap();
         assert_eq!(serde_json::to_value(&policy).unwrap(), value);
-        let schema = serde_json::to_string(&schemars::schema_for!(IdTokenPolicy)).unwrap();
-        for operator in ["arrayContainsAny", "arrayContainsAll", "arrayLikeAny"] {
-            assert!(schema.contains(operator), "{operator}");
+        let schema = serde_json::to_value(schemars::schema_for!(IdTokenPolicy)).unwrap();
+        let branches = schema["$defs"]["IdTokenClaimMatcher"]["anyOf"]
+            .as_array()
+            .expect("matcher variants");
+        let branch = |operator: &str| {
+            branches
+                .iter()
+                .find_map(|branch| branch["properties"].get(operator))
+                .unwrap_or_else(|| panic!("{operator} missing from the schema"))
+        };
+        for operator in ["arrayContainsAny", "arrayContainsAll"] {
+            assert_eq!(branch(operator)["type"], "array", "{operator}");
+            assert_eq!(branch(operator)["minItems"], 1, "{operator}");
+            assert_eq!(branch(operator)["items"]["type"], "string", "{operator}");
         }
+        assert_eq!(branch("arrayLikeAny")["type"], "string");
     }
 
     #[test]

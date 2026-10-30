@@ -189,10 +189,12 @@ syntax, path-separator handling, or implicit email normalization. For example,
 or `guest-a@example.net.evil`. Use Google's signed `hd` claim when checking Workspace membership;
 an email-address suffix alone does not establish it.
 
-The array operators are for claims such as `groups`. A claim that is absent, is not an array, or is
-an array with any non-string element fails the matcher (`wrong_type`), and the string operators
-likewise reject an array claim. An empty array never satisfies an array operator, including
-`arrayContainsAll`. `arrayLikeAny` uses the `stringLike` glob semantics for each element. For
+The array operators are for claims such as `groups`. An absent claim fails the matcher
+(`missing_claim`); a claim that is `null`, is not an array, or is an array with any non-string
+element fails it as `wrong_type`, and the string operators likewise reject an array claim. An empty
+array never satisfies an array operator, including `arrayContainsAll`. Providers that leave the claim
+out under some conditions (Microsoft Entra ID omits `groups` for users in more groups than fit in a
+token) are therefore denied for those users. `arrayLikeAny` uses the `stringLike` glob semantics for each element. For
 example, to admit verified users in the `admins` or `ops` group:
 
 ```yaml
