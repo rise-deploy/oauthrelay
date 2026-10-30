@@ -3223,6 +3223,415 @@ fn basic_authorization_form_urlencodes_both_credentials() {
     assert!(value.is_sensitive());
 }
 
+/// `Authorization: Basic` as RFC 6749 section 2.3.1 builds it: form-urlencode each credential, join
+/// with `:`, base64-encode.
+fn basic_header(id: &str, secret: &str) -> String {
+    let encode =
+        |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    format!(
+        "Basic {}",
+        STANDARD.encode(format!("{}:{}", encode(id), encode(secret)))
+    )
+}
+
+fn basic_header_for_raw(credentials: &[u8]) -> String {
+    format!("Basic {}", STANDARD.encode(credentials))
+}
+
+async fn post_token_with_authorization(
+    app: &Router,
+    path_key: &str,
+    authorization: &[&[u8]],
+    form: &str,
+) -> Response {
+    let mut request = Request::post(format!("/relay/{path_key}/token"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::ORIGIN, "https://app.example");
+    for value in authorization {
+        request = request.header(
+            header::AUTHORIZATION,
+            HeaderValue::from_bytes(value).unwrap(),
+        );
+    }
+    app.clone()
+        .oneshot(request.body(Body::from(form.to_owned())).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn error_code(response: Response) -> String {
+    let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    body["error"].as_str().unwrap().to_owned()
+}
+
+const APPLICATION_AUTH: fn() -> ClientAuth = || ClientAuth::ClientSecret {
+    client_id: "application".into(),
+    client_secret: SecretString::new("application-secret"),
+};
+
+fn code_form(code: &str) -> String {
+    serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", "https://app.example/callback"),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn basic_client_authentication_covers_code_exchange_and_refresh_for_client_secret_relays() {
+    let (app, _, task, capture) = setup_with_upstream_auth(
+        "github",
+        APPLICATION_AUTH(),
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+        RefreshTokens::default(),
+        Arc::new(MemoryStore::default()),
+        TokenEndpointAuthMethod::ClientSecretBasic,
+    )
+    .await;
+    let basic = basic_header("application", "application-secret");
+    let code = authorization_code(&app, "github", None).await;
+    let response =
+        post_token_with_authorization(&app, "github", &[basic.as_bytes()], &code_form(&code)).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = post_token_with_authorization(
+        &app,
+        "github",
+        &[basic.as_bytes()],
+        "grant_type=refresh_token&refresh_token=refresh&scope=openid",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // The relying party's header is never forwarded: the upstream saw only its own credentials.
+    assert_basic_upstream_requests(&capture, 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn basic_client_authentication_covers_code_exchange_and_refresh_for_upstream_client_relays() {
+    let (app, _, task, capture) = setup_with_capture(
+        "github",
+        ClientAuth::UpstreamClient,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+    )
+    .await;
+    let basic = basic_header("upstream-client", "upstream-secret");
+    let code = authorization_code(&app, "github", None).await;
+    let response =
+        post_token_with_authorization(&app, "github", &[basic.as_bytes()], &code_form(&code)).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = post_token_with_authorization(
+        &app,
+        "github",
+        &[basic.as_bytes()],
+        "grant_type=refresh_token&refresh_token=refresh",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // The upstream is configured for form-body credentials: nothing from the header reaches it.
+    assert!(capture
+        .authorization
+        .lock()
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    let forms = capture.token.lock().unwrap().clone();
+    assert_eq!(forms.len(), 2);
+    for form in forms {
+        assert!(form.contains(&("client_id".into(), "upstream-client".into())));
+        assert!(form.contains(&("client_secret".into(), "upstream-secret".into())));
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn basic_client_authentication_rejects_wrong_credentials_with_a_challenge() {
+    let (app, _, task) = setup("github", APPLICATION_AUTH(), KeyStrategy::SingleSegment).await;
+    let refresh = "grant_type=refresh_token&refresh_token=refresh";
+    for (id, secret) in [
+        ("application", "wrong"),
+        ("someone-else", "application-secret"),
+        ("application", ""),
+        ("", ""),
+    ] {
+        let basic = basic_header(id, secret);
+        let response =
+            post_token_with_authorization(&app, "github", &[basic.as_bytes()], refresh).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{id}:{secret}");
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Basic realm=\"oauthrelay\""
+        );
+        assert_eq!(error_code(response).await, "invalid_client");
+    }
+    // Body credentials keep the response without a challenge.
+    let response = post_token(
+        &app,
+        "github",
+        &format!("{refresh}&client_id=application&client_secret=wrong"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+    assert_eq!(error_code(response).await, "invalid_client");
+    task.abort();
+}
+
+#[tokio::test]
+async fn upstream_client_relay_rejects_wrong_basic_credentials() {
+    let (app, _, task) = setup(
+        "github",
+        ClientAuth::UpstreamClient,
+        KeyStrategy::SingleSegment,
+    )
+    .await;
+    let basic = basic_header("upstream-client", "wrong");
+    let response = post_token_with_authorization(
+        &app,
+        "github",
+        &[basic.as_bytes()],
+        "grant_type=refresh_token&refresh_token=refresh",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+    task.abort();
+}
+
+#[tokio::test]
+async fn header_and_body_credentials_together_are_an_invalid_request() {
+    for auth in [APPLICATION_AUTH(), ClientAuth::UpstreamClient] {
+        let (id, secret) = match &auth {
+            ClientAuth::UpstreamClient => ("upstream-client", "upstream-secret"),
+            _ => ("application", "application-secret"),
+        };
+        let (app, _, task) = setup("github", auth, KeyStrategy::SingleSegment).await;
+        let basic = basic_header(id, secret);
+        let refresh = "grant_type=refresh_token&refresh_token=refresh";
+        let conflicting = [
+            format!("{refresh}&client_id={id}&client_secret={secret}"),
+            format!("{refresh}&client_secret={secret}"),
+            format!("{refresh}&client_id=another-client"),
+            format!("{refresh}&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion=x"),
+        ];
+        for form in conflicting {
+            let response =
+                post_token_with_authorization(&app, "github", &[basic.as_bytes()], &form).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{form}");
+            assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+            assert_eq!(error_code(response).await, "invalid_request");
+        }
+        // A body `client_id` that repeats the header's identifies the client; it is not a second
+        // credential.
+        let form = format!("{refresh}&client_id={id}");
+        let response =
+            post_token_with_authorization(&app, "github", &[basic.as_bytes()], &form).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn malformed_authorization_headers_are_invalid_client_with_a_challenge() {
+    let (app, _, task) = setup("github", APPLICATION_AUTH(), KeyStrategy::SingleSegment).await;
+    let valid = basic_header("application", "application-secret");
+    let malformed: Vec<Vec<Vec<u8>>> = vec![
+        vec![b"Bearer application-secret".to_vec()],
+        vec![b"Basic".to_vec()],
+        vec![b"Basic ".to_vec()],
+        vec![b"Basic !!!not-base64!!!".to_vec()],
+        vec![b"Basic YXBwbGljYXRpb24".to_vec()],
+        vec![basic_header_for_raw(b"application-without-colon").into_bytes()],
+        vec![basic_header_for_raw(b"application:application%zzsecret").into_bytes()],
+        vec![basic_header_for_raw(b"application:application%2").into_bytes()],
+        vec![basic_header_for_raw(b"application%:secret").into_bytes()],
+        vec![basic_header_for_raw(b"application:\xff\xfe").into_bytes()],
+        vec![basic_header_for_raw(b"application:application%FF").into_bytes()],
+        vec![b"Basic \xff".to_vec()],
+        vec![valid.clone().into_bytes(), valid.clone().into_bytes()],
+    ];
+    for headers in malformed {
+        let values: Vec<&[u8]> = headers.iter().map(Vec::as_slice).collect();
+        let response = post_token_with_authorization(
+            &app,
+            "github",
+            &values,
+            "grant_type=refresh_token&refresh_token=refresh",
+        )
+        .await;
+        let shown = format!("{headers:?}");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{shown}");
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Basic realm=\"oauthrelay\"",
+            "{shown}"
+        );
+        assert_eq!(error_code(response).await, "invalid_client", "{shown}");
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn basic_authorization_accepts_any_scheme_case_and_both_space_encodings() {
+    let auth = ClientAuth::ClientSecret {
+        client_id: "application".into(),
+        client_secret: SecretString::new("a b"),
+    };
+    let (app, _, task) = setup("github", auth, KeyStrategy::SingleSegment).await;
+    let refresh = "grant_type=refresh_token&refresh_token=refresh";
+    for credentials in [
+        "application:a+b",
+        "application:a%20b",
+        "application:%61%20b",
+    ] {
+        for scheme in ["Basic", "basic", "BASIC"] {
+            let value = format!("{scheme} {}", STANDARD.encode(credentials));
+            let response =
+                post_token_with_authorization(&app, "github", &[value.as_bytes()], refresh).await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{value}");
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn basic_credentials_round_trip_special_characters() {
+    let id = "client:id/with space";
+    let secret = "se+cret %/é:&=\u{1f512}";
+    let auth = ClientAuth::ClientSecret {
+        client_id: id.into(),
+        client_secret: SecretString::new(secret),
+    };
+    let (app, _, task) = setup("github", auth, KeyStrategy::SingleSegment).await;
+    let refresh = "grant_type=refresh_token&refresh_token=refresh";
+    let basic = basic_header(id, secret);
+    let response =
+        post_token_with_authorization(&app, "github", &[basic.as_bytes()], refresh).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // The same credentials without the percent-encoding are a different secret.
+    let unencoded = basic_header_for_raw(format!("{id}:{secret}").as_bytes());
+    let response =
+        post_token_with_authorization(&app, "github", &[unencoded.as_bytes()], refresh).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    task.abort();
+}
+
+#[tokio::test]
+async fn public_relay_rejects_a_basic_authorization_header() {
+    let (app, _, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
+    let refresh = "grant_type=refresh_token&refresh_token=refresh";
+    for value in [
+        basic_header("public-application", "secret"),
+        basic_header("public-application", ""),
+        "basic !!!".to_owned(),
+    ] {
+        let response =
+            post_token_with_authorization(&app, "google", &[value.as_bytes()], refresh).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{value}");
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Basic realm=\"oauthrelay\""
+        );
+        assert_eq!(error_code(response).await, "invalid_client");
+    }
+    // Other schemes are not client credentials and are ignored, as the relay never reads them.
+    let response = post_token_with_authorization(&app, "google", &[b"Bearer token"], refresh).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    task.abort();
+}
+
+#[tokio::test]
+async fn private_key_jwt_relay_does_not_read_the_authorization_header() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let jwks = json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "application-key",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())
+        }]
+    });
+    let auth = ClientAuth::PrivateKeyJwt {
+        require_single_use: false,
+        client_id: "jwt-application".into(),
+        issuer: None,
+        subject: None,
+        audience: None,
+        jwks: Some(ClientJwks::Inline(jwks)),
+    };
+    let (app, _, task) = setup("jwt", auth, KeyStrategy::SingleSegment).await;
+    let basic = basic_header("jwt-application", "anything");
+    // A Basic header is not a credential here.
+    let response = post_token_with_authorization(
+        &app,
+        "jwt",
+        &[basic.as_bytes()],
+        "grant_type=refresh_token&refresh_token=refresh",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+    // A valid assertion authenticates whatever the header says.
+    let claims = json!({
+        "iss": "jwt-application",
+        "sub": "jwt-application",
+        "aud": "https://relay.example/relay/jwt/token",
+        "exp": unix_now() + 60,
+        "iat": unix_now(),
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("application-key".into());
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let assertion = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "refresh"),
+        ("client_id", "jwt-application"),
+        (
+            "client_assertion_type",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        ),
+        ("client_assertion", assertion.as_str()),
+    ])
+    .unwrap();
+    let response = post_token_with_authorization(&app, "jwt", &[basic.as_bytes()], &form).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    task.abort();
+}
+
+#[test]
+fn basic_credentials_parse_strictly() {
+    let parse = |value: &str| parse_basic_credentials(value.as_bytes());
+    assert_eq!(
+        parse(&basic_header("a:b", "c d")),
+        Some(("a:b".into(), "c d".into()))
+    );
+    assert_eq!(
+        parse(&format!("Basic   {}", STANDARD.encode("a:b"))),
+        Some(("a".into(), "b".into()))
+    );
+    // Only the first colon separates; an unencoded colon in the secret stays part of it.
+    assert_eq!(
+        parse(&basic_header_for_raw(b"a:b:c")),
+        Some(("a".into(), "b:c".into()))
+    );
+    assert_eq!(parse("Basic"), None);
+    assert_eq!(parse("Basicdmc6Yg=="), None);
+    assert_eq!(form_urldecode(b"%e9"), None);
+    assert_eq!(form_urldecode(b"%C3%A9+x").as_deref(), Some("é x"));
+}
+
 #[tokio::test]
 async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
     let (app, sealer, task, _) = setup_sealed(ClientAuth::Public).await;

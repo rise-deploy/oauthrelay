@@ -663,7 +663,8 @@ async fn token(
     request: Request<Body>,
 ) -> Response {
     let origin = allowed_cors_origin(relay, request.headers(), state.cfg.allow_localhost_loopback);
-    let bytes = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(_) => {
             return with_cors(
@@ -685,16 +686,8 @@ async fn token(
             )
         }
     };
-    let auth_result = authenticate(state, relay, upstream, &form).await;
-    if auth_result.is_err() {
-        return with_cors(
-            oauth_error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_client",
-                "client authentication failed",
-            ),
-            origin,
-        );
+    if let Err(failure) = authenticate(state, relay, upstream, &form, &parts.headers).await {
+        return with_cors(failure.into_response(), origin);
     }
     let response = match form.grant_type.as_str() {
         "authorization_code" => exchange_sealed_code(state, relay, upstream, &form).await,
@@ -1286,51 +1279,165 @@ fn refresh_state_unavailable() -> Response {
     )
 }
 
+/// Why a token request failed client authentication.
+enum AuthFailure {
+    /// The credentials are wrong or malformed. `via_header` is set when the client used the
+    /// `Authorization` header, which RFC 6749 section 5.2 answers with `WWW-Authenticate`.
+    InvalidClient { via_header: bool },
+    /// The request presents credentials by more than one method (RFC 6749 section 2.3).
+    MultipleMethods,
+}
+
+impl AuthFailure {
+    fn into_response(self) -> Response {
+        match self {
+            AuthFailure::InvalidClient { via_header } => {
+                let mut response = oauth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "client authentication failed",
+                );
+                if via_header {
+                    response.headers_mut().insert(
+                        header::WWW_AUTHENTICATE,
+                        HeaderValue::from_static("Basic realm=\"oauthrelay\""),
+                    );
+                }
+                response
+            }
+            AuthFailure::MultipleMethods => oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "client credentials must use exactly one authentication method",
+            ),
+        }
+    }
+}
+
+/// The client ID and secret of a password-style relay, from the `Authorization: Basic` header or
+/// the form body, never both.
+fn password_credentials(
+    headers: &HeaderMap,
+    form: &TokenRequest,
+) -> Result<(String, String, bool), AuthFailure> {
+    let Some(authorization) = authorization_header(headers) else {
+        return Ok((
+            form.client_id.clone().unwrap_or_default(),
+            form.client_secret.clone().unwrap_or_default(),
+            false,
+        ));
+    };
+    let (id, secret) = parse_basic_credentials(authorization)
+        .ok_or(AuthFailure::InvalidClient { via_header: true })?;
+    // A body `client_id` that repeats the header's is identification, not a second credential.
+    let repeats_id = form
+        .client_id
+        .as_deref()
+        .is_none_or(|body_id| constant_eq(body_id.as_bytes(), id.as_bytes()));
+    if !repeats_id
+        || form.client_secret.is_some()
+        || form.client_assertion_type.is_some()
+        || form.client_assertion.is_some()
+    {
+        return Err(AuthFailure::MultipleMethods);
+    }
+    Ok((id, secret, true))
+}
+
+/// The request's `Authorization` header value. Several headers are reported as one unusable
+/// value rather than picking among them.
+fn authorization_header(headers: &HeaderMap) -> Option<&[u8]> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let first = values.next()?;
+    Some(if values.next().is_some() {
+        b""
+    } else {
+        first.as_bytes()
+    })
+}
+
+/// Decodes `Basic base64(urlencode(id):urlencode(secret))` (RFC 6749 section 2.3.1). Anything that
+/// is not exactly that, including invalid base64, a missing colon, malformed percent-encoding and
+/// non-UTF-8 bytes, yields `None`.
+fn parse_basic_credentials(value: &[u8]) -> Option<(String, String)> {
+    let (scheme, rest) = value.split_at_checked(5)?;
+    if !scheme.eq_ignore_ascii_case(b"basic") {
+        return None;
+    }
+    let token = rest.strip_prefix(b" ")?.trim_ascii_start();
+    let decoded = STANDARD.decode(token).ok()?;
+    let colon = decoded.iter().position(|byte| *byte == b':')?;
+    Some((
+        form_urldecode(&decoded[..colon])?,
+        form_urldecode(&decoded[colon + 1..])?,
+    ))
+}
+
+/// Strict `application/x-www-form-urlencoded` decoding: `+` is a space, and every `%` must
+/// introduce two hex digits.
+fn form_urldecode(input: &[u8]) -> Option<String> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut bytes = input.iter().copied();
+    while let Some(byte) = bytes.next() {
+        output.push(match byte {
+            b'+' => b' ',
+            b'%' => {
+                let high = (bytes.next()? as char).to_digit(16)?;
+                let low = (bytes.next()? as char).to_digit(16)?;
+                (high * 16 + low) as u8
+            }
+            other => other,
+        });
+    }
+    String::from_utf8(output).ok()
+}
+
+fn has_basic_authorization(headers: &HeaderMap) -> bool {
+    headers.get_all(header::AUTHORIZATION).iter().any(|value| {
+        value
+            .as_bytes()
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"basic"))
+    })
+}
+
 async fn authenticate(
     state: &AppState,
     relay: &Relay,
     upstream: &Upstream,
     form: &TokenRequest,
-) -> Result<(), ()> {
+    headers: &HeaderMap,
+) -> Result<(), AuthFailure> {
+    let password = |expected_id: &str, expected_secret: &str| {
+        let (id, secret, via_header) = password_credentials(headers, form)?;
+        if constant_eq(id.as_bytes(), expected_id.as_bytes())
+            & constant_eq(secret.as_bytes(), expected_secret.as_bytes())
+        {
+            Ok(())
+        } else {
+            Err(AuthFailure::InvalidClient { via_header })
+        }
+    };
     match &relay.client_auth {
         ClientAuth::UpstreamClient => {
-            let id = form.client_id.as_deref().unwrap_or_default();
-            let secret = form.client_secret.as_deref().unwrap_or_default();
-            if constant_eq(id.as_bytes(), upstream.client_id.as_bytes())
-                & constant_eq(
-                    secret.as_bytes(),
-                    upstream.client_secret.expose().as_bytes(),
-                )
-            {
-                Ok(())
-            } else {
-                Err(())
-            }
+            password(&upstream.client_id, upstream.client_secret.expose())
         }
         ClientAuth::Public => {
+            let via_header = has_basic_authorization(headers);
             if form.client_secret.is_none()
                 && form.client_assertion_type.is_none()
                 && form.client_assertion.is_none()
+                && !via_header
             {
                 Ok(())
             } else {
-                Err(())
+                Err(AuthFailure::InvalidClient { via_header })
             }
         }
         ClientAuth::ClientSecret {
             client_id,
             client_secret,
-        } => {
-            let id = form.client_id.as_deref().unwrap_or_default();
-            let secret = form.client_secret.as_deref().unwrap_or_default();
-            if constant_eq(id.as_bytes(), client_id.as_bytes())
-                & constant_eq(secret.as_bytes(), client_secret.expose().as_bytes())
-            {
-                Ok(())
-            } else {
-                Err(())
-            }
-        }
+        } => password(client_id, client_secret.expose()),
         ClientAuth::PrivateKeyJwt {
             require_single_use,
             client_id,
@@ -1339,13 +1446,14 @@ async fn authenticate(
             audience,
             jwks,
         } => {
+            let invalid = || AuthFailure::InvalidClient { via_header: false };
             if form.client_assertion_type.as_deref()
                 != Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
                 || form.client_id.as_deref() != Some(client_id)
             {
-                return Err(());
+                return Err(invalid());
             }
-            let assertion = form.client_assertion.as_deref().ok_or(())?;
+            let assertion = form.client_assertion.as_deref().ok_or_else(invalid)?;
             let audience = audience
                 .clone()
                 .unwrap_or_else(|| token_url(&state.cfg.public_url, &relay.key).to_string());
@@ -1359,6 +1467,7 @@ async fn authenticate(
                 *require_single_use,
             )
             .await
+            .map_err(|()| invalid())
         }
     }
 }
