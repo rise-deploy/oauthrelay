@@ -17,7 +17,7 @@ Select a backend with `OAUTHRELAY_STORE`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OAUTHRELAY_STORE` | `memory` | `memory`, `dynamodb`, or `kubernetes`. |
+| `OAUTHRELAY_STORE` | `memory` | `memory`, `dynamodb`, or `kubernetes`. `kubernetes` is rejected at startup on AWS Lambda. |
 | `OAUTHRELAY_STORE_DYNAMODB_TABLE` | — | DynamoDB table name. Required with `dynamodb`, rejected otherwise. |
 | `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | `transientrecords.oauthrelay.dev` | Resource that holds the records: oauthrelay's own, or `authcodes.dex.coreos.com` (see [Using Dex's AuthCode resource](#using-dexs-authcode-resource)). Only valid with `kubernetes`. |
 | `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` | see [Kubernetes](#kubernetes) | Namespace that holds the records. Only valid with `kubernetes`. |
@@ -182,6 +182,11 @@ build feature, which the default build includes, and works with any configuratio
 never implied by `OAUTHRELAY_PROVIDER_KUBERNETES=true`: selecting it also means granting the RBAC
 below, so you choose it explicitly.
 
+It does not run on AWS Lambda. Lambda freezes the process between invocations, so no background
+sweeper would ever delete an expired record, and oauthrelay refuses to start with
+`OAUTHRELAY_STORE=kubernetes` there, even when `OAUTHRELAY_STORE_KUBERNETES_SWEEP` is set. Use
+[DynamoDB](#dynamodb), whose TTL deletes expired items.
+
 ```console
 export OAUTHRELAY_STORE=kubernetes
 ```
@@ -190,9 +195,12 @@ oauthrelay authenticates like the [Kubernetes provider](/oauthrelay/reference/ku
 with its service account in a pod, otherwise with the active kubeconfig. Records live in one
 namespace, chosen in this order: `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE`, the provider namespace
 (`OAUTHRELAY_PROVIDER_KUBERNETES_NAMESPACE`, when the Kubernetes provider is enabled), then the
-pod or kubeconfig namespace. At startup oauthrelay lists the resource once and refuses to start,
-with the resource and namespace in the message, if the CRD is not installed or the credentials may
-not list it.
+pod or kubeconfig namespace. At startup oauthrelay lists the resource once, then asks the API
+server (a `SelfSubjectAccessReview` per verb) whether the credentials may `get`, `list`, `create`,
+`update`, and `delete` it in that namespace. It refuses to start, with the resource and namespace
+in the message, if the resource is not served, if a verb is missing (the message names the missing
+verbs), or if the access review itself fails. A Role without `create`, `update`, or `delete` is
+therefore reported when the pod starts, not on the first token request.
 
 ### Install the CRD and grant access
 
@@ -228,7 +236,7 @@ Each record is one `TransientRecord` (`oauthrelay.dev/v1alpha1`):
 | Field | Meaning |
 | --- | --- |
 | `metadata.name` | `oauthrelay-` plus the lowercase base32 of the key's SHA-256: 63 characters, a valid name for any key. |
-| `metadata.labels` | `app.kubernetes.io/managed-by: oauthrelay`, and `oauthrelay.dev/purpose` with the key's first segment (`replay`, `refresh`). |
+| `metadata.labels` | `app.kubernetes.io/managed-by: oauthrelay`; `oauthrelay.dev/purpose` with the key's first segment (`replay`, `refresh`); and `oauthrelay.dev/expires-hour`, the unix hour of the expiry (integer hours since the epoch, for example `"498921"`), which every write sets again because a write restarts the TTL. The sweeper selects on it. |
 | `spec.key` | The store key, for inspection. |
 | `spec.value` | The value, base64. |
 | `spec.expiresAt` | Expiry, RFC 3339 with millisecond precision. |
@@ -245,11 +253,39 @@ Kubernetes has no server-side TTL, and correctness never depends on deletion: re
 `spec.expiresAt` with the clock, and a write treats an expired record as absent and takes it over.
 Deleting expired records only keeps etcd small. Every replica runs a sweeper for that, by default
 every 60 seconds (`OAUTHRELAY_STORE_KUBERNETES_SWEEP`; `off` disables it, for example when
-another job cleans up). A sweep lists the records oauthrelay wrote (label selector
-`app.kubernetes.io/managed-by=oauthrelay`, 500 per page) and deletes each expired one with a
-`resourceVersion` precondition, so a record that another replica renewed between the list and the
-delete is kept. Replicas sweeping at once is harmless: deletes are idempotent. The sweeper does
-not run on Lambda, which freezes the process between invocations.
+another job cleans up).
+
+A sweeper that listed every record each time would not scale: records such as rotation tombstones
+live for the whole refresh family, so there can be hundreds of thousands (see
+[sizing](#rotating-refresh-tokens-and-sizing)). Instead each sweeper lists only records that can
+have expired, using the `oauthrelay.dev/expires-hour` label:
+
+- **At start**, a sweeper does one full pass over every record oauthrelay wrote (selector
+  `app.kubernetes.io/managed-by=oauthrelay`, 500 per page). That also covers records written before
+  the label existed.
+- **Each later sweep** lists `app.kubernetes.io/managed-by=oauthrelay,oauthrelay.dev/expires-hour in (...)`
+  for the hours from a watermark, which the sweeper keeps in memory, up to the hour of the current
+  time minus the grace below (twenty hours per request, 500 records per page). Normally that is
+  the current hour. It deletes each expired record with a `resourceVersion` precondition, so a
+  record that another replica renewed between the list and the delete is kept, and then advances
+  the watermark past every hour that is entirely in the past. A sweep that fails leaves the
+  watermark where it was.
+- **Every 24 hours** it repeats the full pass as a backstop, for records the hours missed: those
+  written by a replica whose clock ran far behind, or without the label.
+
+Replicas sweeping at once is harmless: deletes are idempotent. **Grace:** a sweeper deletes only
+records that expired more than 30 seconds ago. Reads and writes judge expiry exactly, so a
+replica whose clock runs fast cannot delete a record that its peers still treat as live; the
+price is that expired records stay in etcd 30 seconds longer.
+
+The remaining cost is one full pass per replica at every start and every 24 hours, and then, per
+sweep, a list bounded by the records that expire in the current hour (the ones that have not
+expired yet are listed again on every sweep of that hour; with the default interval, about sixty
+times). Long-lived records are listed again only in the hour they expire, so the number of
+objects in etcd no longer sets the cost of a sweep. API load still scales with the number of
+replicas, since each runs a sweeper; to reduce it, raise `OAUTHRELAY_STORE_KUBERNETES_SWEEP`.
+Start replicas gradually when the namespace holds many records, so their full passes do not
+coincide.
 
 ### Using Dex's AuthCode resource
 
@@ -317,8 +353,15 @@ server and every record an object in etcd, which the cluster shares with everyth
 
 | Per refresh grant | Operations |
 | --- | --- |
-| Rotation | 2 reads (handle, revoked marker) and 5 writes (claim, response, successor, tombstone swap, head pointer; see [DynamoDB sizing](#sizing-for-rotating-refresh-tokens)) |
+| Rotation | 5 reads and 5 writes (see below) |
 | Duplicate within the grace period | 3 reads, no writes |
+
+A rotation reads the handle and the revoked marker (2 `GET`s), then makes five conditional writes.
+Three of them are `compare_and_swap` calls (claim, tombstone swap, head pointer), each of which is
+a `GET` followed by a `PUT`; the other two are creates (response, successor), each a `POST`. That
+is 5 `GET`s and 5 writes, about ten sequential API requests at a few milliseconds each on a
+healthy cluster, in addition to the upstream refresh. A duplicate reads the handle, the revoked
+marker, and the recorded response.
 
 Each rotation leaves a tombstone object until the family ends, so a session that refreshes hourly
 leaves about 720 of them over the default 30-day family. An object weighs roughly 1 to 2 KB in
@@ -339,7 +382,18 @@ figure to about 170 per session), and use [DynamoDB](#dynamodb) when refresh vol
   which oauthrelay does (see [DynamoDB behavior](#behavior)).
 - Records keep millisecond precision. Expiry is judged by the reading instance's clock, so keep
   instance clocks synchronized.
-- If the API server is unreachable or denies a request, a token request that needs the store
+- Every store operation, with all the API requests it makes, has 10 seconds in total. When the
+  API server is slower than that, the operation fails with an error whose outcome is unknown,
+  like a lost response, instead of stalling the token request. The deadline is well inside the
+  60-second claim lease of a refresh-token rotation, so a caller stuck on the store cannot hold
+  a claim past its lease and be overtaken. oauthrelay turns off the Kubernetes client library's
+  own retry of 429, 503, and 504 responses for this client, which would otherwise keep retrying
+  for minutes and honour `Retry-After`; such a response fails the operation at once. The deadline
+  is not configurable.
+- A missing resource type (for example a CRD removed while oauthrelay runs) is an error, not an
+  absent record: only the API server's "object not found" answer, which names the object, reads
+  as absence.
+- If the API server is unreachable, slow, or denies a request, a token request that needs the store
   fails closed with HTTP 503 `server_error` and the authorization code stays unconsumed, exactly
   as with DynamoDB.
 
