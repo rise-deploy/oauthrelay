@@ -46,6 +46,7 @@ them.
 - One IdP OAuth client whose redirect URI is the oauthrelay callback for the shared upstream,
   `{OAUTHRELAY_PUBLIC_URL}/upstream/{upstream-name}/callback`. Both relays use this one callback.
   This guide uses `https://login.example.com/oidc/upstream/idp/callback`.
+- Optional: oauthrelay's [transient store in Dex's `AuthCode` objects](/oauthrelay/reference/transient-store/#using-dexs-authcode-resource) needs Dex 2.46.0 too, for a different reason.
 
 The hostnames below are used throughout: Dex at `https://dex.example.com/dex`, oauthrelay at
 `OAUTHRELAY_PUBLIC_URL=https://login.example.com/oidc`, and the IdP at `https://idp.example.com`.

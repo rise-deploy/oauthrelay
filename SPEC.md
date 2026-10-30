@@ -255,8 +255,10 @@ error after 10 seconds, and the backend is not available on Lambda, which cannot
 It suits moderate refresh traffic; each rotation is five reads and five writes against the API
 server (three `compare_and_swap` calls, each a `GET` plus a `PUT`, two creates, and two plain
 reads). The same records can instead be Dex `AuthCode` objects
-(`OAUTHRELAY_STORE_KUBERNETES_RESOURCE=authcodes.dex.coreos.com`), an opt-in that widens the
-service account's read access to Dex's live codes. An embedding without a store accepts a sealed authorization code for its five-minute cryptographic
+(`OAUTHRELAY_STORE_KUBERNETES_RESOURCE=authcodes.dex.coreos.com`, with
+`OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` set to Dex's namespace), an opt-in that requires Dex 2.46.0
+or later, which binds its device callback to the code's client, and that widens the service
+account's read access to Dex's live codes. An embedding without a store accepts a sealed authorization code for its five-minute cryptographic
 lifetime and rejects `requireSingleUse` client assertions.
 
 ## Configuration resources

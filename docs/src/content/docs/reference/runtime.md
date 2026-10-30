@@ -28,8 +28,8 @@ for namespace selection, refresh settings, CRD installation, and deployment exam
 | `OAUTHRELAY_LAMBDA_CONFIG_TTL` | no | `60s` | Maximum Lambda snapshot age before invocation-driven refresh. |
 | `OAUTHRELAY_STORE` | no | `memory` | Transient store backend for single-use state: `memory`, `dynamodb`, or `kubernetes` (not on Lambda). |
 | `OAUTHRELAY_STORE_DYNAMODB_TABLE` | with `dynamodb` | — | DynamoDB table holding transient records; see [Transient store](/oauthrelay/reference/transient-store/). |
-| `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | no | `transientrecords.oauthrelay.dev` | Resource holding the records of the `kubernetes` store: that one, or Dex's `authcodes.dex.coreos.com`. |
-| `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` | no | provider, pod, or kubeconfig namespace | Namespace holding the records of the `kubernetes` store. |
+| `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | no | `transientrecords.oauthrelay.dev` | Resource holding the records of the `kubernetes` store: that one, or Dex's `authcodes.dex.coreos.com` (requires Dex 2.46.0 or later). |
+| `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` | no | provider, pod, or kubeconfig namespace | Namespace holding the records of the `kubernetes` store. Required, and never inferred, with `authcodes.dex.coreos.com`: Dex's namespace. |
 | `OAUTHRELAY_STORE_KUBERNETES_SWEEP` | no | `60s` | Interval at which the `kubernetes` store deletes expired records, or `off`. |
 | `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` | no | `false` | Treat `localhost` as an alias for configured IP-literal loopback redirect matchers. |
 | `OAUTHRELAY_LOG` | no | `info` | `tracing` filter. |

@@ -26,9 +26,10 @@ rules:
     resources: [transientrecords]
     verbs: [get, list, create, update, delete]
   # OAUTHRELAY_STORE_KUBERNETES_RESOURCE=authcodes.dex.coreos.com keeps the records as Dex
-  # AuthCodes instead. That rule belongs in Dex's namespace, in a Role and RoleBinding for this
-  # ServiceAccount there, and it also lets oauthrelay read Dex's live authorization codes: read
-  # the Transient store reference first.
+  # AuthCodes instead; it requires Dex 2.46.0 or later and
+  # OAUTHRELAY_STORE_KUBERNETES_NAMESPACE set to Dex's namespace. That rule belongs in Dex's
+  # namespace, in a Role and RoleBinding for this ServiceAccount there, and it also lets
+  # oauthrelay read Dex's live authorization codes: read the Transient store reference first.
   #
   #   - apiGroups: [dex.coreos.com]
   #     resources: [authcodes]
