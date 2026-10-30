@@ -49,6 +49,11 @@ pub struct Entry {
 /// - A record stays visible for at least its TTL. A backend with a coarse clock (DynamoDB stores
 ///   whole seconds) may keep it a couple of seconds longer; either way `get` and the conditional
 ///   writes treat an expired record as absent even if the backend has not physically removed it.
+/// - Callers write values that are unique to the writer (for example sealed with a random nonce
+///   or carrying a random claim id), never a constant shared by several writers. A backend whose
+///   conditional write can fail ambiguously after applying (DynamoDB behind SDK retries) resolves
+///   the ambiguity by checking whether the stored value is the one it just wrote; that is exact
+///   only when no other writer could have written the same bytes.
 /// - An `Err` means the outcome is unknown. Callers fail closed: a replay check that errors rejects
 ///   the request.
 ///

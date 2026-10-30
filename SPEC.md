@@ -161,7 +161,10 @@ pub trait TransientStore: Send + Sync + 'static {
 Every write carries a TTL, values are opaque bytes, and operations on one key are linearizable
 across all instances sharing the backend. Callers namespace keys by purpose (`replay:` today,
 `refresh:` for stateful refresh-token rotation); backends never interpret keys. An expired record
-is absent for reads and conditional writes even when the backend has not yet deleted it. A backend
+is absent for reads and conditional writes even when the backend has not yet deleted it. Callers write values unique
+to the writer (sealed with a random nonce, or carrying a random claim id): DynamoDB asks for the
+existing item when a condition fails and counts a failure against the value it just wrote as
+success, since SDK retries can report a failure for a write that applied. A backend
 error means the outcome is unknown and callers fail closed. The rustdoc on the trait states the
 full contract and the intended rotation record layout.
 

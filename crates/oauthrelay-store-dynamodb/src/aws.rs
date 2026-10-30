@@ -1,6 +1,11 @@
 use crate::*;
 use anyhow::Context;
-use aws_sdk_dynamodb::{primitives::Blob, types::AttributeValue};
+use aws_sdk_dynamodb::{
+    operation::put_item::PutItemError,
+    primitives::Blob,
+    types::{AttributeValue, ReturnValuesOnConditionCheckFailure},
+};
+use std::collections::HashMap;
 
 /// SDK-backed client for one table.
 pub struct AwsDynamoDbClient {
@@ -48,13 +53,27 @@ pub(super) fn condition_parts(condition: &PutCondition) -> ConditionParts {
     }
 }
 
+fn decode_item(key: &str, item: &HashMap<String, AttributeValue>) -> anyhow::Result<Item> {
+    let value = match item.get(VALUE_ATTRIBUTE) {
+        Some(AttributeValue::B(blob)) => blob.as_ref().to_vec(),
+        _ => anyhow::bail!("item {key:?} has no binary {VALUE_ATTRIBUTE} attribute"),
+    };
+    let expires_at = match item.get(EXPIRES_ATTRIBUTE) {
+        Some(AttributeValue::N(number)) => number
+            .parse()
+            .with_context(|| format!("item {key:?} has an invalid {EXPIRES_ATTRIBUTE}"))?,
+        _ => anyhow::bail!("item {key:?} has no numeric {EXPIRES_ATTRIBUTE} attribute"),
+    };
+    Ok(Item { value, expires_at })
+}
+
 fn key_attribute(key: &str) -> AttributeValue {
     AttributeValue::S(key.to_owned())
 }
 
 #[async_trait]
 impl DynamoDbClient for AwsDynamoDbClient {
-    async fn put_item(&self, request: PutRequest) -> anyhow::Result<bool> {
+    async fn put_item(&self, request: PutRequest) -> anyhow::Result<PutOutcome> {
         let condition = condition_parts(&request.condition);
         let mut builder = self
             .client
@@ -66,7 +85,8 @@ impl DynamoDbClient for AwsDynamoDbClient {
                 AttributeValue::B(Blob::new(request.item.value)),
             )
             .item(EXPIRES_ATTRIBUTE, number(request.item.expires_at))
-            .condition_expression(condition.expression);
+            .condition_expression(condition.expression)
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld);
         for (placeholder, name) in condition.names {
             builder = builder.expression_attribute_names(placeholder, name);
         }
@@ -74,15 +94,20 @@ impl DynamoDbClient for AwsDynamoDbClient {
             builder = builder.expression_attribute_values(placeholder, value);
         }
         match builder.send().await {
-            Ok(_) => Ok(true),
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|error| error.is_conditional_check_failed_exception()) =>
-            {
-                Ok(false)
+            Ok(_) => Ok(PutOutcome::Written),
+            Err(error) => {
+                if let Some(PutItemError::ConditionalCheckFailedException(failed)) =
+                    error.as_service_error()
+                {
+                    // An item that cannot be decoded is reported as absent: the write then counts
+                    // as failed, which is the safe reading.
+                    let existing = failed
+                        .item()
+                        .and_then(|item| decode_item(&request.key, item).ok());
+                    return Ok(PutOutcome::ConditionFailed { existing });
+                }
+                Err(error).context("PutItem")
             }
-            Err(error) => Err(error).context("PutItem"),
         }
     }
 
@@ -96,20 +121,7 @@ impl DynamoDbClient for AwsDynamoDbClient {
             .send()
             .await
             .context("GetItem")?;
-        let Some(item) = output.item() else {
-            return Ok(None);
-        };
-        let value = match item.get(VALUE_ATTRIBUTE) {
-            Some(AttributeValue::B(blob)) => blob.as_ref().to_vec(),
-            _ => anyhow::bail!("item {key:?} has no binary {VALUE_ATTRIBUTE} attribute"),
-        };
-        let expires_at = match item.get(EXPIRES_ATTRIBUTE) {
-            Some(AttributeValue::N(number)) => number
-                .parse()
-                .with_context(|| format!("item {key:?} has an invalid {EXPIRES_ATTRIBUTE}"))?,
-            _ => anyhow::bail!("item {key:?} has no numeric {EXPIRES_ATTRIBUTE} attribute"),
-        };
-        Ok(Some(Item { value, expires_at }))
+        output.item().map(|item| decode_item(key, item)).transpose()
     }
 
     async fn delete_item(&self, key: &str) -> anyhow::Result<()> {

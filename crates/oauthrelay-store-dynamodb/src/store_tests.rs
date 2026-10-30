@@ -15,6 +15,9 @@ const TTL: Duration = Duration::from_secs(60);
 struct FakeClient {
     items: Mutex<HashMap<String, Item>>,
     puts: Mutex<Vec<PutRequest>>,
+    /// Applies the next conditional write but reports it as failed, as an SDK retry does when the
+    /// first attempt succeeded and its response was lost.
+    lose_next_response: AtomicBool,
     gets: Mutex<Vec<String>>,
     deletes: Mutex<Vec<String>>,
     failing: AtomicBool,
@@ -37,7 +40,7 @@ impl FakeClient {
 
 #[async_trait]
 impl DynamoDbClient for FakeClient {
-    async fn put_item(&self, request: PutRequest) -> anyhow::Result<bool> {
+    async fn put_item(&self, request: PutRequest) -> anyhow::Result<PutOutcome> {
         self.check_available()?;
         self.puts.lock().unwrap().push(request.clone());
         let mut items = self.items.lock().unwrap();
@@ -51,9 +54,18 @@ impl DynamoDbClient for FakeClient {
             }
         };
         if allowed {
-            items.insert(request.key, request.item);
+            items.insert(request.key.clone(), request.item);
+            if self.lose_next_response.swap(false, Ordering::SeqCst) {
+                return Ok(PutOutcome::ConditionFailed {
+                    existing: items.get(&request.key).cloned(),
+                });
+            }
+            Ok(PutOutcome::Written)
+        } else {
+            Ok(PutOutcome::ConditionFailed {
+                existing: items.get(&request.key).cloned(),
+            })
         }
-        Ok(allowed)
     }
 
     async fn get_item(&self, key: &str) -> anyhow::Result<Option<Item>> {
@@ -220,5 +232,47 @@ async fn client_failures_surface_as_backend_errors() {
     assert!(matches!(
         store.delete("k").await,
         Err(StoreError::Backend(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_condition_failure_against_our_own_value_counts_as_written() {
+    let (client, _, store) = store();
+    // put_if_absent whose first attempt applied.
+    client.lose_next_response.store(true, Ordering::SeqCst);
+    assert!(store.put_if_absent("k", b"claim:A", TTL).await.unwrap());
+    // A genuine loser sees somebody else's value and loses.
+    assert!(!store.put_if_absent("k", b"claim:B", TTL).await.unwrap());
+
+    // The same for a swap.
+    client.lose_next_response.store(true, Ordering::SeqCst);
+    assert!(store
+        .compare_and_swap("k", b"claim:A", b"rotated:A", TTL)
+        .await
+        .unwrap());
+    assert_eq!(client.items.lock().unwrap()["k"].value, b"rotated:A");
+    assert!(!store
+        .compare_and_swap("k", b"claim:A", b"rotated:B", TTL)
+        .await
+        .unwrap());
+    assert!(!store
+        .compare_and_swap("k", b"stale", b"rotated:A2", TTL)
+        .await
+        .unwrap());
+
+    // An expired item with an equal value is not ours: it is not live.
+    client.items.lock().unwrap().insert(
+        "e".into(),
+        Item {
+            value: b"same".to_vec(),
+            expires_at: START - 1,
+        },
+    );
+    assert!(!DynamoDbStore::<FakeClient>::applied(
+        PutOutcome::ConditionFailed {
+            existing: client.items.lock().unwrap().get("e").cloned()
+        },
+        b"same",
+        START
     ));
 }

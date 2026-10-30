@@ -56,11 +56,26 @@ pub struct PutRequest {
     pub condition: PutCondition,
 }
 
+/// The result of a conditional [`DynamoDbClient::put_item`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PutOutcome {
+    /// The condition held and the item was written.
+    Written,
+    /// DynamoDB reported that the condition failed. `existing` is the item that was in the table
+    /// at that moment (`ReturnValuesOnConditionCheckFailure=ALL_OLD`), `None` when the table
+    /// returned none.
+    ///
+    /// This can also be the outcome of a request that *did* apply: the SDK retries a request whose
+    /// response was lost, and the retry then fails against the item the first attempt wrote.
+    ConditionFailed { existing: Option<Item> },
+}
+
 /// The three table operations the store needs, bound to one table.
 #[async_trait]
 pub trait DynamoDbClient: Send + Sync + 'static {
-    /// Conditional `PutItem`. Returns `false` when the condition failed and nothing was written.
-    async fn put_item(&self, request: PutRequest) -> anyhow::Result<bool>;
+    /// Conditional `PutItem` that asks DynamoDB to return the existing item when the condition
+    /// fails.
+    async fn put_item(&self, request: PutRequest) -> anyhow::Result<PutOutcome>;
     /// Strongly consistent `GetItem`. Expired but not yet deleted items are returned as stored.
     async fn get_item(&self, key: &str) -> anyhow::Result<Option<Item>>;
     /// Unconditional `DeleteItem`; deleting an absent item succeeds.
@@ -99,6 +114,22 @@ impl<C: DynamoDbClient> DynamoDbStore<C> {
         (self.clock)()
     }
 
+    /// Whether a conditional write took effect.
+    ///
+    /// A `ConditionalCheckFailed` is ambiguous: SDK retries can make a write that applied report a
+    /// failure. If the item DynamoDB returned holds exactly the value this call wrote, and is
+    /// still live, the write is ours and counts as successful. That is exact only if every value
+    /// written to a key is unique among its writers, which is a caller obligation of
+    /// [`TransientStore`]: oauthrelay seals every record value with a random nonce.
+    fn applied(outcome: PutOutcome, written: &[u8], now: u64) -> bool {
+        match outcome {
+            PutOutcome::Written => true,
+            PutOutcome::ConditionFailed { existing } => {
+                existing.is_some_and(|item| item.value == written && item.expires_at > now)
+            }
+        }
+    }
+
     fn expiry(&self, now: u64, ttl: Duration) -> u64 {
         let whole = ttl.as_secs() + u64::from(ttl.subsec_nanos() > 0);
         now.saturating_add(whole).saturating_add(1)
@@ -122,7 +153,8 @@ impl<C: DynamoDbClient> TransientStore for DynamoDbStore<C> {
         validate_key(key)?;
         validate_ttl(ttl)?;
         let now = self.now();
-        self.client
+        let outcome = self
+            .client
             .put_item(PutRequest {
                 key: key.to_owned(),
                 item: Item {
@@ -132,7 +164,8 @@ impl<C: DynamoDbClient> TransientStore for DynamoDbStore<C> {
                 condition: PutCondition::AbsentOrExpired { now },
             })
             .await
-            .map_err(StoreError::Backend)
+            .map_err(StoreError::Backend)?;
+        Ok(Self::applied(outcome, value, now))
     }
 
     async fn get(&self, key: &str) -> Result<Option<Entry>, StoreError> {
@@ -159,7 +192,8 @@ impl<C: DynamoDbClient> TransientStore for DynamoDbStore<C> {
         validate_key(key)?;
         validate_ttl(ttl)?;
         let now = self.now();
-        self.client
+        let outcome = self
+            .client
             .put_item(PutRequest {
                 key: key.to_owned(),
                 item: Item {
@@ -172,7 +206,8 @@ impl<C: DynamoDbClient> TransientStore for DynamoDbStore<C> {
                 },
             })
             .await
-            .map_err(StoreError::Backend)
+            .map_err(StoreError::Backend)?;
+        Ok(Self::applied(outcome, new, now))
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {

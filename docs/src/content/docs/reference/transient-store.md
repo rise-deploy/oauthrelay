@@ -100,6 +100,13 @@ customer-managed KMS key.
 - Claims use a conditional `PutItem` that succeeds only when no live item exists, so exactly one
   of any number of concurrent redemptions wins, across every replica and Lambda environment.
 - Reads are strongly consistent.
+- A conditional write asks DynamoDB to return the existing item when its condition fails
+  (`ReturnValuesOnConditionCheckFailure=ALL_OLD`). The AWS SDK retries a request whose response was
+  lost, and such a retry can report `ConditionalCheckFailed` for a write that had already applied.
+  When the returned item still holds exactly the value being written, the write is treated as
+  successful. This relies on callers writing values that are unique to the writer, which
+  oauthrelay does (every record value is sealed with a random nonce); a custom caller that writes
+  the same bytes from several writers loses that exactness.
 - DynamoDB stores whole seconds. A record is kept for its TTL rounded up to whole seconds plus one
   second: never shorter than requested, at most two seconds longer. Expiry is judged by the
   reading instance's clock, so keep instance clocks synchronized.
