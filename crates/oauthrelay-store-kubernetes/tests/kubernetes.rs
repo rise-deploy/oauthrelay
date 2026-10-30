@@ -12,8 +12,9 @@ use kube::{
 };
 use oauthrelay_core::TransientStore;
 use oauthrelay_store_kubernetes::{
-    object_name, CreateOutcome, DeleteOutcome, KubeClient, KubernetesClient, KubernetesStore,
-    NewRecord, Page, RecordMapping, ReplaceOutcome, Stored, SweepReport, TransientRecord,
+    expiry_hour, expiry_selector, object_name, CreateOutcome, DeleteOutcome, KubeClient,
+    KubernetesClient, KubernetesStore, NewRecord, Page, RecordMapping, ReplaceOutcome, Stored,
+    SweepReport, TransientRecord, SWEEP_GRACE,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,6 +46,25 @@ async fn admin_config() -> Config {
     )
     .await
     .unwrap()
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// A store over `client` whose clock runs `SWEEP_GRACE` ahead, so that records that expired a
+/// moment ago are past the grace the sweeper waits before deleting.
+fn store_past_the_grace(
+    client: Arc<impl KubernetesClient>,
+) -> KubernetesStore<impl KubernetesClient> {
+    let grace = u64::try_from(SWEEP_GRACE.as_millis()).unwrap();
+    KubernetesStore::with_clock(client, Arc::new(move || now_ms() + grace))
 }
 
 /// A key no other test, and no earlier run, has used.
@@ -319,7 +339,10 @@ mod scenarios {
         let live = unique_key("replay");
         assert!(store.put_if_absent(&live, b"x", TTL).await.unwrap());
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let report = store.sweep().await.unwrap();
+        let report = store_past_the_grace(env.client.clone())
+            .sweep()
+            .await
+            .unwrap();
         assert!(report.deleted >= 2, "{report:?}");
         assert!(env.stored(&key).await.is_none());
         assert!(env.stored(&swept).await.is_none());
@@ -344,7 +367,7 @@ mod scenarios {
             .await
             .unwrap());
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let racing = KubernetesStore::new(Arc::new(RenewAfterList {
+        let racing = store_past_the_grace(Arc::new(RenewAfterList {
             inner: env.client.clone(),
         }));
         let SweepReport { skipped, .. } = racing.sweep().await.unwrap();
@@ -367,6 +390,12 @@ struct RenewAfterList {
 impl KubernetesClient for RenewAfterList {
     fn target(&self) -> String {
         self.inner.target()
+    }
+    fn install_hint(&self) -> String {
+        self.inner.install_hint()
+    }
+    async fn permits(&self, verb: &str) -> anyhow::Result<bool> {
+        self.inner.permits(verb).await
     }
     async fn get(&self, name: &str) -> anyhow::Result<Option<Stored>> {
         self.inner.get(name).await
@@ -434,12 +463,13 @@ async fn the_shipped_role_is_enough_and_confined_to_its_namespace() {
         .await
         .unwrap());
     let object = env.stored(&key).await.unwrap();
-    assert_eq!(
-        object.metadata.labels.unwrap()["oauthrelay.dev/purpose"],
-        "refresh"
-    );
+    let labels = object.metadata.labels.clone().unwrap();
+    assert_eq!(labels["oauthrelay.dev/purpose"], "refresh");
     assert_eq!(object.data["spec"]["key"], key);
     assert_eq!(object.data["spec"]["value"], "AP8=");
+    // The hour label is within an hour of "now plus TTL" (the two clocks differ by moments).
+    let hour: u64 = labels["oauthrelay.dev/expires-hour"].parse().unwrap();
+    assert!(hour.abs_diff(expiry_hour(now_ms() + TTL.as_millis() as u64)) <= 1);
 
     // The role is a Role, not a ClusterRole: another namespace is off limits.
     let elsewhere = KubeClient::new(
@@ -654,7 +684,11 @@ async fn the_sweeper_never_touches_auth_codes_that_dex_wrote() {
         .await
         .unwrap());
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(env.store.sweep().await.unwrap().deleted >= 1);
+    let report = store_past_the_grace(env.client.clone())
+        .sweep()
+        .await
+        .unwrap();
+    assert!(report.deleted >= 1);
     assert!(env.stored(&expired).await.is_none());
     assert!(env
         .raw()
@@ -669,4 +703,56 @@ async fn the_sweeper_never_touches_auth_codes_that_dex_wrote() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn the_expiry_hour_selector_and_the_bucketed_sweeper_work_against_the_api_server() {
+    let env = Env::new(RecordMapping::TransientRecord).await;
+    let key = unique_key("replay");
+    assert!(env
+        .store
+        .put_if_absent(&key, b"x", Duration::from_millis(100))
+        .await
+        .unwrap());
+    let object = env.stored(&key).await.unwrap();
+    let hour: u64 = object.metadata.labels.unwrap()["oauthrelay.dev/expires-hour"]
+        .parse()
+        .unwrap();
+    let name = object_name(&key);
+    // The `in (...)` selector, with other hours alongside, selects the record's bucket only.
+    let selected = env
+        .client
+        .list(&expiry_selector([hour - 1, hour, hour + 1]), 500, None)
+        .await
+        .unwrap();
+    assert!(selected.items.iter().any(|object| object.name == name));
+    let elsewhere = env
+        .client
+        .list(&expiry_selector([hour + 1000, hour + 1001]), 500, None)
+        .await
+        .unwrap();
+    assert!(elsewhere.items.iter().all(|object| object.name != name));
+
+    // The sweeper task: its first pass is full, later ones are bucketed. The clock runs exactly
+    // the grace ahead, so a record is deletable as soon as it expired.
+    let grace = u64::try_from(SWEEP_GRACE.as_millis()).unwrap();
+    let sweeping =
+        KubernetesStore::with_clock(env.client.clone(), Arc::new(move || now_ms() + grace))
+            .with_sweeper(Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(env.stored(&key).await.is_none(), "the full pass deletes it");
+    let later = unique_key("replay");
+    assert!(env
+        .store
+        .put_if_absent(&later, b"x", Duration::from_millis(100))
+        .await
+        .unwrap());
+    let mut attempts = 0;
+    while env.stored(&later).await.is_some() {
+        attempts += 1;
+        assert!(attempts < 50, "a bucketed sweep never deleted the record");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(sweeping);
 }

@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
@@ -10,6 +10,8 @@ use std::{
 const START: u64 = 1_800_000_000_000;
 const TTL: Duration = Duration::from_secs(60);
 const TTL_MS: u64 = 60_000;
+const GRACE_MS: u64 = 30_000;
+const HOUR_MS: u64 = 3_600_000;
 
 type Objects = BTreeMap<String, Stored>;
 type Interference = Arc<dyn Fn(&mut Objects) + Send + Sync>;
@@ -25,6 +27,7 @@ enum Call {
         limit: u32,
         token: Option<String>,
     },
+    Permits(String),
 }
 
 /// Applies each operation exactly as its documentation states, and records every call.
@@ -47,9 +50,44 @@ struct FakeClient {
     /// Makes the next `get` report the object as absent and remove it: it was deleted between
     /// the caller's previous request and this one.
     vanish_on_get: AtomicBool,
+    /// Objects written without the expiry-hour label, as before the label existed.
+    unlabelled: Mutex<BTreeSet<String>>,
+    /// Every request takes this long before it is served.
+    latency: Mutex<Duration>,
+    /// Every request waits forever.
+    hang: AtomicBool,
+    /// Verbs the access review denies.
+    denied_verbs: Mutex<Vec<String>>,
+}
+
+/// The expiry hours that `selector` restricts a list to, `None` for the plain managed-by
+/// selector. Any other shape is a bug in the store.
+fn selected_hours(selector: &str) -> Option<BTreeSet<u64>> {
+    let rest = selector
+        .strip_prefix(MANAGED_SELECTOR)
+        .unwrap_or_else(|| panic!("a list must select on managed-by first: {selector:?}"));
+    if rest.is_empty() {
+        return None;
+    }
+    let hours = rest
+        .strip_prefix(&format!(",{EXPIRES_HOUR_LABEL} in ("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("unexpected selector {selector:?}"));
+    Some(hours.split(',').map(|hour| hour.parse().unwrap()).collect())
 }
 
 impl FakeClient {
+    async fn enter(&self) -> anyhow::Result<()> {
+        if self.hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let latency = *self.latency.lock().unwrap();
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
+        self.check_available()
+    }
+
     fn check_available(&self) -> anyhow::Result<()> {
         if self.failing.load(Ordering::SeqCst) {
             anyhow::bail!("api server unavailable");
@@ -90,8 +128,26 @@ impl KubernetesClient for FakeClient {
         "fake.example in namespace \"test\"".into()
     }
 
+    fn install_hint(&self) -> String {
+        "the fake CRD is installed".into()
+    }
+
+    async fn permits(&self, verb: &str) -> anyhow::Result<bool> {
+        self.enter().await?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::Permits(verb.to_owned()));
+        Ok(!self
+            .denied_verbs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|denied| denied == verb))
+    }
+
     async fn get(&self, name: &str) -> anyhow::Result<Option<Stored>> {
-        self.check_available()?;
+        self.enter().await?;
         self.calls.lock().unwrap().push(Call::Get(name.to_owned()));
         if self.vanish_on_get.swap(false, Ordering::SeqCst) {
             self.objects.lock().unwrap().remove(name);
@@ -101,7 +157,7 @@ impl KubernetesClient for FakeClient {
     }
 
     async fn create(&self, record: NewRecord<'_>) -> anyhow::Result<CreateOutcome> {
-        self.check_available()?;
+        self.enter().await?;
         self.calls
             .lock()
             .unwrap()
@@ -121,7 +177,7 @@ impl KubernetesClient for FakeClient {
         record: NewRecord<'_>,
         resource_version: &str,
     ) -> anyhow::Result<ReplaceOutcome> {
-        self.check_available()?;
+        self.enter().await?;
         self.calls.lock().unwrap().push(Call::Replace(
             record.name.to_owned(),
             resource_version.to_owned(),
@@ -151,7 +207,7 @@ impl KubernetesClient for FakeClient {
         name: &str,
         resource_version: Option<&str>,
     ) -> anyhow::Result<DeleteOutcome> {
-        self.check_available()?;
+        self.enter().await?;
         self.calls.lock().unwrap().push(Call::Delete(
             name.to_owned(),
             resource_version.map(str::to_owned),
@@ -177,7 +233,7 @@ impl KubernetesClient for FakeClient {
         limit: u32,
         continue_token: Option<&str>,
     ) -> anyhow::Result<Page> {
-        self.check_available()?;
+        self.enter().await?;
         self.calls.lock().unwrap().push(Call::List {
             selector: label_selector.to_owned(),
             limit,
@@ -189,9 +245,17 @@ impl KubernetesClient for FakeClient {
             .unwrap()
             .map_or(limit as usize, |cap| cap.min(limit as usize));
         // The token is the last name returned, so deletions between pages do not shift it.
+        let hours = selected_hours(label_selector);
+        let unlabelled = self.unlabelled.lock().unwrap().clone();
         let objects = self.objects.lock().unwrap();
         let remaining: Vec<_> = objects
             .values()
+            .filter(|object| {
+                hours.as_ref().is_none_or(|hours| {
+                    !unlabelled.contains(&object.name)
+                        && hours.contains(&expiry_hour(object.expires_at_ms))
+                })
+            })
             .filter(|object| continue_token.is_none_or(|token| object.name.as_str() > token))
             .cloned()
             .collect();
@@ -663,7 +727,7 @@ async fn sweep_deletes_expired_objects_with_a_version_precondition() {
     assert!(store.put_if_absent("replay:old", b"1", TTL).await.unwrap());
     now.fetch_add(30_000, Ordering::SeqCst);
     assert!(store.put_if_absent("replay:new", b"1", TTL).await.unwrap());
-    now.fetch_add(30_000, Ordering::SeqCst);
+    now.fetch_add(30_000 + GRACE_MS, Ordering::SeqCst);
     let old = client.object("replay:old").unwrap();
     client.calls();
     assert_eq!(
@@ -693,7 +757,7 @@ async fn sweep_deletes_expired_objects_with_a_version_precondition() {
 async fn sweep_spares_a_record_renewed_between_the_list_and_the_delete() {
     let (client, now, store) = store();
     assert!(store.put_if_absent("refresh:a", b"1", TTL).await.unwrap());
-    now.fetch_add(TTL_MS, Ordering::SeqCst);
+    now.fetch_add(TTL_MS + GRACE_MS, Ordering::SeqCst);
     // Another replica takes the expired record over just after this sweep listed it.
     *client.after_list.lock().unwrap() = Some(overwrite(
         object_name("refresh:a"),
@@ -715,7 +779,7 @@ async fn sweep_spares_a_record_renewed_between_the_list_and_the_delete() {
 async fn sweep_tolerates_objects_deleted_by_another_replica() {
     let (client, now, store) = store();
     assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
-    now.fetch_add(TTL_MS, Ordering::SeqCst);
+    now.fetch_add(TTL_MS + GRACE_MS, Ordering::SeqCst);
     *client.after_list.lock().unwrap() = interference(|objects| objects.clear());
     assert_eq!(
         store.sweep().await.unwrap(),
@@ -736,7 +800,7 @@ async fn sweep_pages_through_every_object_and_always_selects_managed_ones() {
             .await
             .unwrap());
     }
-    now.fetch_add(TTL_MS, Ordering::SeqCst);
+    now.fetch_add(TTL_MS + GRACE_MS, Ordering::SeqCst);
     *client.max_page.lock().unwrap() = Some(2);
     client.calls();
     assert_eq!(store.sweep().await.unwrap().deleted, 5);
@@ -764,7 +828,7 @@ async fn sweep_pages_through_every_object_and_always_selects_managed_ones() {
 async fn sweep_reports_objects_it_cannot_decode_and_carries_on() {
     let (client, now, store) = store();
     assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
-    now.fetch_add(TTL_MS, Ordering::SeqCst);
+    now.fetch_add(TTL_MS + GRACE_MS, Ordering::SeqCst);
     client
         .undecodable
         .lock()
@@ -791,7 +855,7 @@ async fn the_sweeper_runs_on_its_interval_and_stops_with_the_store() {
     )
     .with_sweeper(Duration::from_secs(60));
     assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
-    now.fetch_add(TTL_MS, Ordering::SeqCst);
+    now.fetch_add(TTL_MS + GRACE_MS, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert!(
         client.object("replay:a").is_some(),
@@ -811,24 +875,98 @@ async fn the_sweeper_runs_on_its_interval_and_stops_with_the_store() {
 }
 
 #[tokio::test]
-async fn probe_lists_one_managed_object_and_explains_failures() {
+async fn probe_lists_one_managed_object_and_reviews_every_required_verb() {
     let (client, _, store) = store();
     store.probe().await.unwrap();
-    assert_eq!(
-        client.calls(),
-        vec![Call::List {
-            selector: MANAGED_SELECTOR.into(),
-            limit: 1,
-            token: None
-        }]
+    let mut expected = vec![Call::List {
+        selector: MANAGED_SELECTOR.into(),
+        limit: 1,
+        token: None,
+    }];
+    expected.extend(
+        ["get", "list", "create", "update", "delete"].map(|verb| Call::Permits(verb.into())),
     );
+    assert_eq!(client.calls(), expected);
+}
+
+#[tokio::test]
+async fn probe_explains_a_failed_list() {
+    let (client, _, store) = store();
     client.failing.store(true, Ordering::SeqCst);
     let error = format!("{:#}", store.probe().await.unwrap_err());
     assert!(
         error.contains("fake.example in namespace \"test\""),
         "{error}"
     );
+    assert!(error.contains("the fake CRD is installed"), "{error}");
+    assert!(
+        error.contains("grants get, list, create, update, delete"),
+        "{error}"
+    );
     assert!(error.contains("api server unavailable"), "{error}");
+}
+
+#[tokio::test]
+async fn probe_names_the_verbs_the_role_lacks() {
+    let (client, _, store) = store();
+    *client.denied_verbs.lock().unwrap() = vec!["update".into(), "delete".into()];
+    let error = format!("{:#}", store.probe().await.unwrap_err());
+    assert!(
+        error.contains("lacks update, delete on fake.example in namespace \"test\""),
+        "{error}"
+    );
+    assert!(!error.contains("lacks get"), "{error}");
+}
+
+#[tokio::test]
+async fn probe_fails_when_the_access_review_cannot_be_made() {
+    struct NoReviews(FakeClient);
+    #[async_trait]
+    impl KubernetesClient for NoReviews {
+        fn target(&self) -> String {
+            self.0.target()
+        }
+        fn install_hint(&self) -> String {
+            self.0.install_hint()
+        }
+        async fn permits(&self, _: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("selfsubjectaccessreviews is forbidden")
+        }
+        async fn get(&self, name: &str) -> anyhow::Result<Option<Stored>> {
+            self.0.get(name).await
+        }
+        async fn create(&self, record: NewRecord<'_>) -> anyhow::Result<CreateOutcome> {
+            self.0.create(record).await
+        }
+        async fn replace(
+            &self,
+            record: NewRecord<'_>,
+            version: &str,
+        ) -> anyhow::Result<ReplaceOutcome> {
+            self.0.replace(record, version).await
+        }
+        async fn delete(&self, name: &str, version: Option<&str>) -> anyhow::Result<DeleteOutcome> {
+            self.0.delete(name, version).await
+        }
+        async fn list(
+            &self,
+            selector: &str,
+            limit: u32,
+            token: Option<&str>,
+        ) -> anyhow::Result<Page> {
+            self.0.list(selector, limit, token).await
+        }
+    }
+    let store = KubernetesStore::new(Arc::new(NoReviews(FakeClient::default())));
+    let error = format!("{:#}", store.probe().await.unwrap_err());
+    assert!(
+        error.contains("cannot check whether the role may get fake.example"),
+        "{error}"
+    );
+    assert!(
+        error.contains("selfsubjectaccessreviews is forbidden"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -853,7 +991,7 @@ fn labels_mark_managed_objects_and_carry_the_purpose() {
     .into_iter()
     .collect();
     for (key, purpose) in purposes {
-        let labels = labels(key);
+        let labels = labels(key, START);
         assert_eq!(labels.get(&managed.0), Some(&managed.1), "{key}");
         assert_eq!(
             labels.get(PURPOSE_LABEL).map(String::as_str),
@@ -861,6 +999,285 @@ fn labels_mark_managed_objects_and_carry_the_purpose() {
             "{key}"
         );
     }
-    assert!(!labels(&"p".repeat(64)).contains_key(PURPOSE_LABEL));
-    assert!(labels(&"p".repeat(63)).contains_key(PURPOSE_LABEL));
+    assert!(!labels(&"p".repeat(64), START).contains_key(PURPOSE_LABEL));
+    assert!(labels(&"p".repeat(63), START).contains_key(PURPOSE_LABEL));
+}
+
+#[test]
+fn every_record_carries_its_expiry_hour() {
+    use crate::mapping::labels;
+    assert_eq!(EXPIRES_HOUR_LABEL, "oauthrelay.dev/expires-hour");
+    let hour = |ms| labels("replay:a", ms)[EXPIRES_HOUR_LABEL].clone();
+    assert_eq!(hour(0), "0");
+    assert_eq!(hour(HOUR_MS - 1), "0");
+    assert_eq!(hour(HOUR_MS), "1");
+    assert_eq!(hour(START), "500000");
+    assert_eq!(hour(START + HOUR_MS - 1), "500000");
+    assert_eq!(
+        expiry_selector([500000, 500001]),
+        "app.kubernetes.io/managed-by=oauthrelay,oauthrelay.dev/expires-hour in (500000,500001)"
+    );
+}
+
+/// The selectors of the list calls among `calls`.
+fn list_selectors(calls: Vec<Call>) -> Vec<String> {
+    calls
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::List { selector, .. } => Some(selector),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Ten minutes into hour 500000.
+const BASE: u64 = START + 600_000;
+
+fn hours(range: std::ops::RangeInclusive<u64>) -> String {
+    expiry_selector(range)
+}
+
+#[tokio::test]
+async fn the_first_sweep_is_a_full_pass_and_later_ones_list_only_expiry_hours() {
+    let (client, now, store) = store();
+    now.store(BASE, Ordering::SeqCst);
+    // Written before the label existed: only a full pass can find it.
+    client.put_object(&object_name("replay:legacy"), b"1", BASE - 2 * HOUR_MS);
+    client
+        .unlabelled
+        .lock()
+        .unwrap()
+        .insert(object_name("replay:legacy"));
+    assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
+    assert!(store
+        .put_if_absent("replay:next-hour", b"1", Duration::from_secs(3600))
+        .await
+        .unwrap());
+    assert!(store
+        .put_if_absent("refresh:week", b"1", Duration::from_secs(7 * 86_400))
+        .await
+        .unwrap());
+    client.calls();
+
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!(
+        report,
+        SweepReport {
+            listed: 4,
+            deleted: 1,
+            skipped: 0
+        }
+    );
+    assert_eq!(list_selectors(client.calls()), vec![MANAGED_SELECTOR]);
+    assert!(client.object("replay:legacy").is_none());
+
+    // Expired a moment ago: within the grace the record stays. The sweep lists the current
+    // hour's bucket and nothing else.
+    now.store(BASE + TTL_MS + 1, Ordering::SeqCst);
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!(
+        report,
+        SweepReport {
+            listed: 1,
+            deleted: 0,
+            skipped: 0
+        }
+    );
+    assert_eq!(list_selectors(client.calls()), vec![hours(500000..=500000)]);
+    assert!(client.object("replay:a").is_some());
+
+    now.store(BASE + TTL_MS + GRACE_MS, Ordering::SeqCst);
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!((report.listed, report.deleted), (1, 1));
+    assert!(client.object("replay:a").is_none());
+    client.calls();
+
+    // The next hour's record expires in hour 500001; hour 500000 is still listed until it is
+    // entirely past, and the long-lived record is never listed.
+    now.store(START + HOUR_MS + 5 * 60_000, Ordering::SeqCst);
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!((report.listed, report.deleted), (1, 0));
+    assert_eq!(list_selectors(client.calls()), vec![hours(500000..=500001)]);
+    now.store(BASE + HOUR_MS + GRACE_MS, Ordering::SeqCst);
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!((report.listed, report.deleted), (1, 1));
+    assert_eq!(list_selectors(client.calls()), vec![hours(500001..=500001)]);
+    assert!(client.object("replay:next-hour").is_none());
+    assert!(client.object("refresh:week").is_some());
+}
+
+#[tokio::test]
+async fn the_watermark_moves_past_an_hour_only_once_the_grace_after_it_has_passed() {
+    let (client, now, store) = store();
+    now.store(BASE, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    client.calls();
+    // Hour 500000 ended 10 s ago: a record expiring in its last second is not deletable yet,
+    // so the hour stays in the window.
+    now.store(START + HOUR_MS + 10_000, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![hours(500000..=500000)]);
+    // Past the grace, hour 500000 is listed one last time together with the new current hour.
+    now.store(START + HOUR_MS + 40_000, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![hours(500000..=500001)]);
+    now.store(START + HOUR_MS + 100_000, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![hours(500001..=500001)]);
+}
+
+#[tokio::test]
+async fn a_long_window_is_listed_in_chunks_of_twenty_hours() {
+    let (client, now, store) = store();
+    now.store(BASE, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    client.calls();
+    // 23 hours later the window spans hours 500000 to 500023.
+    now.store(BASE + 23 * HOUR_MS, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(
+        list_selectors(client.calls()),
+        vec![hours(500000..=500019), hours(500020..=500023)]
+    );
+}
+
+#[tokio::test]
+async fn a_full_pass_repeats_as_a_backstop_for_what_the_hours_missed() {
+    let (client, now, store) = store();
+    now.store(BASE, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    // Appears after the first pass without a label, for instance from a replica running older code.
+    client.put_object(&object_name("replay:missed"), b"1", BASE);
+    client
+        .unlabelled
+        .lock()
+        .unwrap()
+        .insert(object_name("replay:missed"));
+    client.calls();
+
+    now.store(BASE + 23 * HOUR_MS + 59 * 60_000, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    assert!(
+        client.object("replay:missed").is_some(),
+        "the hours do not list it"
+    );
+    assert!(list_selectors(client.calls())
+        .iter()
+        .all(|selector| selector != MANAGED_SELECTOR));
+
+    now.store(BASE + 24 * HOUR_MS, Ordering::SeqCst);
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!(report.deleted, 1);
+    assert!(client.object("replay:missed").is_none());
+    assert_eq!(list_selectors(client.calls()), vec![MANAGED_SELECTOR]);
+
+    // The next backstop is a day after this one, and the hours resume after it.
+    now.store(BASE + 24 * HOUR_MS + 60_000, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![hours(500024..=500024)]);
+    now.store(BASE + 48 * HOUR_MS, Ordering::SeqCst);
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![MANAGED_SELECTOR]);
+}
+
+#[tokio::test]
+async fn a_failed_sweep_leaves_the_watermark_and_a_failed_first_sweep_is_retried_in_full() {
+    let (client, now, store) = store();
+    now.store(BASE, Ordering::SeqCst);
+    client.failing.store(true, Ordering::SeqCst);
+    assert!(store.inner.sweep_tick().await.is_err());
+    client.failing.store(false, Ordering::SeqCst);
+    client.calls();
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![MANAGED_SELECTOR]);
+
+    assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
+    now.store(BASE + 2 * HOUR_MS, Ordering::SeqCst);
+    client.failing.store(true, Ordering::SeqCst);
+    assert!(store.inner.sweep_tick().await.is_err());
+    client.failing.store(false, Ordering::SeqCst);
+    client.calls();
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!(report.deleted, 1);
+    assert_eq!(list_selectors(client.calls()), vec![hours(500000..=500002)]);
+}
+
+#[tokio::test]
+async fn the_public_sweep_is_a_full_pass_that_restarts_the_hours() {
+    let (client, now, store) = store();
+    now.store(BASE, Ordering::SeqCst);
+    store.sweep().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![MANAGED_SELECTOR]);
+    store.inner.sweep_tick().await.unwrap();
+    assert_eq!(list_selectors(client.calls()), vec![hours(500000..=500000)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_sweeper_task_runs_a_full_pass_first_and_then_the_hours() {
+    let client = Arc::new(FakeClient::default());
+    let now = Arc::new(AtomicU64::new(BASE));
+    let source = now.clone();
+    let store = KubernetesStore::with_clock(
+        client.clone(),
+        Arc::new(move || source.load(Ordering::SeqCst)),
+    )
+    .with_sweeper(Duration::from_secs(60));
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    now.fetch_add(61_000, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        list_selectors(client.calls()),
+        vec![MANAGED_SELECTOR.to_owned(), hours(500000..=500000)]
+    );
+    drop(store);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unresponsive_api_server_fails_every_operation_at_the_deadline() {
+    let (client, _, store) = store();
+    assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
+    client.hang.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let check = |result: Result<_, StoreError>| match result {
+        Err(StoreError::Backend(error)) => {
+            let message = error.to_string();
+            assert!(message.contains("did not finish within 10s"), "{message}");
+            assert!(message.contains("unknown"), "{message}");
+        }
+        other => panic!("expected a backend error, got {other:?}"),
+    };
+    check(store.put_if_absent("replay:b", b"1", TTL).await.map(drop));
+    check(store.get("replay:a").await.map(drop));
+    check(
+        store
+            .compare_and_swap("replay:a", b"1", b"2", TTL)
+            .await
+            .map(drop),
+    );
+    check(store.delete("replay:a").await.map(drop));
+    assert_eq!(started.elapsed(), 4 * OPERATION_DEADLINE);
+    // The sweeper and the startup probe are bounded as well.
+    assert!(store.sweep().await.is_err());
+    assert!(store.probe().await.is_err());
+    assert_eq!(started.elapsed(), 6 * OPERATION_DEADLINE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_deadline_covers_a_whole_operation_not_each_request() {
+    let (client, now, store) = store();
+    // A slow but answering API server: 4 s per request.
+    *client.latency.lock().unwrap() = Duration::from_secs(4);
+    let started = tokio::time::Instant::now();
+    // create + get = 8 s: within the deadline.
+    assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
+    assert!(!store.put_if_absent("replay:a", b"2", TTL).await.unwrap());
+    assert_eq!(started.elapsed(), Duration::from_secs(4 + 8));
+    // Taking over an expired record is create + get + replace = 12 s: over it.
+    now.fetch_add(TTL_MS, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        store.put_if_absent("replay:a", b"3", TTL).await,
+        Err(StoreError::Backend(_))
+    ));
+    assert_eq!(started.elapsed(), OPERATION_DEADLINE);
 }

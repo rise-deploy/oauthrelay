@@ -27,6 +27,19 @@ struct ApiState {
     lose_next_write_response: bool,
     /// Answers every request with this status instead.
     fail_with: Option<u16>,
+    /// Answers every request on the resource as the API server does when the resource type is
+    /// not served, for instance because its CRD was removed.
+    missing_type: Option<MissingType>,
+    /// Verbs the access review denies.
+    denied_verbs: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum MissingType {
+    /// The API server's own 404 `Status`.
+    Status,
+    /// A 404 whose body is not a `Status`, as from a proxy in front of the API server.
+    PlainText,
 }
 
 #[derive(Clone)]
@@ -39,6 +52,31 @@ fn status(code: u16, reason: &str) -> Response<Body> {
     let body = json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":reason,"reason":reason,"code":code});
     Response::builder()
         .status(code)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// The 404 for an object that does not exist, as the API server writes it: `details` names the
+/// object, its group and its resource.
+fn not_found(name: &str) -> Response<Body> {
+    let body = json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+        "message":format!("transientrecords.oauthrelay.dev \"{name}\" not found"),
+        "reason":"NotFound",
+        "details":{"name":name,"group":"oauthrelay.dev","kind":"transientrecords"},"code":404});
+    Response::builder()
+        .status(404)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// The 404 for a resource type that is not served: the generic not-found handler's `Status`,
+/// which names no object.
+fn type_not_found() -> Response<Body> {
+    let body = json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",
+        "message":"the server could not find the requested resource","reason":"NotFound",
+        "details":{},"code":404});
+    Response::builder()
+        .status(404)
         .body(Body::from(body.to_string()))
         .unwrap()
 }
@@ -92,6 +130,28 @@ impl FakeApi {
                         return Ok::<_, Infallible>(status(code, "InjectedFailure"));
                     }
                     let path = parts.uri.path();
+                    if path == "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" {
+                        let verb = body["spec"]["resourceAttributes"]["verb"].as_str().unwrap();
+                        assert_eq!(body["spec"]["resourceAttributes"]["namespace"], NAMESPACE);
+                        assert_eq!(
+                            body["spec"]["resourceAttributes"]["resource"],
+                            collection.rsplit('/').next().unwrap()
+                        );
+                        let allowed = !state.denied_verbs.iter().any(|denied| denied == verb);
+                        let mut review = body.clone();
+                        review["status"] = json!({"allowed": allowed});
+                        return Ok(ok(201, review));
+                    }
+                    match state.missing_type {
+                        Some(MissingType::Status) => return Ok(type_not_found()),
+                        Some(MissingType::PlainText) => {
+                            return Ok(Response::builder()
+                                .status(404)
+                                .body(Body::from("404 page not found\n"))
+                                .unwrap())
+                        }
+                        None => {}
+                    }
                     let name = path
                         .strip_prefix(collection)
                         .unwrap_or_else(|| panic!("unexpected path {path}"))
@@ -112,6 +172,36 @@ impl FakeApi {
     }
 }
 
+/// Evaluates a label selector of comma-separated `key=value` and `key in (a,b)` terms.
+fn selector_matches(selector: &str, object: &Value) -> bool {
+    let mut terms = Vec::new();
+    let (mut depth, mut start) = (0, 0);
+    for (index, character) in selector.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                terms.push(&selector[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    terms.push(&selector[start..]);
+    terms.into_iter().all(|term| {
+        let labels = &object["metadata"]["labels"];
+        if let Some((key, values)) = term.split_once(" in (") {
+            let values = values.strip_suffix(')').unwrap();
+            labels[key]
+                .as_str()
+                .is_some_and(|label| values.split(',').any(|value| value == label))
+        } else {
+            let (key, value) = term.split_once('=').unwrap();
+            labels[key] == value
+        }
+    })
+}
+
 impl ApiState {
     fn bump(&mut self) -> String {
         self.versions += 1;
@@ -130,9 +220,6 @@ impl ApiState {
             ("GET", None) => {
                 let params = query(uri);
                 let selector = params.get("labelSelector");
-                let (key, value) = selector
-                    .and_then(|selector| selector.split_once('='))
-                    .unwrap_or_default();
                 let limit: usize = params
                     .get("limit")
                     .map_or(usize::MAX, |l| l.parse().unwrap());
@@ -140,7 +227,7 @@ impl ApiState {
                     .objects
                     .values()
                     .filter(|object| {
-                        selector.is_none() || object["metadata"]["labels"][key] == value
+                        selector.is_none_or(|selector| selector_matches(selector, object))
                     })
                     .filter(|object| {
                         params.get("continue").is_none_or(|token| {
@@ -160,7 +247,7 @@ impl ApiState {
             }
             ("GET", Some(name)) => match self.objects.get(name) {
                 Some(object) => ok(200, object.clone()),
-                None => status(404, "NotFound"),
+                None => not_found(name),
             },
             ("POST", None) => {
                 let name = body["metadata"]["name"].as_str().unwrap().to_owned();
@@ -176,7 +263,7 @@ impl ApiState {
             }
             ("PUT", Some(name)) => {
                 let Some(current) = self.objects.get(name) else {
-                    return status(404, "NotFound");
+                    return not_found(name);
                 };
                 if body["metadata"]["resourceVersion"] != current["metadata"]["resourceVersion"] {
                     return status(409, "Conflict");
@@ -190,7 +277,7 @@ impl ApiState {
             }
             ("DELETE", Some(name)) => {
                 let Some(current) = self.objects.get(name) else {
-                    return status(404, "NotFound");
+                    return not_found(name);
                 };
                 let precondition = &body["preconditions"]["resourceVersion"];
                 if !precondition.is_null()
@@ -242,7 +329,9 @@ async fn transient_record_objects_have_the_documented_shape() {
     assert_eq!(object["metadata"]["namespace"], NAMESPACE);
     assert_eq!(
         object["metadata"]["labels"],
-        json!({"app.kubernetes.io/managed-by":"oauthrelay","oauthrelay.dev/purpose":"replay"})
+        json!({"app.kubernetes.io/managed-by":"oauthrelay","oauthrelay.dev/purpose":"replay",
+            // START is the first instant of unix hour 500000, and the record lives 5 minutes.
+            "oauthrelay.dev/expires-hour":"500000"})
     );
     assert_eq!(
         object["spec"],
@@ -349,7 +438,7 @@ async fn sweeping_sends_a_resource_version_precondition_and_skips_changed_object
         .put_if_absent("replay:code:a", b"1", Duration::from_millis(1))
         .await
         .unwrap());
-    let later = KubernetesStore::with_clock(client.clone(), Arc::new(|| START + 10));
+    let later = KubernetesStore::with_clock(client.clone(), Arc::new(|| START + 40_000));
     api.requests();
     assert_eq!(
         later.sweep().await.unwrap(),
@@ -513,9 +602,123 @@ async fn probe_reports_a_forbidden_list() {
         "{error}"
     );
     assert!(
-        error.contains("grant get, list, create, update and delete"),
+        error.contains("the CRD is installed (`oauthrelay crds`)"),
         "{error}"
     );
+    assert!(
+        error.contains("grants get, list, create, update, delete"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn probe_reviews_each_verb_in_the_namespace_and_names_the_missing_ones() {
+    let api = FakeApi::default();
+    let (_, store) = kube_store(&api);
+    store.probe().await.unwrap();
+    let reviews: Vec<_> = api
+        .requests()
+        .into_iter()
+        .filter(|(method, uri, _)| method == "POST" && uri.contains("selfsubjectaccessreviews"))
+        .map(|(_, _, body)| {
+            let attributes = &body["spec"]["resourceAttributes"];
+            (
+                attributes["verb"].as_str().unwrap().to_owned(),
+                attributes["group"].as_str().unwrap().to_owned(),
+                attributes["resource"].as_str().unwrap().to_owned(),
+                attributes["namespace"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let expected: Vec<_> = ["get", "list", "create", "update", "delete"]
+        .map(|verb| {
+            (
+                verb.to_owned(),
+                "oauthrelay.dev".to_owned(),
+                "transientrecords".to_owned(),
+                NAMESPACE.to_owned(),
+            )
+        })
+        .into();
+    assert_eq!(reviews, expected);
+
+    api.state.lock().unwrap().denied_verbs = vec!["create".into(), "update".into()];
+    let error = format!("{:#}", store.probe().await.unwrap_err());
+    assert!(
+        error.contains("lacks create, update on transientrecords.oauthrelay.dev"),
+        "{error}"
+    );
+    // A review the API server refuses to evaluate fails startup too.
+    api.state.lock().unwrap().denied_verbs.clear();
+    {
+        let (client, _) = kube_store(&api);
+        api.state.lock().unwrap().fail_with = Some(500);
+        let error = format!("{:#}", client.permits("get").await.unwrap_err());
+        assert!(error.contains("SelfSubjectAccessReview"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn a_resource_type_that_is_not_served_is_an_error_not_an_absence() {
+    let record = NewRecord {
+        name: "oauthrelay-x",
+        key: "replay:x",
+        value: b"1",
+        expires_at_ms: START,
+    };
+    for missing in [MissingType::Status, MissingType::PlainText] {
+        let api = FakeApi::default();
+        let (client, store) = kube_store(&api);
+        api.state.lock().unwrap().missing_type = Some(missing);
+        assert!(client.get("oauthrelay-x").await.is_err());
+        assert!(client.replace(record, "1").await.is_err());
+        assert!(client.delete("oauthrelay-x", None).await.is_err());
+        assert!(client.delete("oauthrelay-x", Some("1")).await.is_err());
+        assert!(client.create(record).await.is_err());
+        assert!(client.list(MANAGED_SELECTOR, 1, None).await.is_err());
+        assert!(matches!(
+            store.get("replay:x").await,
+            Err(StoreError::Backend(_))
+        ));
+        assert!(matches!(
+            store.compare_and_swap("replay:x", b"1", b"2", TTL).await,
+            Err(StoreError::Backend(_))
+        ));
+        assert!(matches!(
+            store.delete("replay:x").await,
+            Err(StoreError::Backend(_))
+        ));
+        assert!(store.probe().await.is_err());
+    }
+}
+
+#[test]
+fn only_a_status_naming_the_object_is_a_missing_object() {
+    use kube::core::{response::StatusDetails, Status};
+    let status = |code, reason: &str, name: &str| Status {
+        code,
+        reason: reason.into(),
+        details: (!name.is_empty()).then(|| StatusDetails {
+            name: name.into(),
+            group: String::new(),
+            kind: String::new(),
+            uid: String::new(),
+            causes: Vec::new(),
+            retry_after_seconds: 0,
+        }),
+        ..Status::default()
+    };
+    use crate::kube_client::is_object_not_found as missing;
+    assert!(missing(&status(404, "NotFound", "obj"), "obj"));
+    // Another object's name, no details, another reason or another code.
+    assert!(!missing(&status(404, "NotFound", "other"), "obj"));
+    assert!(!missing(&status(404, "NotFound", ""), "obj"));
+    assert!(!missing(
+        &status(404, "Failed to parse error data", ""),
+        "obj"
+    ));
+    assert!(!missing(&status(404, "", "obj"), "obj"));
+    assert!(!missing(&status(403, "NotFound", "obj"), "obj"));
 }
 
 #[tokio::test]
@@ -632,7 +835,9 @@ async fn dex_auth_codes_have_the_shape_dex_expects_and_can_never_be_exchanged() 
     assert_eq!(object["metadata"]["namespace"], NAMESPACE);
     assert_eq!(
         object["metadata"]["labels"],
-        json!({"app.kubernetes.io/managed-by":"oauthrelay","oauthrelay.dev/purpose":"replay"})
+        json!({"app.kubernetes.io/managed-by":"oauthrelay","oauthrelay.dev/purpose":"replay",
+            // START is the first instant of unix hour 500000, and the record lives 5 minutes.
+            "oauthrelay.dev/expires-hour":"500000"})
     );
     // Exactly the fields of Dex's AuthCode that carry the record, and nothing else: no claims
     // and no scopes, and none of the unused string fields.
@@ -828,4 +1033,99 @@ fn resource_names_select_the_mapping() {
         ("dex.coreos.com", "v1", "AuthCode", "authcodes")
     );
     assert_eq!(dex.api_version, "dex.coreos.com/v1");
+}
+
+#[tokio::test]
+async fn every_write_rewrites_the_expiry_hour_label() {
+    let api = FakeApi::default();
+    let (_, store) = kube_store(&api);
+    let name = object_name("refresh:a");
+    let hour = |api: &FakeApi| {
+        api.object(&name).unwrap()["metadata"]["labels"]["oauthrelay.dev/expires-hour"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(store
+        .put_if_absent("refresh:a", b"1", Duration::from_secs(60))
+        .await
+        .unwrap());
+    assert_eq!(hour(&api), "500000");
+    // A swap restarts the TTL, so it moves the record to the later bucket.
+    assert!(store
+        .compare_and_swap("refresh:a", b"1", b"2", Duration::from_secs(2 * 3600))
+        .await
+        .unwrap());
+    assert_eq!(hour(&api), "500002");
+    // So does taking over an expired record.
+    let later = KubernetesStore::with_clock(
+        Arc::new(KubeClient::new(
+            api.client(),
+            NAMESPACE,
+            RecordMapping::TransientRecord,
+        )),
+        Arc::new(|| START + 3 * EXPIRY_BUCKET_MS),
+    );
+    assert!(later
+        .put_if_absent("refresh:a", b"3", Duration::from_secs(3600))
+        .await
+        .unwrap());
+    assert_eq!(hour(&api), "500004");
+}
+
+#[tokio::test]
+async fn bucket_sweeps_send_the_expiry_selector_and_delete_with_a_precondition() {
+    let api = FakeApi::default();
+    let (client, _) = kube_store(&api);
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(START + 600_000));
+    let source = now.clone();
+    let store = KubernetesStore::with_clock(
+        client.clone(),
+        Arc::new(move || source.load(std::sync::atomic::Ordering::SeqCst)),
+    );
+    assert!(store
+        .put_if_absent("replay:soon", b"1", Duration::from_secs(60))
+        .await
+        .unwrap());
+    assert!(store
+        .put_if_absent("replay:later", b"1", Duration::from_secs(3 * 3600))
+        .await
+        .unwrap());
+    // A legacy record: managed, but without the hour label.
+    api.state.lock().unwrap().objects.insert(
+        "oauthrelay-legacy".into(),
+        json!({"metadata":{"name":"oauthrelay-legacy","resourceVersion":"70",
+            "labels":{"app.kubernetes.io/managed-by":"oauthrelay"}},
+            "spec":{"key":"replay:legacy","value":"AQ==","expiresAt":"2001-01-01T00:00:00Z"}}),
+    );
+    api.requests();
+    // The first sweep is a full pass: it finds the legacy record too.
+    assert_eq!(store.inner.sweep_tick().await.unwrap().deleted, 1);
+    assert!(api.object("oauthrelay-legacy").is_none());
+    // The next lists hour 500000 only.
+    now.store(
+        START + 600_000 + 90_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    api.requests();
+    let report = store.inner.sweep_tick().await.unwrap();
+    assert_eq!((report.listed, report.deleted), (1, 1));
+    assert!(api.object(&object_name("replay:soon")).is_none());
+    assert!(api.object(&object_name("replay:later")).is_some());
+    let requests = api.requests();
+    let list = requests
+        .iter()
+        .find(|(method, ..)| method == "GET")
+        .unwrap();
+    let uri: axum::http::Uri = list.1.parse().unwrap();
+    assert_eq!(
+        query(&uri)["labelSelector"],
+        "app.kubernetes.io/managed-by=oauthrelay,oauthrelay.dev/expires-hour in (500000)"
+    );
+    assert_eq!(query(&uri)["limit"], "500");
+    let delete = requests
+        .iter()
+        .find(|(method, ..)| method == "DELETE")
+        .unwrap();
+    assert!(!delete.2["preconditions"]["resourceVersion"].is_null());
 }

@@ -25,6 +25,12 @@ pub const MANAGED_BY_VALUE: &str = "oauthrelay";
 pub const MANAGED_SELECTOR: &str = "app.kubernetes.io/managed-by=oauthrelay";
 /// Label carrying the key's purpose prefix (`replay`, `refresh`), for `kubectl get -l`.
 pub const PURPOSE_LABEL: &str = "oauthrelay.dev/purpose";
+/// Label carrying the unix hour (integer hours since the epoch, decimal) in which the record
+/// expires. It is rewritten on every write, since a write restarts the TTL, and lets the sweeper
+/// list only the records that can have expired.
+pub const EXPIRES_HOUR_LABEL: &str = "oauthrelay.dev/expires-hour";
+/// Milliseconds in one expiry bucket.
+pub const EXPIRY_BUCKET_MS: u64 = 3_600_000;
 /// Prefix of every object name the store writes.
 pub const NAME_PREFIX: &str = "oauthrelay-";
 
@@ -76,8 +82,28 @@ fn purpose(key: &str) -> Option<&str> {
     valid.then_some(segment)
 }
 
-pub(crate) fn labels(key: &str) -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::from([(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned())]);
+/// The expiry bucket of an instant: its unix hour.
+pub fn expiry_hour(expires_at_ms: u64) -> u64 {
+    expires_at_ms / EXPIRY_BUCKET_MS
+}
+
+/// The label selector matching managed objects that expire in one of `hours`.
+pub fn expiry_selector(hours: impl IntoIterator<Item = u64>) -> String {
+    let hours: Vec<_> = hours.into_iter().map(|hour| hour.to_string()).collect();
+    format!(
+        "{MANAGED_SELECTOR},{EXPIRES_HOUR_LABEL} in ({})",
+        hours.join(",")
+    )
+}
+
+pub(crate) fn labels(key: &str, expires_at_ms: u64) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::from([
+        (MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned()),
+        (
+            EXPIRES_HOUR_LABEL.to_owned(),
+            expiry_hour(expires_at_ms).to_string(),
+        ),
+    ]);
     if let Some(purpose) = purpose(key) {
         labels.insert(PURPOSE_LABEL.to_owned(), purpose.to_owned());
     }
@@ -122,6 +148,9 @@ const DEX_REDIRECT_URI: &str = "urn:oauthrelay:transient-record";
 const DEX_CONNECTOR_ID: &str = "oauthrelay";
 
 impl RecordMapping {
+    /// Every supported mapping.
+    pub const ALL: [Self; 2] = [Self::TransientRecord, Self::DexAuthCode];
+
     pub fn resource_name(self) -> &'static str {
         match self {
             Self::TransientRecord => "transientrecords.oauthrelay.dev",
@@ -131,9 +160,19 @@ impl RecordMapping {
 
     /// The mapping for a `plural.group` resource name, if the store supports it.
     pub fn from_resource_name(name: &str) -> Option<Self> {
-        [Self::TransientRecord, Self::DexAuthCode]
+        Self::ALL
             .into_iter()
             .find(|mapping| mapping.resource_name() == name)
+    }
+
+    /// What must hold for the resource to be served, for startup messages.
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            Self::TransientRecord => "the CRD is installed (`oauthrelay crds`)",
+            Self::DexAuthCode => {
+                "Dex is installed and running in that namespace (it creates the CRD)"
+            }
+        }
     }
 
     pub fn api_resource(self) -> ApiResource {
@@ -149,7 +188,7 @@ impl RecordMapping {
     /// The full object for `record`, without a `resourceVersion`.
     pub fn encode(self, namespace: &str, record: &NewRecord<'_>) -> anyhow::Result<DynamicObject> {
         let mut object = DynamicObject::new(record.name, &self.api_resource()).within(namespace);
-        object.metadata.labels = Some(labels(record.key));
+        object.metadata.labels = Some(labels(record.key, record.expires_at_ms));
         let expires_at = format_time(record.expires_at_ms)?;
         object.data = match self {
             Self::TransientRecord => serde_json::json!({
