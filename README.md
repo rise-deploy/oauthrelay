@@ -32,7 +32,7 @@ configuration; Amazon Cognito is one example.
 - Authorization-code flow with independent upstream S256 PKCE.
 - Public, shared-secret, upstream-client, and `private_key_jwt` relay authentication, including issuer/subject constraints for workload tokens.
 - Exact URI, HTTPS-origin, and variable-port loopback redirect policies with sealed state/code envelopes.
-- Transparent authorization, token, refresh, discovery metadata, and JWKS routing.
+- Transparent authorization, token, refresh, discovery metadata, and JWKS routing, with optional sealed refresh-token handles that keep upstream refresh tokens out of browsers.
 - Relay-specific admission rules over verified upstream ID-token claims, with typed comparisons and glob matching.
 - Multi-document File configuration with local or AWS-backed secret references.
 - Namespaced Kubernetes custom resources, live watches, and Kubernetes Secret references.

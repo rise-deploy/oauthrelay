@@ -10,8 +10,8 @@ upstream name `U`, oauthrelay serves:
 | --- | --- |
 | `GET {B}/relay/{R}/authorize` | Validates redirect and scope policy, creates independent upstream state and S256 PKCE, then redirects to the upstream. |
 | `GET {B}/upstream/{U}/callback` | Validates upstream-bound state, exchanges the upstream code, and returns a sealed code to the originating relay redirect. |
-| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. |
-| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. |
+| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. A relay with `refreshTokens.mode: sealed` replaces only the `refresh_token` member. |
+| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. A `sealed` relay opens the presented handle first. |
 | `OPTIONS {B}/relay/{R}/token` | Returns CORS headers only for an allowed origin. |
 | `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
 | `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
@@ -58,6 +58,23 @@ response does not include tokens or rejected claim values.
 Refresh grants preserve extension fields and replace downstream authentication with the referenced
 upstream client credentials. Unsupported grants and invalid requests use RFC 6749-style JSON error
 bodies.
+
+### Sealed refresh tokens
+
+With `refreshTokens.mode: sealed` (see [Refresh tokens](/oauthrelay/configuration/#refresh-tokens)),
+the relay never returns the upstream refresh token. In a successful JSON response from either grant,
+`refresh_token` is a handle beginning with `rrt1.`; the status, content type, member order, and all
+other members are unchanged.
+
+```json
+{"access_token":"ya29.…","refresh_token":"rrt1.v1.…","expires_in":3599,"token_type":"Bearer"}
+```
+
+The refresh grant takes that handle as `refresh_token`. Anything else, including a raw upstream
+token, a handle from another relay, or a modified handle, returns HTTP 400 with
+`error=invalid_grant`, and the request is not sent to the upstream. If the upstream refresh response
+has no `refresh_token`, neither does the relay's response, and the client keeps its handle.
+Non-2xx and non-JSON upstream responses are returned unchanged.
 
 ## Transparent metadata
 

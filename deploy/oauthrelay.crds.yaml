@@ -1717,6 +1717,22 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+              refreshTokens:
+                description: >-
+                  How upstream refresh tokens are handed to relying parties. Defaults to
+                  `passthrough`.
+                properties:
+                  mode:
+                    default: passthrough
+                    description: |-
+                      `passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque
+                      handle in its place, so a refresh token that leaves the relying party cannot be used
+                      at the upstream directly.
+                    enum:
+                    - passthrough
+                    - sealed
+                    type: string
+                type: object
               requiredIdTokenClaims:
                 additionalProperties:
                   type: string
