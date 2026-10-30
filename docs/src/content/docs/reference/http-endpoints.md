@@ -10,8 +10,8 @@ upstream name `U`, oauthrelay serves:
 | --- | --- |
 | `GET {B}/relay/{R}/authorize` | Validates redirect and scope policy, creates independent upstream state and S256 PKCE, then redirects to the upstream. |
 | `GET {B}/upstream/{U}/callback` | Validates upstream-bound state, exchanges the upstream code, and returns a sealed code to the originating relay redirect. |
-| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. |
-| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. |
+| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. A relay with `refreshTokens.mode: sealed` or `rotating` replaces only the `refresh_token` member. |
+| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. A `sealed` relay opens the presented handle first; a `rotating` relay claims it and returns a successor handle. |
 | `OPTIONS {B}/relay/{R}/token` | Returns CORS headers only for an allowed origin. |
 | `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
 | `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
@@ -47,8 +47,9 @@ application.
 
 The authorization-code request must use the same redirect URI and, when present, the matching PKCE
 verifier. Successful exchange returns the upstream status, content type, and body bytes unchanged
-under `no-store`/`no-cache` response headers. The standalone replay cache rejects a second use in
-the same process.
+under `no-store`/`no-cache` response headers. The transient store rejects a second use: in the same
+process with the default memory store, deployment-wide with DynamoDB. If the store is unavailable,
+the endpoint returns HTTP 503 `server_error` and leaves the code unconsumed.
 
 When `requiredIdTokenClaims` is non-empty, oauthrelay verifies the signed upstream ID token before
 returning a successful stored response. A missing or different claim returns HTTP 400 with
@@ -58,6 +59,57 @@ response does not include tokens or rejected claim values.
 Refresh grants preserve extension fields and replace downstream authentication with the referenced
 upstream client credentials. Unsupported grants and invalid requests use RFC 6749-style JSON error
 bodies.
+
+### Sealed refresh tokens
+
+With `refreshTokens.mode: sealed` (see [Refresh tokens](/oauthrelay/configuration/#refresh-tokens)),
+the relay never returns the upstream refresh token. In a successful JSON response from either grant,
+`refresh_token` is a handle beginning with `rrt1.`; the status, content type, member order, and all
+other members are unchanged.
+
+```json
+{"access_token":"ya29.…","refresh_token":"rrt1.v1.…","expires_in":3599,"token_type":"Bearer"}
+```
+
+The refresh grant takes that handle as `refresh_token`. Anything else, including a raw upstream
+token, a handle from another relay, or a modified handle, returns HTTP 400 with
+`error=invalid_grant`, and the request is not sent to the upstream. If the upstream refresh response
+has no `refresh_token`, neither does the relay's response, and the client keeps its handle.
+Non-2xx upstream responses are returned unchanged. The relay sends `Accept: application/json` to
+the upstream and reads any 2xx body as JSON whatever its content type; a 2xx body that is not a
+JSON object but contains a `refresh_token` field (for example form-encoded) is answered with 502
+`server_error` and is never returned. A refresh token with a handle prefix (`rrt<N>.`) is never sent
+to the upstream as-is in any mode, including `passthrough`: a handle the mode can open is opened,
+any other is `invalid_grant`.
+
+### Rotating refresh tokens
+
+With `refreshTokens.mode: rotating` (see
+[Rotating refresh tokens](/oauthrelay/configuration/#rotating-refresh-tokens)) handles begin with
+`rrt2.` and are single use. A successful refresh response always contains a successor handle,
+even when the provider returned none; present that one next.
+
+```json
+{"access_token":"ya29.…","refresh_token":"rrt2.Zk3…","expires_in":3599,"token_type":"Bearer"}
+```
+
+| Situation | Response |
+| --- | --- |
+| Handle unknown, expired, revoked, past the family's maximum lifetime, not issued by this relay, or stored under a seal key that is no longer configured | 400 `invalid_grant`; the provider is not contacted. |
+| Handle already used, within `gracePeriodSeconds` of its rotation | The response of that rotation again, with the same successor handle. |
+| Handle already used, after the grace period | 400 `invalid_grant`, and the whole family is revoked. |
+| Another request is rotating the same handle and does not finish within five seconds | 503 `temporarily_unavailable` with `Retry-After: 1`; retry. |
+| Provider unreachable or answers an error | The provider's error, or 502 `server_error`; the handle stays usable. |
+| Provider answers `invalid_grant` | The provider's error, and the family is revoked. |
+| Provider answers success without a JSON object body | 502 `server_error`; the handle stays usable. |
+| Transient store unreachable | 503 `server_error`. |
+| `rrt1.` handle from this relay when it was `sealed`, younger than `maxLifetimeSeconds` | Accepted (and accepted again if presented again: sealed handles are stateless); the response carries an `rrt2.` handle in a new family. |
+| `rrt1.` handle older than `maxLifetimeSeconds` | 400 `invalid_grant`. |
+| Provider answers a 2xx body that is not a JSON object but contains `refresh_token` (code or refresh grant) | 502 `server_error`; the token is never returned. |
+| The family is revoked while the request is in flight | 400 `invalid_grant`; no tokens are returned. |
+
+A relay in this mode with no transient store configured returns 500 `server_error` from the
+authorize endpoint and both grants and logs the cause.
 
 ## Transparent metadata
 

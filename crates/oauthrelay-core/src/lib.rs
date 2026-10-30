@@ -10,7 +10,7 @@
 //! let config = RelayConfig {
 //!     public_url: "https://rise.example.com/oidc".parse().unwrap(),
 //!     sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
-//!     replay_cache: None,
+//!     store: None,
 //!     http: reqwest::Client::new(),
 //!     client_assertion_http: Default::default(),
 //!     allow_localhost_loopback: false,
@@ -23,9 +23,12 @@ mod config;
 mod id_token_policy;
 mod jwks;
 mod model;
+mod refresh_handle;
 mod resolver;
+mod rotation;
 mod router;
 mod seal;
+mod store;
 
 pub use config::*;
 pub use id_token_policy::*;
@@ -34,3 +37,4 @@ pub use model::*;
 pub use resolver::*;
 pub use router::*;
 pub use seal::*;
+pub use store::*;

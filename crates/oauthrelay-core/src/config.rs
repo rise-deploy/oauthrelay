@@ -1,6 +1,7 @@
 use crate::{
-    ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher, Relay,
-    ResourceKey, SecretString, TokenEndpointAuthMethod, Upstream,
+    ClientAuth, ClientJwks, IdTokenPolicy, ProviderSnapshot, PublicJwkSet, RedirectMatcher,
+    RefreshTokenMode, RefreshTokens, Relay, ResourceKey, SecretString, TokenEndpointAuthMethod,
+    Upstream,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -124,17 +125,32 @@ pub struct OAuthClient {
     pub client_id: String,
     /// Provider client secret, supplied inline or through a provider-supported reference.
     pub client_secret: SecretValue,
-    /// Authentication used at the provider token endpoint.
+    /// How the relay authenticates at the provider token endpoint. Choose `client_secret_basic`
+    /// for providers that accept only HTTP Basic client authentication. Defaults to
+    /// `client_secret_post`.
     #[serde(default)]
-    pub token_endpoint_auth_method: UpstreamTokenEndpointAuthMethod,
+    pub token_endpoint_auth_method: TokenEndpointAuthMethodSpec,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum UpstreamTokenEndpointAuthMethod {
+/// Client authentication method at the provider token endpoint.
+pub enum TokenEndpointAuthMethodSpec {
+    /// Send `client_id` and `client_secret` as form fields in the request body.
     #[default]
     ClientSecretPost,
+    /// Send the credentials in an HTTP Basic `Authorization` header (RFC 6749 section 2.3.1) and
+    /// leave them out of the request body.
     ClientSecretBasic,
+}
+
+impl From<TokenEndpointAuthMethodSpec> for TokenEndpointAuthMethod {
+    fn from(spec: TokenEndpointAuthMethodSpec) -> Self {
+        match spec {
+            TokenEndpointAuthMethodSpec::ClientSecretPost => Self::ClientSecretPost,
+            TokenEndpointAuthMethodSpec::ClientSecretBasic => Self::ClientSecretBasic,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -152,11 +168,58 @@ pub struct RelayResourceSpec {
     /// Typed admission policy applied to the verified upstream ID token, in addition to requiredIdTokenClaims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token_policy: Option<IdTokenPolicy>,
+    /// How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.
+    #[serde(default, skip_serializing_if = "RefreshTokensSpec::is_default")]
+    pub refresh_tokens: RefreshTokensSpec,
     /// Authentication required at the relay token endpoint.
     pub client_authentication: ClientAuthentication,
     /// Explicit application redirect matchers.
     #[schemars(length(min = 1))]
     pub redirect_policy: Vec<RedirectPolicyEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Refresh-token handling for token responses.
+pub struct RefreshTokensSpec {
+    /// `passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque
+    /// handle in its place, so a refresh token that leaves the relying party cannot be used
+    /// at the upstream directly. `rotating` returns single-use handles whose state lives in the
+    /// transient store, so a replayed handle is detected and revokes its whole token family;
+    /// it requires a store shared by all serving instances.
+    #[serde(default)]
+    pub mode: RefreshTokenModeSpec,
+    /// `rotating` only: seconds during which an already-rotated handle is still answered with the
+    /// same successor, so concurrent tabs and retried requests are safe. 1 to 300; defaults to 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 300))]
+    pub grace_period_seconds: Option<u32>,
+    /// `rotating` only: absolute lifetime of a refresh-token family in seconds, measured from the
+    /// original sign-in. After it a refresh fails with `invalid_grant`. At least
+    /// `gracePeriodSeconds`; defaults to 2592000 (30 days).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 315360000))]
+    pub max_lifetime_seconds: Option<u32>,
+}
+
+impl RefreshTokensSpec {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+/// How the relay presents upstream refresh tokens downstream.
+pub enum RefreshTokenModeSpec {
+    /// Return the upstream refresh token unchanged.
+    #[default]
+    Passthrough,
+    /// Replace the upstream refresh token with a handle sealed to this relay.
+    Sealed,
+    /// Replace the upstream refresh token with a single-use handle; each refresh issues a
+    /// successor and a replayed handle revokes the family.
+    Rotating,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -236,7 +299,7 @@ pub enum ClientAuthentication {
     /// Require a signed client assertion, optionally from a federated workload issuer.
     PrivateKeyJwt {
         /// Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.
-        /// Requires a replay cache shared by all serving instances; false permits reusable workload JWTs.
+        /// Requires a transient store shared by all serving instances; false permits reusable workload JWTs.
         #[serde(
             default,
             rename = "requireSingleUse",
@@ -427,15 +490,11 @@ pub async fn compile_resources(
             jwks_uri: parse_optional_url("spec.endpoints.jwks", resource.spec.endpoints.jwks)?,
             client_id: resource.spec.oauth_client.client_id,
             client_secret: secret,
-            token_endpoint_auth_method: match resource.spec.oauth_client.token_endpoint_auth_method
-            {
-                UpstreamTokenEndpointAuthMethod::ClientSecretPost => {
-                    TokenEndpointAuthMethod::ClientSecretPost
-                }
-                UpstreamTokenEndpointAuthMethod::ClientSecretBasic => {
-                    TokenEndpointAuthMethod::ClientSecretBasic
-                }
-            },
+            token_endpoint_auth_method: resource
+                .spec
+                .oauth_client
+                .token_endpoint_auth_method
+                .into(),
         };
         upstream
             .validate()
@@ -515,6 +574,8 @@ pub async fn compile_resources(
             allowed_scopes: resource.spec.scopes.allowed,
             required_id_token_claims: resource.spec.required_id_token_claims,
             id_token_policy: resource.spec.id_token_policy,
+            refresh_tokens: compile_refresh_tokens(&resource.spec.refresh_tokens)
+                .with_context(|| format!("Relay/{key} spec.refreshTokens"))?,
             redirect_policy,
         };
         relay
@@ -543,6 +604,33 @@ async fn resolve_secret(
     let value = resolver.resolve_source(source).await?;
     cache.insert(source.clone(), value.clone());
     Ok(value)
+}
+
+fn compile_refresh_tokens(spec: &RefreshTokensSpec) -> anyhow::Result<RefreshTokens> {
+    let mode = match spec.mode {
+        RefreshTokenModeSpec::Passthrough => RefreshTokenMode::Passthrough,
+        RefreshTokenModeSpec::Sealed => RefreshTokenMode::Sealed,
+        RefreshTokenModeSpec::Rotating => RefreshTokenMode::Rotating,
+    };
+    if mode != RefreshTokenMode::Rotating
+        && (spec.grace_period_seconds.is_some() || spec.max_lifetime_seconds.is_some())
+    {
+        return Err(anyhow!(
+            "gracePeriodSeconds and maxLifetimeSeconds apply only to mode: rotating"
+        ));
+    }
+    let defaults = RefreshTokens::default();
+    let compiled = RefreshTokens {
+        mode,
+        grace_period_seconds: spec
+            .grace_period_seconds
+            .map_or(defaults.grace_period_seconds, u64::from),
+        max_lifetime_seconds: spec
+            .max_lifetime_seconds
+            .map_or(defaults.max_lifetime_seconds, u64::from),
+    };
+    compiled.validate().map_err(anyhow::Error::msg)?;
+    Ok(compiled)
 }
 
 fn resource_key(kind: &str, value: &str) -> anyhow::Result<ResourceKey> {
@@ -601,8 +689,7 @@ mod tests {
                     oauth_client: OAuthClient {
                         client_id: "client".into(),
                         client_secret: secret,
-                        token_endpoint_auth_method:
-                            UpstreamTokenEndpointAuthMethod::ClientSecretPost,
+                        token_endpoint_auth_method: TokenEndpointAuthMethodSpec::default(),
                     },
                 },
             }),
@@ -619,6 +706,7 @@ mod tests {
                     scopes: ScopePolicy::default(),
                     required_id_token_claims: HashMap::new(),
                     id_token_policy: None,
+                    refresh_tokens: RefreshTokensSpec::default(),
                     client_authentication: ClientAuthentication::UpstreamClient,
                     redirect_policy: vec![RedirectPolicyEntry::Uri(UriRedirectPolicy {
                         uri: "https://app.example/callback".into(),
@@ -670,7 +758,7 @@ mod tests {
             unreachable!()
         };
         upstream.spec.oauth_client.token_endpoint_auth_method =
-            UpstreamTokenEndpointAuthMethod::ClientSecretBasic;
+            TokenEndpointAuthMethodSpec::ClientSecretBasic;
         let snapshot = compile_resources(resources, &secrets).await.unwrap();
         assert_eq!(
             snapshot
@@ -681,6 +769,44 @@ mod tests {
                 .token_endpoint_auth_method,
             TokenEndpointAuthMethod::ClientSecretBasic
         );
+    }
+
+    #[test]
+    fn token_endpoint_auth_method_defaults_to_post_and_rejects_unknown_values() {
+        let client = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({"clientId": "id", "clientSecret": {"value": "s"}});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<OAuthClient>(value)
+        };
+        assert_eq!(
+            client(serde_json::json!({}))
+                .unwrap()
+                .token_endpoint_auth_method,
+            TokenEndpointAuthMethodSpec::ClientSecretPost
+        );
+        for (value, expected) in [
+            (
+                "client_secret_post",
+                TokenEndpointAuthMethodSpec::ClientSecretPost,
+            ),
+            (
+                "client_secret_basic",
+                TokenEndpointAuthMethodSpec::ClientSecretBasic,
+            ),
+        ] {
+            assert_eq!(
+                client(serde_json::json!({"tokenEndpointAuthMethod": value}))
+                    .unwrap()
+                    .token_endpoint_auth_method,
+                expected
+            );
+        }
+        for value in ["client_secret_jwt", "clientSecretBasic", "basic"] {
+            assert!(client(serde_json::json!({"tokenEndpointAuthMethod": value})).is_err());
+        }
     }
 
     #[tokio::test]
@@ -709,6 +835,115 @@ mod tests {
         };
         relay.spec.id_token_policy = Some(serde_json::from_value(serde_json::json!({})).unwrap());
         assert!(compile_resources(resources, &secrets).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn compiles_refresh_token_mode_and_defaults_to_passthrough() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let snapshot = compile_resources(resources.clone(), &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.relays.values().next().unwrap().refresh_tokens.mode,
+            RefreshTokenMode::Passthrough
+        );
+        let mut value = serde_json::to_value(&resources[1]).unwrap();
+        assert!(value["spec"].get("refreshTokens").is_none());
+        value["spec"]["refreshTokens"] = serde_json::json!({"mode": "sealed"});
+        let sealed: ResourceDocument = serde_json::from_value(value.clone()).unwrap();
+        let snapshot = compile_resources(vec![resources[0].clone(), sealed], &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.relays.values().next().unwrap().refresh_tokens.mode,
+            RefreshTokenMode::Sealed
+        );
+        for invalid in [
+            serde_json::json!({"mode": "sealed", "gracePeriod": "1m"}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": "30"}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": -1}),
+        ] {
+            value["spec"]["refreshTokens"] = invalid;
+            assert!(serde_json::from_value::<ResourceDocument>(value.clone()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn compiles_rotating_refresh_tokens_with_defaults_and_bounds() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let resources = documents(SecretValue::Value(InlineSecret {
+            value: "secret".into(),
+        }));
+        let mut value = serde_json::to_value(&resources[1]).unwrap();
+        let compile = |refresh_tokens: serde_json::Value| {
+            let mut value = value.clone();
+            value["spec"]["refreshTokens"] = refresh_tokens;
+            let relay: ResourceDocument = serde_json::from_value(value).unwrap();
+            let resources = vec![resources[0].clone(), relay];
+            let secrets = &secrets;
+            async move {
+                compile_resources(resources, secrets).await.map(|snapshot| {
+                    snapshot
+                        .relays
+                        .values()
+                        .next()
+                        .unwrap()
+                        .refresh_tokens
+                        .clone()
+                })
+            }
+        };
+        let defaults = compile(serde_json::json!({"mode": "rotating"}))
+            .await
+            .unwrap();
+        assert_eq!(defaults.mode, RefreshTokenMode::Rotating);
+        assert_eq!(defaults.grace_period_seconds, 30);
+        assert_eq!(defaults.max_lifetime_seconds, 30 * 24 * 60 * 60);
+        let custom = compile(serde_json::json!({
+            "mode": "rotating", "gracePeriodSeconds": 300, "maxLifetimeSeconds": 3600
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            (custom.grace_period_seconds, custom.max_lifetime_seconds),
+            (300, 3600)
+        );
+
+        for invalid in [
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 0}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 301}),
+            serde_json::json!({"mode": "rotating", "maxLifetimeSeconds": 0}),
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 60, "maxLifetimeSeconds": 59}),
+            serde_json::json!({"mode": "rotating", "maxLifetimeSeconds": 315_360_001_u64}),
+            // Rotation settings mean nothing outside rotating mode and are not silently ignored.
+            serde_json::json!({"mode": "sealed", "gracePeriodSeconds": 30}),
+            serde_json::json!({"mode": "passthrough", "maxLifetimeSeconds": 3600}),
+            serde_json::json!({"gracePeriodSeconds": 30}),
+        ] {
+            let error = compile(invalid.clone()).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("refresh"),
+                "{invalid}: {error:#}"
+            );
+        }
+        value["spec"]["refreshTokens"] =
+            serde_json::json!({"mode": "rotating", "gracePeriodSeconds": 30});
+        let document: ResourceDocument = serde_json::from_value(value).unwrap();
+        let ResourceDocument::Relay(relay) = &document else {
+            unreachable!()
+        };
+        let serialized = serde_json::to_value(relay).unwrap();
+        assert_eq!(serialized["spec"]["refreshTokens"]["mode"], "rotating");
+        assert!(serialized["spec"]["refreshTokens"]
+            .get("maxLifetimeSeconds")
+            .is_none());
     }
 
     #[test]

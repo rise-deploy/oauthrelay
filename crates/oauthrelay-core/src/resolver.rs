@@ -1,17 +1,13 @@
 use crate::{Relay, RelayMap, ResourceKey, Upstream, UpstreamMap};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 
 #[derive(Debug, Error)]
 #[error("resource resolution failed: {0}")]
 pub struct ResolveError(pub String);
-
-#[derive(Debug, Error)]
-#[error("replay cache failed: {0}")]
-pub struct CacheError(pub String);
 
 #[async_trait]
 pub trait ResourceResolver: Send + Sync + 'static {
@@ -56,32 +52,6 @@ pub trait ConfigProvider: Send + Sync + 'static {
     /// Produces one complete snapshot for startup or invocation-driven refresh.
     async fn load(&self) -> anyhow::Result<ProviderSnapshot>;
     async fn run(self: Arc<Self>, tx: watch::Sender<ProviderSnapshot>) -> anyhow::Result<()>;
-}
-
-#[async_trait]
-pub trait ReplayCache: Send + Sync + 'static {
-    /// Atomically record an absent ID for the full TTL; return false if already present.
-    /// Share durable storage across serving instances when enforcing deployment-wide single use.
-    async fn first_use(&self, id: &str, ttl: Duration) -> Result<bool, CacheError>;
-}
-
-#[derive(Default)]
-pub struct MemoryReplayCache {
-    entries: Mutex<HashMap<String, std::time::Instant>>,
-}
-
-#[async_trait]
-impl ReplayCache for MemoryReplayCache {
-    async fn first_use(&self, id: &str, ttl: Duration) -> Result<bool, CacheError> {
-        let now = std::time::Instant::now();
-        let mut entries = self.entries.lock().await;
-        entries.retain(|_, expires| *expires > now);
-        if entries.contains_key(id) {
-            return Ok(false);
-        }
-        entries.insert(id.to_owned(), now + ttl);
-        Ok(true)
-    }
 }
 
 pub struct Registry {
@@ -161,6 +131,7 @@ impl ResourceResolver for ProviderSnapshot {
 mod tests {
     use super::*;
     use crate::{ClientAuth, RedirectMatcher, SecretString, TokenEndpointAuthMethod};
+    use std::collections::HashMap;
     use url::Url;
 
     fn upstream(key: &str) -> Arc<Upstream> {
@@ -185,6 +156,7 @@ mod tests {
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
             id_token_policy: None,
+            refresh_tokens: Default::default(),
             redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
         })
     }

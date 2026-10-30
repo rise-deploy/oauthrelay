@@ -111,15 +111,17 @@ pub struct Upstream {
     pub jwks_uri: Option<Url>,
     pub client_id: String,
     pub client_secret: SecretString,
-    #[serde(default)]
     pub token_endpoint_auth_method: TokenEndpointAuthMethod,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+/// How the upstream client authenticates at the provider token endpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenEndpointAuthMethod {
+    /// `client_id` and `client_secret` are form fields in the request body.
     #[default]
     ClientSecretPost,
+    /// The credentials travel in an HTTP Basic `Authorization` header and not in the body.
     ClientSecretBasic,
 }
 
@@ -134,7 +136,71 @@ pub struct Relay {
     pub required_id_token_claims: HashMap<String, String>,
     #[serde(default)]
     pub id_token_policy: Option<crate::IdTokenPolicy>,
+    #[serde(default)]
+    pub refresh_tokens: RefreshTokens,
     pub redirect_policy: Vec<RedirectMatcher>,
+}
+
+/// Default time an already-rotated handle keeps answering with its recorded successor.
+pub const DEFAULT_GRACE_PERIOD_SECONDS: u64 = 30;
+/// Longest accepted grace period (five minutes).
+pub const MAX_GRACE_PERIOD_SECONDS: u64 = 5 * 60;
+/// Default absolute lifetime of a rotating refresh-token family (30 days).
+pub const DEFAULT_MAX_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+/// Longest accepted family lifetime (ten years); it only guards against arithmetic overflow and
+/// absurd TTLs.
+pub const MAX_MAX_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+
+/// How a relay hands upstream refresh tokens to downstream clients.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct RefreshTokens {
+    pub mode: RefreshTokenMode,
+    /// `rotating` only: how long a rotated handle still answers with its recorded successor.
+    pub grace_period_seconds: u64,
+    /// `rotating` only: absolute lifetime of a family, measured from the code grant that created it.
+    pub max_lifetime_seconds: u64,
+}
+
+impl Default for RefreshTokens {
+    fn default() -> Self {
+        Self {
+            mode: RefreshTokenMode::default(),
+            grace_period_seconds: DEFAULT_GRACE_PERIOD_SECONDS,
+            max_lifetime_seconds: DEFAULT_MAX_LIFETIME_SECONDS,
+        }
+    }
+}
+
+impl RefreshTokens {
+    /// Rejects rotation parameters outside their bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_GRACE_PERIOD_SECONDS).contains(&self.grace_period_seconds) {
+            return Err(format!(
+                "refresh_tokens.grace_period_seconds must be between 1 and {MAX_GRACE_PERIOD_SECONDS}"
+            ));
+        }
+        if self.max_lifetime_seconds < self.grace_period_seconds
+            || self.max_lifetime_seconds > MAX_MAX_LIFETIME_SECONDS
+        {
+            return Err(format!(
+                "refresh_tokens.max_lifetime_seconds must be between grace_period_seconds and {MAX_MAX_LIFETIME_SECONDS}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshTokenMode {
+    /// The upstream refresh token is returned to the client unchanged.
+    #[default]
+    Passthrough,
+    /// Token responses carry a sealed handle that only this relay can open.
+    Sealed,
+    /// Token responses carry a single-use handle whose state lives in the transient store.
+    Rotating,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -290,6 +356,7 @@ impl Relay {
         if let Some(policy) = &self.id_token_policy {
             policy.validate()?;
         }
+        self.refresh_tokens.validate()?;
         let mut configured_scopes = HashSet::new();
         for scope in &self.scopes {
             if !valid_scope_token(scope) {
@@ -509,6 +576,7 @@ mod tests {
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
             id_token_policy: None,
+            refresh_tokens: RefreshTokens::default(),
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb?channel=stable&next=%2Fhome")
                     .unwrap(),
@@ -587,6 +655,7 @@ mod tests {
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
             id_token_policy: None,
+            refresh_tokens: RefreshTokens::default(),
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb").unwrap(),
                 RedirectMatcher::origin("https://preview.example").unwrap(),

@@ -155,7 +155,7 @@
               "type": "string"
             },
             "requireSingleUse": {
-              "description": "Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.\nRequires a replay cache shared by all serving instances; false permits reusable workload JWTs.",
+              "description": "Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.\nRequires a transient store shared by all serving instances; false permits reusable workload JWTs.",
               "type": "boolean"
             },
             "subject": {
@@ -414,9 +414,9 @@
           "$ref": "#/$defs/SecretValue"
         },
         "tokenEndpointAuthMethod": {
-          "description": "Authentication used at the provider token endpoint.",
-          "default": "client_secret_post",
-          "$ref": "#/$defs/UpstreamTokenEndpointAuthMethod"
+          "description": "How the relay authenticates at the provider token endpoint. Choose `client_secret_basic`\nfor providers that accept only HTTP Basic client authentication. Defaults to\n`client_secret_post`.",
+          "$ref": "#/$defs/TokenEndpointAuthMethodSpec",
+          "default": "client_secret_post"
         }
       },
       "additionalProperties": false,
@@ -727,6 +727,58 @@
         "valueFrom"
       ]
     },
+    "RefreshTokenModeSpec": {
+      "description": "How the relay presents upstream refresh tokens downstream.",
+      "oneOf": [
+        {
+          "description": "Return the upstream refresh token unchanged.",
+          "type": "string",
+          "const": "passthrough"
+        },
+        {
+          "description": "Replace the upstream refresh token with a handle sealed to this relay.",
+          "type": "string",
+          "const": "sealed"
+        },
+        {
+          "description": "Replace the upstream refresh token with a single-use handle; each refresh issues a\nsuccessor and a replayed handle revokes the family.",
+          "type": "string",
+          "const": "rotating"
+        }
+      ]
+    },
+    "RefreshTokensSpec": {
+      "description": "Refresh-token handling for token responses.",
+      "type": "object",
+      "properties": {
+        "gracePeriodSeconds": {
+          "description": "`rotating` only: seconds during which an already-rotated handle is still answered with the\nsame successor, so concurrent tabs and retried requests are safe. 1 to 300; defaults to 30.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 300,
+          "minimum": 1
+        },
+        "maxLifetimeSeconds": {
+          "description": "`rotating` only: absolute lifetime of a refresh-token family in seconds, measured from the\noriginal sign-in. After it a refresh fails with `invalid_grant`. At least\n`gracePeriodSeconds`; defaults to 2592000 (30 days).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 315360000,
+          "minimum": 1
+        },
+        "mode": {
+          "description": "`passthrough` returns the upstream refresh token unchanged. `sealed` returns an opaque\nhandle in its place, so a refresh token that leaves the relying party cannot be used\nat the upstream directly. `rotating` returns single-use handles whose state lives in the\ntransient store, so a replayed handle is detected and revokes its whole token family;\nit requires a store shared by all serving instances.",
+          "$ref": "#/$defs/RefreshTokenModeSpec",
+          "default": "passthrough"
+        }
+      },
+      "additionalProperties": false
+    },
     "RelayResourceSpec": {
       "description": "Transparent-relay policy and upstream reference.",
       "type": "object",
@@ -753,6 +805,10 @@
             "$ref": "#/$defs/RedirectPolicyEntry"
           },
           "minItems": 1
+        },
+        "refreshTokens": {
+          "description": "How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.",
+          "$ref": "#/$defs/RefreshTokensSpec"
         },
         "requiredIdTokenClaims": {
           "description": "Exact string values required in the verified upstream ID token.",
@@ -968,6 +1024,21 @@
         }
       ]
     },
+    "TokenEndpointAuthMethodSpec": {
+      "description": "Client authentication method at the provider token endpoint.",
+      "oneOf": [
+        {
+          "description": "Send `client_id` and `client_secret` as form fields in the request body.",
+          "type": "string",
+          "const": "client_secret_post"
+        },
+        {
+          "description": "Send the credentials in an HTTP Basic `Authorization` header (RFC 6749 section 2.3.1) and\nleave them out of the request body.",
+          "type": "string",
+          "const": "client_secret_basic"
+        }
+      ]
+    },
     "UpstreamEndpoints": {
       "description": "Optional explicit provider endpoints.",
       "type": "object",
@@ -1025,13 +1096,6 @@
       "required": [
         "issuerUrl",
         "oauthClient"
-      ]
-    },
-    "UpstreamTokenEndpointAuthMethod": {
-      "type": "string",
-      "enum": [
-        "client_secret_post",
-        "client_secret_basic"
       ]
     },
     "UriRedirectPolicy": {

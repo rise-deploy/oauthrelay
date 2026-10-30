@@ -42,6 +42,8 @@ metadata:
   name: oauthrelay
   namespace: oauthrelay
 spec:
+  # The default in-memory transient store only enforces single-use authorization codes within one
+  # replica. Before scaling out, set OAUTHRELAY_STORE=dynamodb (see the Transient store reference).
   replicas: 1
   selector:
     matchLabels:

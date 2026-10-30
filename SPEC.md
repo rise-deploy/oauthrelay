@@ -17,11 +17,12 @@ continuing to trust the upstream issuer.
 
 ```text
 crates/
-  oauthrelay-core/          protocol engine, resources, resolver seams, router, sealing
+  oauthrelay-core/          protocol engine, resources, resolver and transient-store seams, router, sealing
   oauthrelay-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
   oauthrelay-provider-file/ multi-document YAML provider and composable secret resolution
   oauthrelay-provider-ssm/  SSM resource discovery and AWS secret backend
   oauthrelay-provider-kubernetes/ Namespaced CR discovery and Kubernetes Secret backend
+  oauthrelay-store-dynamodb/ Amazon DynamoDB transient store
   oauthrelay/               provider wiring, native server, Lambda runtime, schema CLI
 ```
 
@@ -49,13 +50,25 @@ pub struct Relay {
     pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
     pub allowed_scopes: Option<Vec<String>>,
+    pub refresh_tokens: RefreshTokens,
     pub redirect_policy: Vec<RedirectMatcher>,
+}
+
+pub struct RefreshTokens {
+    pub mode: RefreshTokenMode, // Passthrough (default) | Sealed | Rotating
+    pub grace_period_seconds: u64, // Rotating only; 1..=300, default 30
+    pub max_lifetime_seconds: u64, // Rotating only; default 30 days
 }
 ```
 
 `Upstream` owns the external authorization-server connection, OAuth client credentials, and
-provider callback. `Relay` owns transparent-relay scope policy, downstream authentication, and
-redirect policy.
+provider callback. `Relay` owns transparent-relay scope policy, downstream authentication,
+refresh-token handling, and redirect policy.
+
+`RefreshTokens` is a struct so that further refresh-token policy can be added per relay without
+changing the resource shape. `Passthrough` returns upstream refresh tokens unchanged. `Sealed`
+returns sealed handles instead and `Rotating` returns single-use handles whose state lives in the
+transient store (see protocol invariants).
 
 `ClientAuth` supports:
 
@@ -80,8 +93,8 @@ For public base URL `B`, relay key `R`, and upstream key `U`:
 | --- | --- |
 | `GET {B}/relay/{R}/authorize` | Validates redirect and downstream PKCE, applies relay scope policy, creates independent upstream state and PKCE, and redirects to the referenced upstream. |
 | `GET {B}/upstream/{U}/callback` | Unseals upstream-bound state, resolves the originating relay, exchanges the upstream code, and returns to the relay's validated application redirect. |
-| `POST {B}/relay/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged. |
-| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. |
+| `POST {B}/relay/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged (a `sealed` or `rotating` relay replaces only `refresh_token`). |
+| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. A `sealed` relay first opens the presented handle; a `rotating` relay claims it in the transient store and answers with a successor handle. |
 | `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
 | `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
 | `GET /healthz` | Standalone runtime liveness. |
@@ -106,11 +119,139 @@ unvalidated redirect URI is never reflected into a response.
 - Upstream-owned authorization parameters are replaced rather than forwarded.
 - Other authorization and grant extensions are preserved.
 - OIDC request objects are rejected because their routing fields conflict with proxy ownership.
-- Upstream token response status, content type, and bytes are preserved.
+- Upstream token response status, content type, and bytes are preserved, except for the
+  `refresh_token` member of a `sealed` or `rotating` relay (below).
+- Every request to the upstream token endpoint, the authorization-code exchange and each refresh
+  grant, authenticates the upstream client as the `Upstream`'s `token_endpoint_auth_method` says.
+  `client_secret_post` (the default) adds `client_id` and `client_secret` to the form body.
+  `client_secret_basic` sends `Authorization: Basic` with the form-urlencoded client ID and secret
+  joined by `:` and base64-encoded (RFC 6749 section 2.3.1), and the body carries neither.
+  Credentials presented by the downstream client are never forwarded.
+- A `sealed` relay never returns an upstream refresh token. In every successful (2xx) JSON token
+  response, from the authorization-code grant and the refresh grant alike, the string
+  `refresh_token` member is replaced by a handle: `rrt1.` followed by an XChaCha20-Poly1305
+  envelope of the upstream token and an issued-at time, sealed with associated data
+  `refresh:{relay key}`. The prefix versions the format; the associated data binds the handle to
+  its relay and purpose, so handles are not interchangeable between relays or with flow and code
+  envelopes. Member order, all other members, status, and content type are preserved; only
+  whitespace between members is normalized. Requests to the upstream token endpoint send
+  `Accept: application/json`, and any 2xx body is read as a JSON object whatever its content
+  type. Non-2xx responses and 2xx responses without a non-empty string `refresh_token` pass through
+  unchanged. A response whose handle cannot be sealed is a `server_error`, and so is a 2xx body
+  that is not a JSON object but names a `refresh_token` (for example a form-encoded
+  `refresh_token=` pair): the relay answers 502 `server_error` and never returns the raw token.
+  Upstream transport failures are 502 `server_error`.
+- A `sealed` relay accepts only its own handles at the refresh grant: it opens the handle and
+  forwards the upstream token. A raw upstream token, a handle of another relay or installation, or
+  a tampered handle is `invalid_grant` and is not forwarded. When the upstream refresh response
+  omits `refresh_token`, so does the relay's, and the client keeps its handle. Handles follow
+  seal-key rotation: they open under the current or previous key. Switching a relay to `sealed`
+  invalidates the refresh tokens it issued earlier; clients must re-authenticate. Switching from
+  `rotating` to `sealed` rejects every `rrt2.` handle with `invalid_grant`.
+- A `rotating` relay returns single-use handles, `rrt2.` followed by the base64url encoding of 32
+  random bytes. A handle is opaque and carries no data; everything it stands for is in the
+  transient store. The settings are `gracePeriodSeconds` (1 to 300, default 30) and
+  `maxLifetimeSeconds` (at least the grace period, default 30 days): the absolute lifetime of a
+  token family from the code grant that created it. A relay in this mode requires
+  `RelayConfig.store`; without one, authorize, the code grant, and the refresh grant fail with a
+  logged `server_error`.
+  - *Issuance.* A successful JSON code-grant response with a non-empty string `refresh_token`
+    starts a family and substitutes an `rrt2.` handle with the same rules as `sealed`.
+  - *Refresh.* An unknown, expired, or revoked handle, or one past its family's end, is
+    `invalid_grant`. Otherwise the handle is claimed with a compare-and-swap so that one
+    concurrent caller wins and refreshes upstream. On success the response always carries a
+    successor `rrt2.` handle in the same family, wrapping the upstream's new refresh token or, if
+    the upstream did not rotate, the same one. The response, byte for byte, is recorded for the
+    grace period. An upstream failure or error response releases the claim and is returned as
+    for other modes. An upstream `invalid_grant` revokes the family and is returned. A 2xx
+    response that is not a JSON object cannot carry a handle: the claim is released and the
+    client gets a 502 `server_error`.
+  - *Replay.* A handle already rotated is answered with the recorded response for
+    `gracePeriodSeconds` after its rotation, so concurrent tabs and retries receive the same
+    successor. A handle whose rotation is still in flight is polled for up to five seconds, then
+    answered with 503 `temporarily_unavailable` and `Retry-After`. A handle presented after the
+    grace period is reuse: the family is revoked, no member refreshes again, and the client gets
+    `invalid_grant`. The relay logs a structured `refresh_token_reuse` security event with the
+    relay and a hash of the family id, never a token or handle.
+  - *Abandoned claims.* A claim older than 60 seconds is presumed abandoned (its process was
+    killed or suspended) and can be claimed again, so a crash cannot strand a handle. The
+    upstream call itself is abandoned after 30 seconds and its claim released.
+  - *Revocation.* Revoking a family (reuse, or an upstream `invalid_grant`) writes the marker
+    and then deletes the record that holds the family's upstream token, found through the head
+    pointer or by following the rotated records from the presented handle; superseded records
+    are already token-free tombstones. A refresh that is in flight when the family is revoked
+    answers `invalid_grant` and removes the successor it created; it never returns tokens. The
+    upstream is asked only for the tokens of a family that is not revoked.
+  - *Content.* Like `sealed`, a 2xx body is read as a JSON object whatever its content type, a
+    form-encoded or other non-object 2xx body that names a `refresh_token` is refused with 502
+    `server_error` (code grant and refresh grant alike), only an upstream 4xx with JSON
+    `error: "invalid_grant"` revokes the family, and any other upstream error is passed through
+    with the claim released.
+  - *Migration.* A `rrt1.` handle presented to a `rotating` relay is opened, refreshed, and
+    replaced by an `rrt2.` successor in a new family, so switching `sealed` to `rotating` does
+    not sign users out. A sealed handle is stateless, so it cannot be spent: presenting the same
+    one again starts another family, until the provider stops honouring its token (known and
+    accepted). A sealed handle whose issued-at time plus `maxLifetimeSeconds` has passed is
+    `invalid_grant` instead of starting a family. Raw upstream tokens are `invalid_grant`.
+  - *Storage.* Keys carry only a SHA-256 over the relay key and the handle (or family id). Record
+    values are XChaCha20-Poly1305 envelopes whose associated data names the relay, the purpose,
+    and the store key, so the store never holds a plaintext token and values cannot be moved
+    between keys. Records expire with their family; see the transient store below. A store
+    failure fails closed with 503 `server_error`; an upstream token is never returned in its
+    place. A record this relay cannot open (seal key replaced, value tampered with) is
+    `invalid_grant`, because retrying cannot help.
+- In every mode, including `passthrough`, a refresh token with a handle prefix (`rrt` followed by
+  digits and a dot) is never forwarded to the upstream as-is. A handle the relay's mode can open
+  (`rrt1.` in `sealed`; `rrt1.` and `rrt2.` in `rotating`) is opened as described above; any other
+  handle is `invalid_grant`. A handle is not an upstream token, so forwarding one only leaks it.
 - Discovery and JWKS responses are cached for bounded TTLs.
 
-The standalone binary supplies an in-memory replay cache. An embedding without a replay cache
-accepts a sealed authorization code for its five-minute cryptographic lifetime.
+## Transient store
+
+Sealed envelopes carry their own state, so the router remembers only the facts that must outlive a
+request: redeemed codes and assertions, and the state of `rotating` refresh-token families. Those live behind one seam, `TransientStore`, selected through `RelayConfig.store`:
+
+```rust
+#[async_trait]
+pub trait TransientStore: Send + Sync + 'static {
+    async fn put_if_absent(&self, key: &str, value: &[u8], ttl: Duration) -> Result<bool, StoreError>;
+    async fn get(&self, key: &str) -> Result<Option<Entry>, StoreError>;
+    async fn compare_and_swap(&self, key: &str, expected: &[u8], new: &[u8], ttl: Duration)
+        -> Result<bool, StoreError>;
+    async fn delete(&self, key: &str) -> Result<(), StoreError>;
+}
+```
+
+Every write carries a TTL, values are opaque bytes, and operations on one key are linearizable
+across all instances sharing the backend. Callers namespace keys by purpose (`replay:` and
+`refresh:`); backends never interpret keys. An expired record
+is absent for reads and conditional writes even when the backend has not yet deleted it. Callers write values unique
+to the writer (sealed with a random nonce, or carrying a random claim id): DynamoDB asks for the
+existing item when a condition fails and counts a failure against the value it just wrote as
+success, since SDK retries can report a failure for a write that applied. A backend
+error means the outcome is unknown and callers fail closed. The rustdoc on the trait states the
+full contract and the rotation protocol built on it.
+
+Replay protection uses `put_if_absent` on `replay:code:{envelope id}` for authorization codes and
+`replay:client-assertion:{digest}` for `requireSingleUse` client assertions. An unavailable store
+makes the token endpoint return HTTP 503 `server_error` without consuming the code, and fails
+client-assertion authentication.
+
+Rotation uses four keys under `refresh:`: `refresh:handle:{hash}` holds a handle's record
+(`Active`, `Claimed`, or a token-free `Rotated` tombstone) until its family expires;
+`refresh:grace:{hash}` holds the response of one rotation for the grace period plus ten seconds;
+`refresh:revoked:{hash}` marks a revoked family until it expires; `refresh:head:{hash}` names the
+family's newest handle record so that a revocation can delete the one record that still holds an
+upstream token. A rotation costs about two strongly consistent reads and five writes, and leaves a
+tombstone of about 0.3 KB that lives until the family ends.
+
+The standalone binary selects the backend with `OAUTHRELAY_STORE`. `memory` (default) is
+process-local and protects one process or one Lambda execution environment. `dynamodb`
+(`oauthrelay-store-dynamodb`, behind the `aws` feature) shares state across replicas and Lambda
+environments through conditional `PutItem` and strongly consistent `GetItem`, with `expires_at`
+epoch seconds as the table's TTL attribute and an explicit expiry check on every read. An
+embedding without a store accepts a sealed authorization code for its five-minute cryptographic
+lifetime and rejects `requireSingleUse` client assertions.
 
 ## Configuration resources
 
@@ -149,6 +290,10 @@ spec:
   redirectPolicy:
     - uri: https://app.example.com/oauth/callback
 ```
+
+`spec.refreshTokens.mode` is `passthrough` (default), `sealed`, or `rotating`. `gracePeriodSeconds`
+(1 to 300, default 30) and `maxLifetimeSeconds` (default 2592000) apply only to `rotating`; setting
+them in another mode, or out of range, rejects the candidate snapshot.
 
 Unknown fields, kinds, API versions, duplicate identities, invalid URLs, invalid origins, invalid
 scope tokens, and dangling references reject the candidate snapshot.

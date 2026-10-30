@@ -24,7 +24,6 @@ spec:
       valueFrom:
         env:
           name: GOOGLE_CLIENT_SECRET
-    tokenEndpointAuthMethod: client_secret_post
 ---
 apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
@@ -69,7 +68,14 @@ An upstream and a relay may use the same name because identities include the res
 | `spec.endpoints.jwks` | no | Explicit upstream JWKS endpoint. Discovery supplies it when omitted. |
 | `spec.oauthClient.clientId` | yes | Provider OAuth client ID. |
 | `spec.oauthClient.clientSecret` | yes | Provider OAuth client secret as a [secret value](#secret-values). |
-| `spec.oauthClient.tokenEndpointAuthMethod` | no | Upstream token endpoint client authentication method: `client_secret_post` (default) or `client_secret_basic`. |
+| `spec.oauthClient.tokenEndpointAuthMethod` | no | How oauthrelay authenticates at the upstream token endpoint: `client_secret_post` (default) or `client_secret_basic`. |
+
+`client_secret_post` sends `client_id` and `client_secret` as form fields in the request body.
+`client_secret_basic` sends them in an HTTP `Authorization: Basic` header instead, form-urlencoded
+before the Basic encoding as RFC 6749 section 2.3.1 requires, and leaves them out of the body. Use it
+for providers that accept only Basic client authentication, such as Notion. The method applies to
+every upstream token request: the authorization-code exchange and all refresh grants. It does not
+change how relying parties authenticate to the relay, which `clientAuthentication` controls.
 
 `OAUTHRELAY_PUBLIC_URL` is the complete externally visible OAuth API base. The callback registered
 with the provider is derived from that base and the upstream name:
@@ -94,6 +100,9 @@ upstream-owned by the relay contract.
 | `spec.scopes.allowed` | no | unrestricted | Complete allow-list for configured and requested scopes. Every default scope must be allowed. |
 | `spec.requiredIdTokenClaims` | no | `{}` | Exact string values required in the verified upstream ID token. |
 | `spec.idTokenPolicy` | no | omitted | Typed claim rules for initial sign-in; all rules also compose with `requiredIdTokenClaims`. |
+| `spec.refreshTokens.mode` | no | `passthrough` | `passthrough` returns upstream refresh tokens unchanged; `sealed` returns [sealed handles](#refresh-tokens) instead; `rotating` returns [single-use handles](#rotating-refresh-tokens) and needs a shared [transient store](/oauthrelay/reference/transient-store/). |
+| `spec.refreshTokens.gracePeriodSeconds` | no | `30` | `rotating` only, 1 to 300. How long an already-used handle is still answered with the same successor. |
+| `spec.refreshTokens.maxLifetimeSeconds` | no | `2592000` (30 days) | `rotating` only, at least `gracePeriodSeconds`. Absolute lifetime of a refresh-token family from the original sign-in. |
 | `spec.clientAuthentication` | yes | — | Authentication policy for requests to the relay token endpoint. |
 | `spec.redirectPolicy` | yes | — | Non-empty list of explicit application redirect matchers. |
 
@@ -202,6 +211,173 @@ not include actual claim values, configured comparison values or patterns, or to
 tokens produce a final rejection result without evaluating their untrusted claims. Exchanges
 without an admission policy or without a successful upstream response log a `skipped` outcome.
 
+## Refresh tokens
+
+By default a relay is transparent: the upstream refresh token reaches the relying party and comes
+back at the refresh grant. For a `Public` relay the relying party is typically a browser, so a
+refresh token that leaks from it can be refreshed through the relay indefinitely.
+
+In every mode, including `passthrough`, a refresh token that starts with `rrt` followed by digits
+and a dot (such as `rrt1.`) is a relay handle, never an upstream token, and is never forwarded to
+the provider as-is. A handle the relay's mode can open is opened (see the modes below); any other
+handle is answered with `invalid_grant`.
+
+### Security profile
+
+| | `passthrough` | `sealed` | `rotating` |
+|---|---|---|---|
+| The client holds | the upstream token | an `rrt1.` handle | an `rrt2.` handle |
+| The upstream token leaves the relay | yes | no | no |
+| A leaked token works through the relay | until the provider expires it | until the provider expires it | until the legitimate client next refreshes; if the thief refreshed first, that refresh revokes the family |
+| Theft detection | none | none | reuse after the grace period revokes the family |
+| Lifetime bound set by the relay | none | none | `maxLifetimeSeconds` |
+| Revoke every token at once | at the provider | replace the seal key | replace the seal key |
+| Needs a store | no | no | yes |
+
+`sealed` hides the upstream token but does not shorten the life of a leaked handle; use `rotating`
+when a stolen refresh token has to stop working. In both, the relay holds the upstream token only
+encrypted with `OAUTHRELAY_SEAL_KEY`, so the store or a captured handle reveals nothing without
+the key. Within `gracePeriodSeconds` of a rotation, anyone presenting the spent handle gets the
+same successor, so the grace window is the one span in which a thief goes undetected.
+
+Set `refreshTokens.mode: sealed` to keep upstream refresh tokens inside the relay:
+
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  oauthClient:
+    clientId: 123456789.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: spa
+spec:
+  upstreamRef:
+    name: google
+  refreshTokens:
+    mode: sealed
+  clientAuthentication:
+    type: Public
+  redirectPolicy:
+    - origin: https://app.example.com
+```
+
+In `sealed` mode every successful JSON token response, from the authorization-code grant and from
+the refresh grant, has its `refresh_token` replaced by an opaque handle that starts with `rrt1.`.
+The handle contains the upstream token encrypted with `OAUTHRELAY_SEAL_KEY`, bound to the relay
+name, so only this relay can open it. At the refresh grant the relay opens the handle and sends
+the upstream token to the provider. Status, content type, member order, and every other member of
+the response are preserved. Non-2xx responses, and successful responses that carry no
+`refresh_token`, are returned unchanged. When a refresh response omits `refresh_token`, the
+relying party keeps using its current handle.
+
+- A refresh token that is not a handle of this relay, such as a raw upstream token or a handle
+  issued by another relay, is rejected with `invalid_grant`. Switching an existing relay to
+  `sealed` therefore requires its users to sign in again.
+- Handles open under `OAUTHRELAY_SEAL_KEY` and `OAUTHRELAY_SEAL_KEY_PREVIOUS`, so seal-key rotation
+  keeps them valid until the previous key is removed. Replacing the key without keeping the old
+  one as the previous key invalidates every handle.
+- A handle carries no expiry and is not single-use: it stays valid for as long as the upstream
+  token does. Sealing prevents a leaked handle from being used at the provider directly; it does
+  not make the handle unusable at the relay. Providers that rotate refresh tokens return a new
+  upstream token, which the relay seals into a new handle.
+- The relay asks the provider for JSON (`Accept: application/json`) and reads any successful
+  response body as a JSON object, whatever its content type. A provider that still answers with a
+  form-encoded or other non-JSON body that contains a `refresh_token` cannot be rewritten, so the
+  relay fails closed with HTTP 502 `server_error` instead of returning the raw token. Provider
+  errors (non-2xx) pass through unchanged; an unreachable provider is a 502 `server_error`.
+
+### Rotating refresh tokens
+
+`sealed` handles are stateless, so a leaked handle works for as long as the upstream token does.
+Set `refreshTokens.mode: rotating` to make every handle single use and to detect theft:
+
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  oauthClient:
+    clientId: 123456789.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: spa
+spec:
+  upstreamRef:
+    name: google
+  refreshTokens:
+    mode: rotating
+    gracePeriodSeconds: 30
+    maxLifetimeSeconds: 2592000
+  clientAuthentication:
+    type: Public
+  redirectPolicy:
+    - origin: https://app.example.com
+```
+
+In `rotating` mode the code grant returns a handle that starts with `rrt2.`: 32 random bytes that
+mean nothing outside the relay. The upstream token lives, encrypted with `OAUTHRELAY_SEAL_KEY` and
+bound to the relay, in the [transient store](/oauthrelay/reference/transient-store/). Every
+refresh grant presents a handle, refreshes upstream, and returns a **new** handle in the same
+`refresh_token` member; the presented handle is spent. If the upstream does not rotate its own
+token, the relay wraps the same upstream token in the new handle, so the response always carries a
+refresh token and the client must always store the latest one.
+
+- **Grace period.** Browsers with several tabs, and clients that retry after a lost response, can
+  present the same handle twice. Within `gracePeriodSeconds` of the rotation the second request
+  gets the same response, and the same successor handle, without reaching the provider. Requests
+  that arrive while the first is still in flight wait up to five seconds for it; if it is slower
+  they get HTTP 503 `temporarily_unavailable` with `Retry-After` and should retry.
+- **Reuse detection.** A spent handle presented after the grace period means two parties hold the
+  same token. The relay revokes the whole family, including the newest handle, and answers
+  `invalid_grant`; the user signs in again. The relay logs a `refresh_token_reuse` security event
+  (target `oauthrelay::security`) with the relay name and a hash of the family, never a token.
+- **Revocation erases the token.** Revoking a family deletes the stored upstream token as well as
+  blocking the handles, and a refresh that was in flight when the revocation happened answers
+  `invalid_grant` instead of returning tokens.
+- **Provider responses.** As in `sealed` mode, any successful body is read as JSON whatever its
+  content type, a successful body that is not JSON but contains a `refresh_token` (such as a
+  form-encoded one) is answered with HTTP 502 `server_error` and never returned, and the claim is
+  released. Only a provider 4xx with the JSON error `invalid_grant` revokes the family; every other
+  provider error is passed through and leaves the handle usable. Handles (`rrt<N>.`) are never
+  forwarded to the provider.
+- **Maximum lifetime.** A family ends `maxLifetimeSeconds` after the sign-in that created it,
+  however actively it is used. After that a refresh fails with `invalid_grant`.
+- **Upstream errors.** A network error or provider error response is returned to the client and
+  leaves the handle usable for a retry. A provider `invalid_grant` revokes the family.
+- **Switching modes.** A relay changed from `sealed` to `rotating` accepts the `rrt1.` handles it
+  issued earlier and replaces them with `rrt2.` handles in a new family, so users stay signed in.
+  A sealed handle is stateless and cannot be spent: presenting the same `rrt1.` handle again starts
+  another family, until the provider stops honouring its upstream token (a known limitation). A
+  sealed handle older than `maxLifetimeSeconds` is rejected with `invalid_grant`. Changed from
+  `rotating` back to `sealed`, or to `passthrough`, every `rrt2.` handle is rejected with
+  `invalid_grant` and users sign in again. Raw upstream tokens are rejected in both modes.
+- **A store is required.** A `rotating` relay needs a transient store shared by every serving
+  instance: use `OAUTHRELAY_STORE=dynamodb` for more than one replica or any Lambda deployment. With
+  the default in-process `memory` store a handle only works on the instance that issued it and
+  stops working when that process restarts. An embedding that supplies no store gets a logged
+  HTTP 500 `server_error` from authorize and from both grants of a `rotating` relay.
+- If the store is unreachable, refresh grants fail closed with HTTP 503 `server_error`.
+
+Rotation settings are rejected on a relay that is not `rotating`.
+
 ## Client authentication
 
 `spec.clientAuthentication` selects how a relying party authenticates to the relay token endpoint.
@@ -259,11 +435,12 @@ request can set `requireSingleUse: true`. This requires an integer `iat`, a non-
 and `exp` greater than `iat` by at most 300 seconds. Every request, including retries, needs a
 fresh `jti`. Replay identity is scoped to the configured issuer, subject, and audience; key rotation
 does not reset it. Assertions are recorded only after validation and retained through expiration
-plus clock skew. A missing or failing replay cache rejects authentication.
+plus clock skew. A missing or failing [transient store](/oauthrelay/reference/transient-store/)
+rejects authentication.
 
-The standalone server's replay cache is in memory: protection covers one process lifetime.
-Multiple replicas, Lambda instances, and restarts require an embedded deployment supplying a
-shared durable `ReplayCache` with atomic `first_use` operations to enforce single use across them.
+The standalone server's default transient store is in memory: protection covers one process
+lifetime. Multiple replicas, Lambda instances, and restarts need `OAUTHRELAY_STORE=dynamodb` (or an
+embedded deployment supplying a shared durable `TransientStore`) to enforce single use across them.
 `requireSingleUse` authenticates the request; it does not sender-constrain upstream access tokens.
 
 Configure `jwksUrl` (an absolute HTTP(S) URL), `jwks` (an inline public JWKS object with a

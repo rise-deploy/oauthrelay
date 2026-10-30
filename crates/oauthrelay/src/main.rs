@@ -10,8 +10,8 @@ use axum::{
 use axum::{http::StatusCode, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use oauthrelay_core::{
-    resource_schema, router, ConfigProvider, KeyStrategy, MemoryReplayCache, ProviderSnapshot,
-    Registry, RelayConfig, XChaChaSealer,
+    resource_schema, router, ConfigProvider, KeyStrategy, MemoryStore, ProviderSnapshot, Registry,
+    RelayConfig, TransientStore, XChaChaSealer,
 };
 #[cfg(feature = "aws")]
 use oauthrelay_core::{SecretResolver, SecretSource, SecretString};
@@ -20,6 +20,8 @@ use oauthrelay_provider_file::FileProvider;
 use oauthrelay_provider_ssm::{
     AwsSecretResolver, AwsSecretsManagerClient, AwsSsmClient, SsmProvider,
 };
+#[cfg(feature = "aws")]
+use oauthrelay_store_dynamodb::{AwsDynamoDbClient, DynamoDbStore};
 #[cfg(feature = "lambda")]
 use std::time::SystemTime;
 use std::{
@@ -127,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
             "at least one provider is required; set OAUTHRELAY_PROVIDER_FILE, OAUTHRELAY_PROVIDER_SSM_PREFIX, or OAUTHRELAY_PROVIDER_KUBERNETES=true"
         ));
     }
+    let store = configured_store().await?;
     let registry = Arc::new(Registry::default());
     let mut running = start_providers(providers);
     await_initial_snapshots(&mut running).await?;
@@ -137,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
         RelayConfig {
             public_url,
             sealer,
-            replay_cache: Some(Arc::new(MemoryReplayCache::default())),
+            store: Some(store),
             http: reqwest::Client::builder().build()?,
             client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
                 reqwest::Client::builder(),
@@ -196,6 +199,73 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     updater.abort();
     Ok(())
+}
+
+/// Which [`TransientStore`] backend `OAUTHRELAY_STORE` selects.
+#[derive(Debug, Eq, PartialEq)]
+enum StoreConfig {
+    Memory,
+    DynamoDb { table: String },
+}
+
+fn parse_store_config(kind: Option<&str>, table: Option<&str>) -> anyhow::Result<StoreConfig> {
+    match kind {
+        None | Some("memory") => {
+            if table.is_some() {
+                return Err(anyhow!(
+                    "OAUTHRELAY_STORE_DYNAMODB_TABLE requires OAUTHRELAY_STORE=dynamodb"
+                ));
+            }
+            Ok(StoreConfig::Memory)
+        }
+        Some("dynamodb") => {
+            let table = table.ok_or_else(|| {
+                anyhow!("OAUTHRELAY_STORE=dynamodb requires OAUTHRELAY_STORE_DYNAMODB_TABLE")
+            })?;
+            let valid = (3..=255).contains(&table.len())
+                && table
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+            if !valid {
+                return Err(anyhow!(
+                    "OAUTHRELAY_STORE_DYNAMODB_TABLE must be a DynamoDB table name: 3-255 characters from A-Z, a-z, 0-9, '_', '-' and '.'"
+                ));
+            }
+            Ok(StoreConfig::DynamoDb {
+                table: table.to_owned(),
+            })
+        }
+        Some(other) => Err(anyhow!(
+            "OAUTHRELAY_STORE must be memory or dynamodb, got {other:?}"
+        )),
+    }
+}
+
+async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
+    let kind = env::var("OAUTHRELAY_STORE").ok();
+    let table = env::var("OAUTHRELAY_STORE_DYNAMODB_TABLE").ok();
+    match parse_store_config(kind.as_deref(), table.as_deref())? {
+        StoreConfig::Memory => {
+            if is_lambda_runtime() {
+                tracing::warn!(
+                    "the memory store only protects against replay within one Lambda execution environment; set OAUTHRELAY_STORE=dynamodb for deployment-wide single use"
+                );
+            }
+            Ok(Arc::new(MemoryStore::default()))
+        }
+        #[cfg(feature = "aws")]
+        StoreConfig::DynamoDb { table } => {
+            let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            tracing::info!(%table, "using DynamoDB transient store");
+            Ok(Arc::new(DynamoDbStore::new(Arc::new(
+                AwsDynamoDbClient::new(aws_sdk_dynamodb::Client::new(&config), table),
+            ))))
+        }
+        #[cfg(not(feature = "aws"))]
+        StoreConfig::DynamoDb { .. } => Err(anyhow!(
+            "OAUTHRELAY_STORE=dynamodb requires the oauthrelay aws feature"
+        )),
+    }
 }
 
 async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> {
@@ -568,6 +638,7 @@ mod tests {
             allowed_scopes: None,
             required_id_token_claims: std::collections::HashMap::new(),
             id_token_policy: None,
+            refresh_tokens: Default::default(),
             redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
         });
         let mut snapshot = ProviderSnapshot::default();
@@ -633,6 +704,31 @@ mod tests {
             Duration::from_millis(largest_hours * 3_600_000)
         );
         assert!(parse_duration("TEST", &format!("{}h", largest_hours + 1)).is_err());
+    }
+
+    #[test]
+    fn store_defaults_to_memory_and_validates_selection() {
+        assert_eq!(parse_store_config(None, None).unwrap(), StoreConfig::Memory);
+        assert_eq!(
+            parse_store_config(Some("memory"), None).unwrap(),
+            StoreConfig::Memory
+        );
+        assert_eq!(
+            parse_store_config(Some("dynamodb"), Some("oauthrelay-store")).unwrap(),
+            StoreConfig::DynamoDb {
+                table: "oauthrelay-store".into()
+            }
+        );
+        assert!(parse_store_config(Some("dynamodb"), None).is_err());
+        assert!(parse_store_config(Some("redis"), None).is_err());
+        assert!(parse_store_config(None, Some("oauthrelay-store")).is_err());
+        assert!(parse_store_config(Some("memory"), Some("oauthrelay-store")).is_err());
+        for table in ["", "ab", "has space", "slash/name", &"t".repeat(256)] {
+            assert!(
+                parse_store_config(Some("dynamodb"), Some(table)).is_err(),
+                "{table:?}"
+            );
+        }
     }
 
     #[test]
