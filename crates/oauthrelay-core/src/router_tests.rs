@@ -3445,10 +3445,50 @@ async fn rotating_relay_without_a_store_fails_with_a_server_error() {
         refresh_form("rrt2.anything"),
         code_grant_form("any-code", SEALED_VERIFIER),
     ] {
-        let response = post_token(&app, "google", &form).await;
+        let logs = LogCapture::default();
+        let response = {
+            let _guard = tracing::subscriber::set_default(logs.subscriber());
+            post_token(&app, "google", &form).await
+        };
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
         assert_eq!(body["error"], "server_error");
+        let output = logs.output();
+        assert!(
+            output.contains("no transient store") && output.contains("google"),
+            "every grant logs the missing store and names the relay: {output}"
+        );
+    }
+}
+
+/// Collects formatted log output for one test, on the current thread only.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        let writer = self.clone();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish()
+    }
+
+    fn output(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
 }
 

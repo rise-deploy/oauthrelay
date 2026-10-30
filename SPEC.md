@@ -194,8 +194,9 @@ unvalidated redirect URI is never reflected into a response.
     place. A record this relay cannot open (seal key replaced, value tampered with) is
     `invalid_grant`, because retrying cannot help.
 - In every mode, including `passthrough`, a refresh token with a handle prefix (`rrt` followed by
-  digits and a dot) is never forwarded to the upstream: it is `invalid_grant`. A handle is not an
-  upstream token, so forwarding one only leaks it.
+  digits and a dot) is never forwarded to the upstream as-is. A handle the relay's mode can open
+  (`rrt1.` in `sealed`; `rrt1.` and `rrt2.` in `rotating`) is opened as described above; any other
+  handle is `invalid_grant`. A handle is not an upstream token, so forwarding one only leaks it.
 - Discovery and JWKS responses are cached for bounded TTLs.
 
 ## Transient store

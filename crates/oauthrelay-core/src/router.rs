@@ -1039,6 +1039,9 @@ async fn refresh(
         );
     };
     if relay.refresh_tokens.mode == RefreshTokenMode::Rotating {
+        if rotation_store_missing(state, relay) {
+            return rotation_store_required();
+        }
         let Some(rotator) = rotator(state, relay) else {
             return rotation_store_required();
         };

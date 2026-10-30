@@ -210,8 +210,9 @@ back at the refresh grant. For a `Public` relay the relying party is typically a
 refresh token that leaks from it can be refreshed through the relay indefinitely.
 
 In every mode, including `passthrough`, a refresh token that starts with `rrt` followed by digits
-and a dot (such as `rrt1.`) is a relay handle, never an upstream token. The relay answers
-`invalid_grant` and does not forward it to the provider.
+and a dot (such as `rrt1.`) is a relay handle, never an upstream token, and is never forwarded to
+the provider as-is. A handle the relay's mode can open is opened (see the modes below); any other
+handle is answered with `invalid_grant`.
 
 Set `refreshTokens.mode: sealed` to keep upstream refresh tokens inside the relay:
 

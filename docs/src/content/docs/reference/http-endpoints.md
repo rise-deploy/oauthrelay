@@ -79,7 +79,8 @@ Non-2xx upstream responses are returned unchanged. The relay sends `Accept: appl
 the upstream and reads any 2xx body as JSON whatever its content type; a 2xx body that is not a
 JSON object but contains a `refresh_token` field (for example form-encoded) is answered with 502
 `server_error` and is never returned. A refresh token with a handle prefix (`rrt<N>.`) is never sent
-to the upstream in any mode, including `passthrough`; it is `invalid_grant`.
+to the upstream as-is in any mode, including `passthrough`: a handle the mode can open is opened,
+any other is `invalid_grant`.
 
 ### Rotating refresh tokens
 
