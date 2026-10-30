@@ -74,7 +74,11 @@ The refresh grant takes that handle as `refresh_token`. Anything else, including
 token, a handle from another relay, or a modified handle, returns HTTP 400 with
 `error=invalid_grant`, and the request is not sent to the upstream. If the upstream refresh response
 has no `refresh_token`, neither does the relay's response, and the client keeps its handle.
-Non-2xx and non-JSON upstream responses are returned unchanged.
+Non-2xx upstream responses are returned unchanged. The relay sends `Accept: application/json` to
+the upstream and reads any 2xx body as JSON whatever its content type; a 2xx body that is not a
+JSON object but contains a `refresh_token` field (for example form-encoded) is answered with 502
+`server_error` and is never returned. A refresh token with a handle prefix (`rrt<N>.`) is never sent
+to the upstream in any mode, including `passthrough`; it is `invalid_grant`.
 
 ## Transparent metadata
 

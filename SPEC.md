@@ -123,15 +123,22 @@ unvalidated redirect URI is never reflected into a response.
   `refresh:{relay key}`. The prefix versions the format; the associated data binds the handle to
   its relay and purpose, so handles are not interchangeable between relays or with flow and code
   envelopes. Member order, all other members, status, and content type are preserved; only
-  whitespace between members is normalized. Non-2xx, non-JSON, and responses without a non-empty
-  string `refresh_token` pass through unchanged. A response whose handle cannot be sealed is a
-  `server_error`; the upstream token is never returned instead.
+  whitespace between members is normalized. Requests to the upstream token endpoint send
+  `Accept: application/json`, and any 2xx body is read as a JSON object whatever its content
+  type. Non-2xx responses and 2xx responses without a non-empty string `refresh_token` pass through
+  unchanged. A response whose handle cannot be sealed is a `server_error`, and so is a 2xx body
+  that is not a JSON object but names a `refresh_token` (for example a form-encoded
+  `refresh_token=` pair): the relay answers 502 `server_error` and never returns the raw token.
+  Upstream transport failures are 502 `server_error`.
 - A `sealed` relay accepts only its own handles at the refresh grant: it opens the handle and
   forwards the upstream token. A raw upstream token, a handle of another relay or installation, or
   a tampered handle is `invalid_grant` and is not forwarded. When the upstream refresh response
   omits `refresh_token`, so does the relay's, and the client keeps its handle. Handles follow
   seal-key rotation: they open under the current or previous key. Switching a relay to `sealed`
   invalidates the refresh tokens it issued earlier; clients must re-authenticate.
+- In every mode, including `passthrough`, a refresh token with a handle prefix (`rrt` followed by
+  digits and a dot) is never forwarded to the upstream: it is `invalid_grant`. A handle is not an
+  upstream token, so forwarding one only leaks it.
 - Discovery and JWKS responses are cached for bounded TTLs.
 
 The standalone binary supplies an in-memory replay cache. An embedding without a replay cache

@@ -72,37 +72,60 @@ pub(crate) fn open_handle(
     })
 }
 
-/// Whether a response `Content-Type` denotes a JSON document (`application/json` or any
-/// `+json` structured syntax suffix, parameters ignored).
-pub(crate) fn is_json_content_type(content_type: Option<&str>) -> bool {
-    let Some(essence) = content_type.and_then(|value| value.split(';').next()) else {
-        return false;
-    };
-    let essence = essence.trim().to_ascii_lowercase();
-    essence == "application/json"
-        || (essence.starts_with("application/") && essence.ends_with("+json"))
+/// Whether `token` has the shape of a handle of any version (`rrt<N>.`). Such a value is never
+/// an upstream refresh token, so it is never forwarded upstream, whatever the relay's mode.
+pub(crate) fn has_handle_prefix(token: &str) -> bool {
+    token.strip_prefix("rrt").is_some_and(|rest| {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && rest[digits..].starts_with('.')
+    })
 }
 
-/// Replaces the `refresh_token` member of a successful JSON token response with a handle.
+/// Why a token response could not be substituted. Neither case may return the upstream body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubstitutionError {
+    /// Sealing or encoding the handle failed.
+    Sealing,
+    /// A successful response is not a JSON object yet appears to carry a refresh token (for
+    /// example a form-encoded `refresh_token=` pair), so it cannot be rewritten safely.
+    UnrecognizedBody,
+}
+
+/// Whether `body` names a `refresh_token` as a member or field (`refresh_token=`,
+/// `"refresh_token":`), which a body that is not a JSON object must not be allowed to carry.
+fn names_refresh_token(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    text.match_indices(REFRESH_TOKEN_MEMBER).any(|(at, name)| {
+        text[at + name.len()..]
+            .trim_start_matches(['"', '\''])
+            .trim_start()
+            .starts_with(['=', ':'])
+    })
+}
+
+/// Replaces the `refresh_token` member of a successful token response with a handle.
 ///
-/// Returns `Ok(None)` when the response must be passed on unchanged: it is not a successful
-/// JSON object response, or carries no non-empty string `refresh_token`. Member order and the
-/// bytes of every other member are preserved; only inter-member whitespace is normalized.
-/// `Err` means sealing failed and the response must not be returned, as it would expose the
-/// upstream token.
+/// Any 2xx body is read as a JSON object whatever its content type. Returns `Ok(None)` when the
+/// response must be passed on unchanged: it is not a 2xx response, or carries no non-empty
+/// string `refresh_token` and does not look like it hides one. Member order and the bytes of
+/// every other member are preserved; only inter-member whitespace is normalized. `Err` means the
+/// response must not be returned, as it would expose the upstream token.
 pub(crate) fn seal_token_response(
     sealer: &dyn Sealer,
     relay: &ResourceKey,
     status: u16,
-    content_type: Option<&str>,
     body: &[u8],
     issued_at: u64,
-) -> Result<Option<Vec<u8>>, ()> {
-    if !(200..300).contains(&status) || !is_json_content_type(content_type) {
+) -> Result<Option<Vec<u8>>, SubstitutionError> {
+    if !(200..300).contains(&status) {
         return Ok(None);
     }
     let Ok(mut members) = serde_json::from_slice::<Members>(body) else {
-        return Ok(None);
+        return if names_refresh_token(body) {
+            Err(SubstitutionError::UnrecognizedBody)
+        } else {
+            Ok(None)
+        };
     };
     let mut replaced = false;
     for (name, value) in &mut members.0 {
@@ -115,15 +138,20 @@ pub(crate) fn seal_token_response(
         if token.is_empty() {
             continue;
         }
-        let handle = seal_handle(sealer, relay, &token, issued_at)?;
-        *value = RawValue::from_string(serde_json::to_string(&handle).map_err(|_| ())?)
-            .map_err(|_| ())?;
+        let handle = seal_handle(sealer, relay, &token, issued_at)
+            .map_err(|()| SubstitutionError::Sealing)?;
+        *value = serde_json::to_string(&handle)
+            .ok()
+            .and_then(|json| RawValue::from_string(json).ok())
+            .ok_or(SubstitutionError::Sealing)?;
         replaced = true;
     }
     if !replaced {
         return Ok(None);
     }
-    serde_json::to_vec(&members).map(Some).map_err(|_| ())
+    serde_json::to_vec(&members)
+        .map(Some)
+        .map_err(|_| SubstitutionError::Sealing)
 }
 
 /// The members of a JSON object in document order, with values kept verbatim.
@@ -171,16 +199,9 @@ mod tests {
     }
 
     fn seal(sealer: &XChaChaSealer, body: &str) -> Option<String> {
-        seal_token_response(
-            sealer,
-            &key("app"),
-            200,
-            Some("application/json"),
-            body.as_bytes(),
-            42,
-        )
-        .unwrap()
-        .map(|bytes| String::from_utf8(bytes).unwrap())
+        seal_token_response(sealer, &key("app"), 200, body.as_bytes(), 42)
+            .unwrap()
+            .map(|bytes| String::from_utf8(bytes).unwrap())
     }
 
     #[test]
@@ -235,55 +256,76 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_when_not_a_successful_json_object_with_a_refresh_token() {
+    fn unchanged_when_there_is_no_refresh_token_to_substitute() {
         let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
-        let with_token = r#"{"refresh_token":"secret"}"#;
         for body in [
             r#"{"access_token":"a"}"#,
             r#"{"refresh_token":null}"#,
             r#"{"refresh_token":""}"#,
             r#"{"refresh_token":7}"#,
             r#"["refresh_token"]"#,
-            "refresh_token=secret",
+            "access_token=a&token_type=Bearer",
             "",
         ] {
             assert_eq!(seal(&sealer, body), None, "{body}");
         }
-        for (status, content_type) in [
-            (400, Some("application/json")),
-            (302, Some("application/json")),
-            (200, Some("text/plain")),
-            (200, Some("application/x-www-form-urlencoded")),
-            (200, None),
-        ] {
+        for status in [400, 302, 500] {
             assert_eq!(
                 seal_token_response(
                     &sealer,
                     &key("app"),
                     status,
-                    content_type,
-                    with_token.as_bytes(),
+                    br#"{"refresh_token":"secret"}"#,
                     0
-                )
-                .unwrap(),
-                None,
-                "{status} {content_type:?}"
+                ),
+                Ok(None),
+                "{status}"
             );
         }
     }
 
     #[test]
-    fn json_content_types() {
-        for value in [
-            "application/json",
-            "Application/JSON; charset=utf-8",
-            "application/vnd.oauth-token+json",
+    fn json_is_recognised_whatever_the_content_type() {
+        // The content type is not an input: a 2xx body is a JSON object or it is not.
+        let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
+        let sealed = seal(&sealer, r#"{"refresh_token":"secret","x":1}"#).unwrap();
+        assert!(!sealed.contains("secret") && sealed.contains(r#""x":1"#));
+    }
+
+    #[test]
+    fn a_non_json_success_body_that_carries_a_refresh_token_fails_closed() {
+        let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
+        for body in [
+            "access_token=a&refresh_token=secret&token_type=Bearer",
+            "refresh_token=secret",
+            "refresh_token = secret",
+            r#"[{"refresh_token":"secret"}]"#,
+            r#"not json "refresh_token" : "secret""#,
+            "{\"refresh_token\": \"secret\"",
         ] {
-            assert!(is_json_content_type(Some(value)), "{value}");
+            assert_eq!(
+                seal_token_response(&sealer, &key("app"), 200, body.as_bytes(), 0),
+                Err(SubstitutionError::UnrecognizedBody),
+                "{body}"
+            );
         }
-        for value in ["text/json", "application/jsonp", "text/html", ""] {
-            assert!(!is_json_content_type(Some(value)), "{value}");
+    }
+
+    #[test]
+    fn handle_prefixes_of_any_version_are_recognised() {
+        for token in ["rrt1.abc", "rrt2.abc", "rrt10.x", "rrt3."] {
+            assert!(has_handle_prefix(token), "{token}");
         }
-        assert!(!is_json_content_type(None));
+        for token in [
+            "rrt.abc",
+            "rrt1abc",
+            "rrtx.abc",
+            "xrrt1.abc",
+            "rrt",
+            "",
+            "1//abc",
+        ] {
+            assert!(!has_handle_prefix(token), "{token}");
+        }
     }
 }

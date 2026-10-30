@@ -39,6 +39,8 @@ struct MockIdpState {
 struct MockCapture {
     authorize: RequestCapture,
     token: RequestCapture,
+    /// The `Accept` header of every token request.
+    accept: Arc<StdMutex<Vec<Option<String>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +87,8 @@ async fn mock_authorize(State(state): State<MockIdpState>, uri: Uri) -> Response
             "code",
             if value_opt("login_hint") == Some("no-refresh") {
                 "upstream-code-no-refresh"
+            } else if value_opt("login_hint") == Some("form-body") {
+                "upstream-code-form"
             } else {
                 "upstream-code"
             },
@@ -95,7 +99,17 @@ async fn mock_authorize(State(state): State<MockIdpState>, uri: Uri) -> Response
     found(callback.as_str())
 }
 
-async fn mock_token(State(state): State<MockIdpState>, body: String) -> Response {
+async fn mock_token(
+    State(state): State<MockIdpState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    state.capture.accept.lock().unwrap().push(
+        headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    );
     state.capture.token.lock().unwrap().push(
         url::form_urlencoded::parse(body.as_bytes())
             .into_owned()
@@ -107,6 +121,43 @@ async fn mock_token(State(state): State<MockIdpState>, body: String) -> Response
             .header(header::CONTENT_TYPE, "application/json;charset=UTF-8")
             .body(Body::from(
                 r#"{"token_type":"Bearer","refresh_token":"rotated","access_token":"refreshed","expires_in":3600}"#,
+            ))
+            .unwrap();
+    }
+    if body.contains("grant_type=refresh_token") && body.contains("refresh_token=revoked-upstream")
+    {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"invalid_grant","error_description":"Token has been revoked"}"#,
+            ))
+            .unwrap();
+    }
+    if body.contains("grant_type=refresh_token") && body.contains("refresh_token=broken-upstream") {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"error":"server_error"}"#))
+            .unwrap();
+    }
+    if body.contains("grant_type=refresh_token") && body.contains("refresh_token=plain-json") {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(
+                r#"{"access_token":"plain","refresh_token":"plain-rotated"}"#,
+            ))
+            .unwrap();
+    }
+    if (body.contains("grant_type=refresh_token") && body.contains("refresh_token=form-encoded"))
+        || body.contains("code=upstream-code-form")
+    {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "access_token=form&refresh_token=raw-secret&token_type=Bearer",
             ))
             .unwrap();
     }
@@ -2789,4 +2840,157 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         assert_eq!(hits.load(Ordering::SeqCst), initial_hits + 4);
     }
     task.abort();
+}
+
+#[tokio::test]
+async fn upstream_requests_ask_for_json() {
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::Public).await;
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
+    post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
+    let handle = seal_handle(
+        sealer.as_ref(),
+        &ResourceKey::new("google").unwrap(),
+        "refresh",
+        1,
+    )
+    .unwrap();
+    post_token(&app, "google", &refresh_form(&handle)).await;
+    let accept = capture.accept.lock().unwrap().clone();
+    assert_eq!(accept.len(), 2, "one code exchange and one refresh");
+    assert!(accept
+        .iter()
+        .all(|value| value.as_deref() == Some("application/json")));
+    task.abort();
+}
+
+#[tokio::test]
+async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
+    let (app, sealer, task, _) = setup_sealed(ClientAuth::Public).await;
+    let handle = seal_handle(
+        sealer.as_ref(),
+        &ResourceKey::new("google").unwrap(),
+        "plain-json",
+        1,
+    )
+    .unwrap();
+    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+    let body = String::from_utf8(response_body(response).await).unwrap();
+    assert!(!body.contains("plain-rotated"), "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert!(value["refresh_token"]
+        .as_str()
+        .unwrap()
+        .starts_with("rrt1."));
+    task.abort();
+}
+
+#[tokio::test]
+async fn sealed_mode_fails_closed_on_a_form_encoded_success_body() {
+    let (app, sealer, task, _) = setup_sealed(ClientAuth::Public).await;
+    let handle = seal_handle(
+        sealer.as_ref(),
+        &ResourceKey::new("google").unwrap(),
+        "form-encoded",
+        1,
+    )
+    .unwrap();
+    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = String::from_utf8(response_body(response).await).unwrap();
+    assert!(!body.contains("raw-secret"), "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"], "server_error");
+
+    let code = authorization_code_with(
+        &app,
+        "google",
+        Some(&pkce_challenge(SEALED_VERIFIER)),
+        "&login_hint=form-body",
+    )
+    .await;
+    let response = post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = String::from_utf8(response_body(response).await).unwrap();
+    assert!(!body.contains("raw-secret"), "{body}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn passthrough_mode_returns_a_form_encoded_body_unchanged() {
+    let (app, _, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
+    let response = post_token(&app, "google", &refresh_form("form-encoded")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_body(response).await,
+        b"access_token=form&refresh_token=raw-secret&token_type=Bearer"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn handle_prefixed_tokens_are_never_forwarded_in_any_mode() {
+    let (passthrough, _, task1, capture1) = setup_with_capture(
+        "google",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+    )
+    .await;
+    let (sealed, _, task2, capture2) = setup_sealed(ClientAuth::Public).await;
+    for (app, capture) in [(&passthrough, &capture1), (&sealed, &capture2)] {
+        for presented in ["rrt1.anything", "rrt2.anything", "rrt7.anything"] {
+            let response = post_token(app, "google", &refresh_form(presented)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{presented}");
+            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+            assert_eq!(body["error"], "invalid_grant", "{presented}");
+        }
+        assert!(
+            capture.token.lock().unwrap().is_empty(),
+            "a handle must not reach the upstream"
+        );
+    }
+    // A raw token that merely resembles the prefix is an ordinary upstream token.
+    let response = post_token(&passthrough, "google", &refresh_form("rrt-not-a-handle")).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    task1.abort();
+    task2.abort();
+}
+
+#[tokio::test]
+async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_failures() {
+    let (app, sealer, task, _) = setup_with_refresh_tokens(
+        "google",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Explicit,
+        SEALED,
+    )
+    .await;
+    let key = ResourceKey::new("google").unwrap();
+    let handle = |token: &str| seal_handle(sealer.as_ref(), &key, token, 1).unwrap();
+
+    let response = post_token(&app, "google", &refresh_form(&handle("broken-upstream"))).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response_body(response).await,
+        br#"{"error":"server_error"}"#
+    );
+    let response = post_token(&app, "google", &refresh_form(&handle("revoked-upstream"))).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_body(response).await,
+        br#"{"error":"invalid_grant","error_description":"Token has been revoked"}"#
+    );
+
+    // With the upstream gone the failure is a 502 server_error, not a hang or a raw error.
+    task.abort();
+    let _ = task.await;
+    let response = post_token(&app, "google", &refresh_form(&handle("rotating"))).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    assert_eq!(body["error"], "server_error");
 }
