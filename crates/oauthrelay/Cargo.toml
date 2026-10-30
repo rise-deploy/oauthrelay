@@ -13,10 +13,13 @@ kubernetes = ["dep:kube", "dep:oauthrelay-provider-kubernetes"]
 aws = [
   "dep:async-trait",
   "dep:aws-config",
+  "dep:aws-sdk-dynamodb",
   "dep:aws-sdk-secretsmanager",
   "dep:aws-sdk-ssm",
   "dep:oauthrelay-provider-ssm",
+  "dep:oauthrelay-store-dynamodb",
   "oauthrelay-provider-ssm/aws",
+  "oauthrelay-store-dynamodb/aws",
 ]
 lambda = ["dep:lambda_http"]
 
@@ -26,6 +29,7 @@ oauthrelay-provider-kubernetes = { path = "../oauthrelay-provider-kubernetes", o
 anyhow.workspace = true
 async-trait = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-ssm = { workspace = true, optional = true }
 axum.workspace = true
@@ -34,6 +38,7 @@ lambda_http = { workspace = true, optional = true }
 oauthrelay-core = { path = "../oauthrelay-core" }
 oauthrelay-provider-file = { path = "../oauthrelay-provider-file" }
 oauthrelay-provider-ssm = { path = "../oauthrelay-provider-ssm", default-features = false, optional = true }
+oauthrelay-store-dynamodb = { path = "../oauthrelay-store-dynamodb", default-features = false, optional = true }
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

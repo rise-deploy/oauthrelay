@@ -256,7 +256,7 @@ pub enum ClientAuthentication {
     /// Require a signed client assertion, optionally from a federated workload issuer.
     PrivateKeyJwt {
         /// Require iat, a non-empty single-use jti, and a lifetime of at most 300 seconds.
-        /// Requires a replay cache shared by all serving instances; false permits reusable workload JWTs.
+        /// Requires a transient store shared by all serving instances; false permits reusable workload JWTs.
         #[serde(
             default,
             rename = "requireSingleUse",

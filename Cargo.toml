@@ -5,6 +5,7 @@ members = [
   "crates/oauthrelay-provider-file",
   "crates/oauthrelay-provider-ssm",
   "crates/oauthrelay-provider-kubernetes",
+  "crates/oauthrelay-store-dynamodb",
   "crates/oauthrelay",
 ]
 resolver = "2"
@@ -21,6 +22,7 @@ anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
 aws-config = "1"
+aws-sdk-dynamodb = "1"
 aws-sdk-secretsmanager = "1"
 aws-sdk-ssm = "1"
 axum = "0.8"
