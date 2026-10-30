@@ -31,18 +31,31 @@ pub const PURPOSE_LABEL: &str = "oauthrelay.dev/purpose";
 pub const EXPIRES_HOUR_LABEL: &str = "oauthrelay.dev/expires-hour";
 /// Milliseconds in one expiry bucket.
 pub const EXPIRY_BUCKET_MS: u64 = 3_600_000;
-/// Prefix of every object name the store writes.
+/// Prefix of every `TransientRecord` name the store writes.
 pub const NAME_PREFIX: &str = "oauthrelay-";
+/// Prefix of every `AuthCode` name the store writes: eleven `z`, so that with the 52-character
+/// hash that follows it the name is 63 characters, like a `TransientRecord` name.
+///
+/// Dex's garbage collector lists the first 500 `AuthCode` objects in name order and has no
+/// continue token, so records that sort early starve it of its own codes. Dex's names are always
+/// 25 characters of `[a-z][a-z2-7]`. Ours begin with eleven `z` and are 63 characters long, so
+/// they sort after every Dex name except one that itself begins with eleven `z` (probability about
+/// 2^-55), and can never equal one.
+pub const DEX_NAME_PREFIX: &str = "zzzzzzzzzzz";
 
 const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-/// The object name for a store key: [`NAME_PREFIX`] plus the lowercase, unpadded base32 of the
+/// The `TransientRecord` object name for a store key: [`NAME_PREFIX`] plus the lowercase, unpadded base32 of the
 /// key's SHA-256, 63 characters in all (a DNS label, and so a valid name for any resource).
 /// Keys are arbitrary UTF-8 up to 1024 bytes, which are not valid names, and hashing keeps the
 /// name fixed-length.
 pub fn object_name(key: &str) -> String {
+    prefixed_name(NAME_PREFIX, key)
+}
+
+fn prefixed_name(prefix: &str, key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
-    format!("{NAME_PREFIX}{}", base32_lower(&digest))
+    format!("{prefix}{}", base32_lower(&digest))
 }
 
 pub(crate) fn base32_lower(bytes: &[u8]) -> String {
@@ -134,14 +147,25 @@ pub(crate) fn max_expiry_millis() -> u64 {
 pub enum RecordMapping {
     /// oauthrelay's own `transientrecords.oauthrelay.dev`.
     TransientRecord,
-    /// Dex's `authcodes.dex.coreos.com`. A record is an `AuthCode` that Dex can never exchange:
-    /// its `clientID` is not a registered client and its PKCE challenge is random. Dex creates
-    /// the CRD itself and its garbage collector also removes expired codes.
+    /// Dex's `authcodes.dex.coreos.com`. A record is an `AuthCode` that Dex cannot exchange: its
+    /// `clientID` is not a registered client, which Dex's token endpoint and (from 2.46.0) its
+    /// device callback check first; the random PKCE challenge and the empty claims are defence
+    /// in depth. Dex creates the CRD itself and its garbage collector also removes expired
+    /// codes. **Requires Dex 2.46.0 or later**; see [`DEX_MINIMUM_VERSION`].
     DexAuthCode,
 }
 
-/// The `clientID` of every `AuthCode` the store writes. Dex rejects a code whose `clientID` is
-/// not the authenticating client's, and no Dex client has this ID.
+/// The oldest Dex release that is safe to share a namespace with [`RecordMapping::DexAuthCode`]
+/// records. Before it, Dex's device callback (`/device/callback?state=<user_code>&code=<name>`)
+/// redeemed any unexpired `AuthCode` it was given the name of, without checking its `clientID`,
+/// so an oauthrelay record could be redeemed there and Dex would mint tokens for an empty
+/// identity. Dex 2.46.0 binds the device callback to its request and rejects on `clientID`.
+/// oauthrelay cannot detect the version of the Dex it shares a namespace with.
+pub const DEX_MINIMUM_VERSION: &str = "2.46.0";
+
+/// The `clientID` of every `AuthCode` the store writes. Dex (2.46.0 and later) rejects a code
+/// whose `clientID` is not the authenticating client's, on the token endpoint and on the device
+/// callback, and no Dex client has this ID.
 const DEX_CLIENT_ID: &str = "oauthrelay:transient-record";
 const DEX_REDIRECT_URI: &str = "urn:oauthrelay:transient-record";
 /// The `connectorID` of every `AuthCode` the store writes, for whoever reads the namespace.
@@ -150,6 +174,22 @@ const DEX_CONNECTOR_ID: &str = "oauthrelay";
 impl RecordMapping {
     /// Every supported mapping.
     pub const ALL: [Self; 2] = [Self::TransientRecord, Self::DexAuthCode];
+
+    /// The object name for a store key. A `TransientRecord` is named [`object_name`]; an
+    /// `AuthCode` is named [`DEX_NAME_PREFIX`] plus the same hash, so that it sorts after every
+    /// code Dex wrote.
+    pub fn object_name(self, key: &str) -> String {
+        match self {
+            Self::TransientRecord => object_name(key),
+            Self::DexAuthCode => prefixed_name(DEX_NAME_PREFIX, key),
+        }
+    }
+
+    /// Whether the records live in a namespace that is not the oauthrelay deployment's own, so
+    /// that the namespace must be named explicitly rather than inferred.
+    pub fn needs_explicit_namespace(self) -> bool {
+        matches!(self, Self::DexAuthCode)
+    }
 
     pub fn resource_name(self) -> &'static str {
         match self {

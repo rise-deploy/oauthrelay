@@ -5,14 +5,16 @@
 //!
 //! | Field | Meaning |
 //! | --- | --- |
-//! | `metadata.name` | [`object_name`]: `oauthrelay-` plus the lowercase base32 of the key's SHA-256. |
+//! | `metadata.name` | [`object_name`]: `oauthrelay-` plus the lowercase base32 of the key's SHA-256. ([`RecordMapping::object_name`] gives the name for the other mapping.) |
 //! | `metadata.labels` | `app.kubernetes.io/managed-by: oauthrelay`, and `oauthrelay.dev/purpose` with the key's first segment (`replay`, `refresh`). |
 //! | `spec.key` | The store key, for inspection. It holds hashes and random IDs, never a secret. |
 //! | `spec.value` | The opaque value, base64. |
 //! | `spec.expiresAt` | Expiry as RFC 3339 with millisecond precision. |
 //!
-//! The same records can live in Dex's `AuthCode` resource (`authcodes.dex.coreos.com`) instead; see
-//! [`RecordMapping::DexAuthCode`]. Everything below the field layout is identical.
+//! The same records can live in Dex's `AuthCode` resource (`authcodes.dex.coreos.com`) instead,
+//! under names that sort after every Dex-written code; see [`RecordMapping::DexAuthCode`], which
+//! requires Dex 2.46.0 or later ([`DEX_MINIMUM_VERSION`]). Everything below the field layout and
+//! the name is identical.
 //!
 //! The runtime role needs `get`, `list`, `create`, `update` and `delete` on the resource in one
 //! namespace ([`REQUIRED_VERBS`]); [`KubernetesStore::probe`] checks them at startup.
@@ -50,8 +52,9 @@ mod mapping;
 pub use crd::{TransientRecord, TransientRecordSpec};
 pub use kube_client::KubeClient;
 pub use mapping::{
-    expiry_hour, expiry_selector, object_name, RecordMapping, EXPIRES_HOUR_LABEL, EXPIRY_BUCKET_MS,
-    MANAGED_BY_LABEL, MANAGED_BY_VALUE, MANAGED_SELECTOR, NAME_PREFIX, PURPOSE_LABEL,
+    expiry_hour, expiry_selector, object_name, RecordMapping, DEX_MINIMUM_VERSION, DEX_NAME_PREFIX,
+    EXPIRES_HOUR_LABEL, EXPIRY_BUCKET_MS, MANAGED_BY_LABEL, MANAGED_BY_VALUE, MANAGED_SELECTOR,
+    NAME_PREFIX, PURPOSE_LABEL,
 };
 
 /// Objects requested per sweeper list call.
@@ -92,7 +95,7 @@ pub struct Stored {
     pub expires_at_ms: u64,
 }
 
-/// A record to write. `name` is [`object_name`] of `key`.
+/// A record to write. `name` is [`KubernetesClient::object_name`] of `key`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewRecord<'a> {
     pub name: &'a str,
@@ -146,6 +149,9 @@ pub trait KubernetesClient: Send + Sync + 'static {
     /// What must hold for the resource to be served, completing "check that ...", for the
     /// startup message that explains a failed list.
     fn install_hint(&self) -> String;
+    /// The name of the object that holds the record for `key`: [`RecordMapping::object_name`]
+    /// for the resource the client is bound to.
+    fn object_name(&self, key: &str) -> String;
     /// Whether the credentials may perform `verb` on the resource in the namespace, from a
     /// `SelfSubjectAccessReview`.
     async fn permits(&self, verb: &str) -> anyhow::Result<bool>;
@@ -492,7 +498,7 @@ impl<C: KubernetesClient> Inner<C> {
         value: &[u8],
         ttl: Duration,
     ) -> Result<bool, StoreError> {
-        let name = object_name(key);
+        let name = self.client.object_name(key);
         let now = self.now();
         let record = NewRecord {
             name: &name,
@@ -537,7 +543,7 @@ impl<C: KubernetesClient> Inner<C> {
         let now = self.now();
         let object = self
             .client
-            .get(&object_name(key))
+            .get(&self.client.object_name(key))
             .await
             .map_err(StoreError::Backend)?;
         Ok(object
@@ -555,7 +561,7 @@ impl<C: KubernetesClient> Inner<C> {
         new: &[u8],
         ttl: Duration,
     ) -> Result<bool, StoreError> {
-        let name = object_name(key);
+        let name = self.client.object_name(key);
         let now = self.now();
         let expires_at_ms = self.expiry(now, ttl)?;
         let current = self.client.get(&name).await.map_err(StoreError::Backend)?;
@@ -587,7 +593,7 @@ impl<C: KubernetesClient> Inner<C> {
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.client
-            .delete(&object_name(key), None)
+            .delete(&self.client.object_name(key), None)
             .await
             .map_err(StoreError::Backend)?;
         Ok(())

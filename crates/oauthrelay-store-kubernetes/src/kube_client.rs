@@ -79,6 +79,10 @@ impl KubernetesClient for KubeClient {
         self.mapping.install_hint().to_owned()
     }
 
+    fn object_name(&self, key: &str) -> String {
+        self.mapping.object_name(key)
+    }
+
     async fn permits(&self, verb: &str) -> anyhow::Result<bool> {
         let resource = self.mapping.api_resource();
         let review = SelfSubjectAccessReview {

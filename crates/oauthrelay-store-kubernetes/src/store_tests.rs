@@ -132,6 +132,10 @@ impl KubernetesClient for FakeClient {
         "the fake CRD is installed".into()
     }
 
+    fn object_name(&self, key: &str) -> String {
+        object_name(key)
+    }
+
     async fn permits(&self, verb: &str) -> anyhow::Result<bool> {
         self.enter().await?;
         self.calls
@@ -703,6 +707,64 @@ fn object_names_are_stable_dns_labels_that_cannot_collide_with_dex() {
         object_name(&"k".repeat(oauthrelay_core::MAX_KEY_BYTES)).len(),
         63
     );
+    assert_eq!(
+        RecordMapping::TransientRecord.object_name("replay:code:abc"),
+        name
+    );
+}
+
+/// Dex's `storage.NewID`: 25 characters, the first a letter and the rest from the lowercase
+/// base32 alphabet.
+fn dex_style_id() -> String {
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    const BASE32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let pick = |alphabet: &[u8]| char::from(alphabet[rand::random_range(0..alphabet.len())]);
+    std::iter::once(pick(LETTERS))
+        .chain((0..24).map(|_| pick(BASE32)))
+        .collect()
+}
+
+#[test]
+fn dex_object_names_are_dns_labels_that_sort_after_every_dex_id() {
+    let name = RecordMapping::DexAuthCode.object_name("replay:code:abc");
+    assert_eq!(
+        name,
+        RecordMapping::DexAuthCode.object_name("replay:code:abc")
+    );
+    assert_ne!(
+        name,
+        RecordMapping::DexAuthCode.object_name("replay:code:abd")
+    );
+    // The same hash as the default mapping, behind a different prefix.
+    assert_eq!(
+        name.strip_prefix(DEX_NAME_PREFIX),
+        object_name("replay:code:abc").strip_prefix(NAME_PREFIX)
+    );
+    assert_eq!(name.len(), 63);
+    assert!(name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
+    assert_eq!(
+        RecordMapping::DexAuthCode
+            .object_name(&"k".repeat(oauthrelay_core::MAX_KEY_BYTES))
+            .len(),
+        63
+    );
+    // Dex's garbage collector reads the first 500 names in order, so ours must come after every
+    // code Dex wrote, whatever either side's random content is. Names are compared as bytes, as
+    // etcd orders keys.
+    for index in 0..20_000 {
+        let ours = RecordMapping::DexAuthCode.object_name(&format!("replay:code:{index}"));
+        let theirs = dex_style_id();
+        assert_eq!(theirs.len(), 25);
+        assert!(theirs < ours, "{theirs} sorts after {ours}");
+        assert_ne!(theirs, ours);
+    }
+    // Even the largest ID that does not begin with eleven `z` sorts first.
+    assert!(format!("{}y{}", "z".repeat(10), "z".repeat(14)) < name);
+    // The default mapping's names are not safe in Dex's namespace: they sort before the Dex IDs
+    // that begin with `ob` or later.
+    assert!(object_name("replay:code:abc").as_str() < "obaaaaaaaaaaaaaaaaaaaaaaa");
 }
 
 #[test]
@@ -928,6 +990,9 @@ async fn probe_fails_when_the_access_review_cannot_be_made() {
         }
         fn install_hint(&self) -> String {
             self.0.install_hint()
+        }
+        fn object_name(&self, key: &str) -> String {
+            self.0.object_name(key)
         }
         async fn permits(&self, _: &str) -> anyhow::Result<bool> {
             anyhow::bail!("selfsubjectaccessreviews is forbidden")

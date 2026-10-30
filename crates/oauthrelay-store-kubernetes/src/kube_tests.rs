@@ -829,7 +829,12 @@ async fn dex_auth_codes_have_the_shape_dex_expects_and_can_never_be_exchanged() 
         .put_if_absent("replay:code:abc", &[0, 1, 2, 255], TTL)
         .await
         .unwrap());
-    let object = api.object(&object_name("replay:code:abc")).unwrap();
+    let name = RecordMapping::DexAuthCode.object_name("replay:code:abc");
+    assert!(
+        name.starts_with("zzzzzzzzzzz") && name.len() == 63,
+        "{name}"
+    );
+    let object = api.object(&name).unwrap();
     assert_eq!(object["apiVersion"], "dex.coreos.com/v1");
     assert_eq!(object["kind"], "AuthCode");
     assert_eq!(object["metadata"]["namespace"], NAMESPACE);

@@ -233,7 +233,10 @@ impl Env {
     }
 
     async fn stored(&self, key: &str) -> Option<DynamicObject> {
-        self.raw().get_opt(&object_name(key)).await.unwrap()
+        self.raw()
+            .get_opt(&self.mapping.object_name(key))
+            .await
+            .unwrap()
     }
 }
 
@@ -393,6 +396,9 @@ impl KubernetesClient for RenewAfterList {
     }
     fn install_hint(&self) -> String {
         self.inner.install_hint()
+    }
+    fn object_name(&self, key: &str) -> String {
+        self.inner.object_name(key)
     }
     async fn permits(&self, verb: &str) -> anyhow::Result<bool> {
         self.inner.permits(verb).await
@@ -607,6 +613,14 @@ async fn dex_auth_codes_work_through_a_role_scoped_to_authcodes() {
         "dex.coreos.com/v1"
     );
     assert_eq!(object.types.as_ref().unwrap().kind, "AuthCode");
+    // Named to sort after every code Dex wrote, so Dex's garbage collector, which reads the
+    // first 500 names, is never starved of its own.
+    let name = object.metadata.name.clone().unwrap();
+    assert_eq!(name, env.mapping.object_name(&key));
+    assert!(
+        name.starts_with("zzzzzzzzzzz") && name.len() == 63,
+        "{name}"
+    );
     assert_eq!(
         object.metadata.labels.unwrap()["app.kubernetes.io/managed-by"],
         "oauthrelay"
