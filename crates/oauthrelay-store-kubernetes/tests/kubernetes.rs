@@ -1,4 +1,6 @@
-//! Requires an isolated cluster with the generated CRDs installed.
+//! Requires an isolated cluster with the generated CRDs and the Dex `authcodes` CRD installed
+//! (`tests/kubernetes/run.py`). Run with `--test-threads=1`: the sweeper tests delete every
+//! expired record in the namespace, including other tests'.
 use k8s_openapi::api::{
     authentication::v1::{TokenRequest, TokenRequestSpec},
     core::v1::ServiceAccount,
@@ -24,10 +26,14 @@ use std::{
 };
 use tokio::sync::OnceCell;
 
+/// Where the shipped deployment example's Role lets the `oauthrelay` service account work.
 const NAMESPACE: &str = "oauthrelay";
+/// Stands in for Dex's namespace.
+const DEX_NAMESPACE: &str = "dex";
 const TTL: Duration = Duration::from_secs(300);
 
 static SETUP: OnceCell<()> = OnceCell::const_new();
+static DEX_SETUP: OnceCell<()> = OnceCell::const_new();
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 async fn admin_config() -> Config {
@@ -53,39 +59,73 @@ fn unique_key(purpose: &str) -> String {
     )
 }
 
+async fn apply(admin: &Client, namespace: Option<&str>, value: Value) {
+    let kind = value["kind"].as_str().unwrap();
+    let group = if kind.starts_with("Role") {
+        "rbac.authorization.k8s.io"
+    } else {
+        ""
+    };
+    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(group, "v1", kind));
+    let api: Api<DynamicObject> = match namespace {
+        None => Api::all_with(admin.clone(), &resource),
+        Some(namespace) => Api::namespaced_with(admin.clone(), namespace, &resource),
+    };
+    let name = value["metadata"]["name"].as_str().unwrap().to_owned();
+    api.patch(
+        &name,
+        &PatchParams::apply("oauthrelay-tests"),
+        &Patch::Apply(value),
+    )
+    .await
+    .unwrap();
+}
+
 /// Applies the namespace, service account, role and binding of the shipped deployment example.
 async fn apply_deployment_rbac(admin: &Client) {
     for document in
         serde_yaml::Deserializer::from_str(include_str!("../../../deploy/kubernetes.yaml"))
     {
         let value = Value::deserialize(document).unwrap();
-        let kind = value["kind"].as_str().unwrap();
-        if matches!(kind, "Deployment" | "Service") {
-            continue;
+        match value["kind"].as_str().unwrap() {
+            "Deployment" | "Service" => {}
+            "Namespace" => apply(admin, None, value).await,
+            _ => apply(admin, Some(NAMESPACE), value).await,
         }
-        let group = if kind.starts_with("Role") {
-            "rbac.authorization.k8s.io"
-        } else {
-            ""
-        };
-        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(group, "v1", kind));
-        let api: Api<DynamicObject> = if kind == "Namespace" {
-            Api::all_with(admin.clone(), &resource)
-        } else {
-            Api::namespaced_with(admin.clone(), NAMESPACE, &resource)
-        };
-        api.patch(
-            "oauthrelay",
-            &PatchParams::apply("oauthrelay-tests"),
-            &Patch::Apply(value),
-        )
-        .await
-        .unwrap();
     }
 }
 
-/// The cluster's administrator, and a client that holds only what the shipped Role grants the
-/// `oauthrelay` service account.
+/// Gives the `oauthrelay` service account the rule that `deploy/kubernetes.yaml` documents for
+/// the Dex mapping, in the namespace that stands in for Dex's.
+async fn apply_dex_rbac(admin: &Client) {
+    apply(
+        admin,
+        None,
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":DEX_NAMESPACE}}),
+    )
+    .await;
+    apply(
+        admin,
+        Some(DEX_NAMESPACE),
+        json!({"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role",
+            "metadata":{"name":"oauthrelay-store","namespace":DEX_NAMESPACE},
+            "rules":[{"apiGroups":["dex.coreos.com"],"resources":["authcodes"],
+                "verbs":["get","list","create","update","delete"]}]}),
+    )
+    .await;
+    apply(
+        admin,
+        Some(DEX_NAMESPACE),
+        json!({"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding",
+            "metadata":{"name":"oauthrelay-store","namespace":DEX_NAMESPACE},
+            "subjects":[{"kind":"ServiceAccount","name":"oauthrelay","namespace":NAMESPACE}],
+            "roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"oauthrelay-store"}}),
+    )
+    .await;
+}
+
+/// The cluster's administrator, and a client that holds only what the `oauthrelay` service
+/// account is granted: the shipped Role, plus the Dex rule in the Dex namespace.
 struct Clients {
     admin: Client,
     service_account: Client,
@@ -96,6 +136,9 @@ async fn clients() -> Clients {
     let admin = Client::try_from(config.clone()).unwrap();
     SETUP
         .get_or_init(|| async { apply_deployment_rbac(&admin).await })
+        .await;
+    DEX_SETUP
+        .get_or_init(|| async { apply_dex_rbac(&admin).await })
         .await;
     let token = Api::<ServiceAccount>::namespaced(admin.clone(), NAMESPACE)
         .create_token_request(
@@ -126,194 +169,196 @@ async fn clients() -> Clients {
     }
 }
 
-/// A store over the service account's credentials.
-async fn store_as_service_account() -> (Client, Arc<KubeClient>, KubernetesStore<KubeClient>) {
-    let clients = clients().await;
-    let client = Arc::new(KubeClient::new(
-        clients.service_account,
-        NAMESPACE,
-        RecordMapping::TransientRecord,
-    ));
-    (clients.admin, client.clone(), KubernetesStore::new(client))
+/// Where the records of one mapping live, and a store over the service account's credentials.
+struct Env {
+    mapping: RecordMapping,
+    namespace: &'static str,
+    admin: Client,
+    client: Arc<KubeClient>,
+    store: KubernetesStore<KubeClient>,
 }
 
-fn raw_api(admin: &Client) -> Api<DynamicObject> {
-    Api::namespaced_with(admin.clone(), NAMESPACE, &TransientRecord::api_resource())
-}
-
-#[tokio::test]
-#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
-async fn the_shipped_role_is_enough_and_confined_to_its_namespace() {
-    let (admin, _, store) = store_as_service_account().await;
-    store.probe().await.unwrap();
-    let key = unique_key("replay");
-    assert!(store.put_if_absent(&key, b"1", TTL).await.unwrap());
-    assert!(!store.put_if_absent(&key, b"2", TTL).await.unwrap());
-    let entry = store.get(&key).await.unwrap().unwrap();
-    assert_eq!(entry.value, b"1");
-    assert!(entry.expires_in <= TTL && entry.expires_in > TTL - Duration::from_secs(30));
-    assert!(store.compare_and_swap(&key, b"1", b"2", TTL).await.unwrap());
-    assert!(!store.compare_and_swap(&key, b"1", b"3", TTL).await.unwrap());
-    assert_eq!(store.get(&key).await.unwrap().unwrap().value, b"2");
-    store.delete(&key).await.unwrap();
-    store.delete(&key).await.unwrap();
-    assert_eq!(store.get(&key).await.unwrap(), None);
-
-    // The record is a labelled TransientRecord that `kubectl` users can inspect.
-    let key = unique_key("refresh");
-    assert!(store.put_if_absent(&key, b"\x00\xff", TTL).await.unwrap());
-    let object = raw_api(&admin).get(&object_name(&key)).await.unwrap();
-    assert_eq!(
-        object.metadata.labels.unwrap()["oauthrelay.dev/purpose"],
-        "refresh"
-    );
-    assert_eq!(object.data["spec"]["key"], key);
-    assert_eq!(object.data["spec"]["value"], "AP8=");
-
-    // The role is a Role, not a ClusterRole: another namespace is off limits.
-    let elsewhere = KubeClient::new(
-        clients().await.service_account,
-        "default",
-        RecordMapping::TransientRecord,
-    );
-    let error = KubernetesStore::new(Arc::new(elsewhere))
-        .probe()
-        .await
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("Forbidden"), "{error:#}");
-}
-
-#[tokio::test]
-#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
-async fn twenty_concurrent_put_if_absent_calls_have_exactly_one_winner() {
-    let (_, _, store) = store_as_service_account().await;
-    let store = Arc::new(store);
-    let key = unique_key("replay");
-    let mut tasks = Vec::new();
-    for index in 0..20 {
-        let (store, key) = (store.clone(), key.clone());
-        tasks.push(tokio::spawn(async move {
-            store
-                .put_if_absent(&key, format!("writer-{index}").as_bytes(), TTL)
-                .await
-                .unwrap()
-        }));
+impl Env {
+    async fn new(mapping: RecordMapping) -> Self {
+        let namespace = match mapping {
+            RecordMapping::TransientRecord => NAMESPACE,
+            RecordMapping::DexAuthCode => DEX_NAMESPACE,
+        };
+        let clients = clients().await;
+        let client = Arc::new(KubeClient::new(clients.service_account, namespace, mapping));
+        let store = KubernetesStore::new(client.clone());
+        // Role bindings take a moment to reach the authorizer.
+        let mut attempts = 0;
+        while let Err(error) = store.probe().await {
+            attempts += 1;
+            assert!(attempts < 20, "probe keeps failing: {error:#}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Self {
+            mapping,
+            namespace,
+            admin: clients.admin,
+            client,
+            store,
+        }
     }
-    let mut winners = 0;
-    for task in tasks {
-        winners += usize::from(task.await.unwrap());
+
+    /// Direct, administrator access to the stored objects.
+    fn raw(&self) -> Api<DynamicObject> {
+        Api::namespaced_with(
+            self.admin.clone(),
+            self.namespace,
+            &self.mapping.api_resource(),
+        )
     }
-    assert_eq!(winners, 1);
-    assert!(store
-        .get(&key)
-        .await
-        .unwrap()
-        .unwrap()
-        .value
-        .starts_with(b"writer-"));
+
+    async fn stored(&self, key: &str) -> Option<DynamicObject> {
+        self.raw().get_opt(&object_name(key)).await.unwrap()
+    }
 }
 
-#[tokio::test]
-#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
-async fn compare_and_swap_under_contention_has_one_winner_per_round() {
-    let (_, _, store) = store_as_service_account().await;
-    let store = Arc::new(store);
-    let key = unique_key("refresh");
-    assert!(store.put_if_absent(&key, b"round-0", TTL).await.unwrap());
-    let mut current = b"round-0".to_vec();
-    for round in 1..=3 {
+/// The scenarios that hold for every mapping.
+mod scenarios {
+    use super::*;
+
+    pub async fn basic_operations(env: &Env) {
+        let store = &env.store;
+        let key = unique_key("replay");
+        assert!(store.put_if_absent(&key, b"1", TTL).await.unwrap());
+        assert!(!store.put_if_absent(&key, b"2", TTL).await.unwrap());
+        let entry = store.get(&key).await.unwrap().unwrap();
+        assert_eq!(entry.value, b"1");
+        assert!(entry.expires_in <= TTL && entry.expires_in > TTL - Duration::from_secs(30));
+        assert!(store.compare_and_swap(&key, b"1", b"2", TTL).await.unwrap());
+        assert!(!store.compare_and_swap(&key, b"1", b"3", TTL).await.unwrap());
+        assert_eq!(store.get(&key).await.unwrap().unwrap().value, b"2");
+        store.delete(&key).await.unwrap();
+        store.delete(&key).await.unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), None);
+        assert!(env.stored(&key).await.is_none());
+    }
+
+    pub async fn one_winner_among_twenty_creators(
+        env: &Env,
+        store: Arc<KubernetesStore<KubeClient>>,
+    ) {
+        let key = unique_key("replay");
         let mut tasks = Vec::new();
         for index in 0..20 {
-            let (store, key, expected) = (store.clone(), key.clone(), current.clone());
+            let (store, key) = (store.clone(), key.clone());
             tasks.push(tokio::spawn(async move {
-                let new = format!("round-{round}-writer-{index}").into_bytes();
-                let won = store
-                    .compare_and_swap(&key, &expected, &new, TTL)
+                store
+                    .put_if_absent(&key, format!("writer-{index}").as_bytes(), TTL)
                     .await
-                    .unwrap();
-                (won, new)
+                    .unwrap()
             }));
         }
-        let mut winners = Vec::new();
+        let mut winners = 0;
         for task in tasks {
-            let (won, new) = task.await.unwrap();
-            if won {
-                winners.push(new);
-            }
+            winners += usize::from(task.await.unwrap());
         }
-        assert_eq!(winners.len(), 1, "round {round}");
-        assert_eq!(store.get(&key).await.unwrap().unwrap().value, winners[0]);
-        current = winners.pop().unwrap();
+        assert_eq!(winners, 1);
+        let value = store.get(&key).await.unwrap().unwrap().value;
+        assert!(value.starts_with(b"writer-"));
+        assert!(env.stored(&key).await.is_some());
     }
-}
 
-#[tokio::test]
-#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
-async fn expired_records_are_absent_replaceable_and_swept() {
-    let (admin, _, store) = store_as_service_account().await;
-    let key = unique_key("replay");
-    assert!(store
-        .put_if_absent(&key, b"old", Duration::from_millis(1500))
-        .await
-        .unwrap());
-    assert!(store.get(&key).await.unwrap().is_some());
-    assert!(!store.put_if_absent(&key, b"other", TTL).await.unwrap());
-    tokio::time::sleep(Duration::from_millis(1700)).await;
-    assert_eq!(store.get(&key).await.unwrap(), None);
-    assert!(!store
-        .compare_and_swap(&key, b"old", b"new", TTL)
-        .await
-        .unwrap());
-    // The object is still there; it only reads as absent.
-    assert!(raw_api(&admin)
-        .get_opt(&object_name(&key))
-        .await
-        .unwrap()
-        .is_some());
+    pub async fn one_winner_per_swap_round(store: Arc<KubernetesStore<KubeClient>>) {
+        let key = unique_key("refresh");
+        assert!(store.put_if_absent(&key, b"round-0", TTL).await.unwrap());
+        let mut current = b"round-0".to_vec();
+        for round in 1..=3 {
+            let mut tasks = Vec::new();
+            for index in 0..20 {
+                let (store, key, expected) = (store.clone(), key.clone(), current.clone());
+                tasks.push(tokio::spawn(async move {
+                    let new = format!("round-{round}-writer-{index}").into_bytes();
+                    let won = store
+                        .compare_and_swap(&key, &expected, &new, TTL)
+                        .await
+                        .unwrap();
+                    (won, new)
+                }));
+            }
+            let mut winners = Vec::new();
+            for task in tasks {
+                let (won, new) = task.await.unwrap();
+                if won {
+                    winners.push(new);
+                }
+            }
+            assert_eq!(winners.len(), 1, "round {round}");
+            assert_eq!(store.get(&key).await.unwrap().unwrap().value, winners[0]);
+            current = winners.pop().unwrap();
+        }
+    }
 
-    let expired_key = unique_key("replay");
-    assert!(store
-        .put_if_absent(&expired_key, b"x", Duration::from_millis(100))
-        .await
-        .unwrap());
-    let live_key = unique_key("replay");
-    assert!(store.put_if_absent(&live_key, b"x", TTL).await.unwrap());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let report = store.sweep().await.unwrap();
-    assert!(report.deleted >= 2, "{report:?}");
-    for gone in [&key, &expired_key] {
-        assert!(raw_api(&admin)
-            .get_opt(&object_name(gone))
+    pub async fn expiry_takeover_and_sweep(env: &Env) {
+        let store = &env.store;
+        let key = unique_key("replay");
+        assert!(store
+            .put_if_absent(&key, b"old", Duration::from_millis(1500))
             .await
-            .unwrap()
-            .is_none());
+            .unwrap());
+        assert!(store.get(&key).await.unwrap().is_some());
+        assert!(!store.put_if_absent(&key, b"other", TTL).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        assert_eq!(store.get(&key).await.unwrap(), None);
+        assert!(!store
+            .compare_and_swap(&key, b"old", b"new", TTL)
+            .await
+            .unwrap());
+        // The object is still there; it only reads as absent.
+        assert!(env.stored(&key).await.is_some());
+
+        let swept = unique_key("replay");
+        assert!(store
+            .put_if_absent(&swept, b"x", Duration::from_millis(100))
+            .await
+            .unwrap());
+        let live = unique_key("replay");
+        assert!(store.put_if_absent(&live, b"x", TTL).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let report = store.sweep().await.unwrap();
+        assert!(report.deleted >= 2, "{report:?}");
+        assert!(env.stored(&key).await.is_none());
+        assert!(env.stored(&swept).await.is_none());
+        assert!(env.stored(&live).await.is_some());
+
+        // A record that expired but was not swept is taken over by the next writer.
+        let stale = unique_key("replay");
+        assert!(store
+            .put_if_absent(&stale, b"old", Duration::from_millis(100))
+            .await
+            .unwrap());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(store.put_if_absent(&stale, b"new", TTL).await.unwrap());
+        assert_eq!(store.get(&stale).await.unwrap().unwrap().value, b"new");
     }
-    assert!(raw_api(&admin)
-        .get_opt(&object_name(&live_key))
-        .await
-        .unwrap()
-        .is_some());
-    // An expired record is replaceable without waiting for the sweeper.
-    assert!(store.put_if_absent(&key, b"new", TTL).await.unwrap());
+
+    pub async fn renewed_record_survives_a_sweep(env: &Env) {
+        let key = unique_key("refresh");
+        assert!(env
+            .store
+            .put_if_absent(&key, b"renew-me", Duration::from_millis(100))
+            .await
+            .unwrap());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let racing = KubernetesStore::new(Arc::new(RenewAfterList {
+            inner: env.client.clone(),
+        }));
+        let SweepReport { skipped, .. } = racing.sweep().await.unwrap();
+        assert!(skipped >= 1);
+        // Renewed with a far-future expiry and a new value: the delete's precondition failed.
+        assert_eq!(
+            env.store.get(&key).await.unwrap().unwrap().value,
+            b"renewed"
+        );
+    }
 }
 
-#[tokio::test]
-#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
-async fn put_if_absent_takes_over_an_expired_record_that_is_still_stored() {
-    let (admin, _, store) = store_as_service_account().await;
-    let key = unique_key("replay");
-    assert!(store
-        .put_if_absent(&key, b"old", Duration::from_millis(100))
-        .await
-        .unwrap());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(store.put_if_absent(&key, b"new", TTL).await.unwrap());
-    assert_eq!(store.get(&key).await.unwrap().unwrap().value, b"new");
-    let object = raw_api(&admin).get(&object_name(&key)).await.unwrap();
-    assert_eq!(object.data["spec"]["key"], key);
-}
-
-/// Renews every listed record right after the sweeper listed it, as a concurrent replica would.
+/// Renews every `renew-me` record right after the sweeper listed it, as a concurrent replica
+/// would.
 struct RenewAfterList {
     inner: Arc<KubeClient>,
 }
@@ -353,21 +398,23 @@ impl KubernetesClient for RenewAfterList {
             .inner
             .list(label_selector, limit, continue_token)
             .await?;
-        for object in &page.items {
+        for object in page
+            .items
+            .iter()
+            .filter(|object| object.value == b"renew-me")
+        {
             let renewed = NewRecord {
                 name: &object.name,
-                key: "replay:renewed",
+                key: "refresh:renewed",
                 value: b"renewed",
                 // 2100-01-01T00:00:00Z.
                 expires_at_ms: 4_102_444_800_000,
             };
-            if object.value == b"renew-me" {
-                let outcome = self
-                    .inner
-                    .replace(renewed, &object.resource_version)
-                    .await?;
-                assert_eq!(outcome, ReplaceOutcome::Replaced);
-            }
+            let outcome = self
+                .inner
+                .replace(renewed, &object.resource_version)
+                .await?;
+            assert_eq!(outcome, ReplaceOutcome::Replaced);
         }
         Ok(page)
     }
@@ -375,26 +422,78 @@ impl KubernetesClient for RenewAfterList {
 
 #[tokio::test]
 #[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
-async fn a_record_renewed_after_the_sweeper_listed_it_survives() {
-    let (_, client, store) = store_as_service_account().await;
+async fn the_shipped_role_is_enough_and_confined_to_its_namespace() {
+    let env = Env::new(RecordMapping::TransientRecord).await;
+    scenarios::basic_operations(&env).await;
+
+    // The record is a labelled TransientRecord that `kubectl` users can inspect.
     let key = unique_key("refresh");
-    assert!(store
-        .put_if_absent(&key, b"renew-me", Duration::from_millis(100))
+    assert!(env
+        .store
+        .put_if_absent(&key, b"\x00\xff", TTL)
         .await
         .unwrap());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let racing = KubernetesStore::new(Arc::new(RenewAfterList { inner: client }));
-    let SweepReport { skipped, .. } = racing.sweep().await.unwrap();
-    assert!(skipped >= 1);
-    // Renewed with a far-future expiry and a new value: the delete's precondition failed.
-    assert_eq!(store.get(&key).await.unwrap().unwrap().value, b"renewed");
+    let object = env.stored(&key).await.unwrap();
+    assert_eq!(
+        object.metadata.labels.unwrap()["oauthrelay.dev/purpose"],
+        "refresh"
+    );
+    assert_eq!(object.data["spec"]["key"], key);
+    assert_eq!(object.data["spec"]["value"], "AP8=");
+
+    // The role is a Role, not a ClusterRole: another namespace is off limits.
+    let elsewhere = KubeClient::new(
+        clients().await.service_account,
+        "default",
+        RecordMapping::TransientRecord,
+    );
+    let error = KubernetesStore::new(Arc::new(elsewhere))
+        .probe()
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").to_lowercase().contains("forbidden"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn twenty_concurrent_put_if_absent_calls_have_exactly_one_winner() {
+    let env = Env::new(RecordMapping::TransientRecord).await;
+    let store = Arc::new(KubernetesStore::new(env.client.clone()));
+    scenarios::one_winner_among_twenty_creators(&env, store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn compare_and_swap_under_contention_has_one_winner_per_round() {
+    let env = Env::new(RecordMapping::TransientRecord).await;
+    scenarios::one_winner_per_swap_round(Arc::new(KubernetesStore::new(env.client.clone()))).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn expired_records_are_absent_replaceable_and_swept() {
+    scenarios::expiry_takeover_and_sweep(&Env::new(RecordMapping::TransientRecord).await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn a_record_renewed_after_the_sweeper_listed_it_survives() {
+    scenarios::renewed_record_survives_a_sweep(&Env::new(RecordMapping::TransientRecord).await)
+        .await;
 }
 
 #[tokio::test]
 #[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
 async fn the_crd_schema_validates_records() {
-    let (admin, _, _) = store_as_service_account().await;
-    let api = raw_api(&admin);
+    let env = Env::new(RecordMapping::TransientRecord).await;
+    let api = Api::<DynamicObject>::namespaced_with(
+        env.admin.clone(),
+        NAMESPACE,
+        &TransientRecord::api_resource(),
+    );
     let dry_run = PostParams {
         dry_run: true,
         ..Default::default()
@@ -454,6 +553,120 @@ async fn the_crd_schema_validates_records() {
         serde_json::from_value(serde_json::to_value(created).unwrap()).unwrap();
     assert_eq!(typed.spec.key, "replay:a");
     api.delete("schema-typed", &DeleteParams::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn dex_auth_codes_work_through_a_role_scoped_to_authcodes() {
+    let env = Env::new(RecordMapping::DexAuthCode).await;
+    scenarios::basic_operations(&env).await;
+
+    // The record is an AuthCode with the Dex-safety fields, and the API server (whose schema
+    // accepts any object, like Dex's own) stored it as written.
+    let key = unique_key("replay");
+    assert!(env
+        .store
+        .put_if_absent(&key, b"\x00\xff", TTL)
+        .await
+        .unwrap());
+    let object = env.stored(&key).await.unwrap();
+    assert_eq!(
+        object.types.as_ref().unwrap().api_version,
+        "dex.coreos.com/v1"
+    );
+    assert_eq!(object.types.as_ref().unwrap().kind, "AuthCode");
+    assert_eq!(
+        object.metadata.labels.unwrap()["app.kubernetes.io/managed-by"],
+        "oauthrelay"
+    );
+    assert_eq!(object.data["connectorData"], "AP8=");
+    assert_eq!(object.data["clientID"], "oauthrelay:transient-record");
+    assert_eq!(
+        object.data["redirectURI"],
+        "urn:oauthrelay:transient-record"
+    );
+    assert_eq!(object.data["code_challenge"].as_str().unwrap().len(), 43);
+    assert!(object.data.get("claims").is_none() && object.data.get("scopes").is_none());
+    let expiry = object.data["expiry"].as_str().unwrap();
+    assert!(expiry.ends_with('Z') && expiry.contains('.'), "{expiry}");
+
+    // The Dex rule is scoped to Dex's namespace: the oauthrelay namespace's Role has none.
+    let elsewhere = KubeClient::new(
+        clients().await.service_account,
+        NAMESPACE,
+        RecordMapping::DexAuthCode,
+    );
+    let error = KubernetesStore::new(Arc::new(elsewhere))
+        .probe()
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").to_lowercase().contains("forbidden"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn dex_auth_codes_have_exactly_one_winner_among_concurrent_writers() {
+    let env = Env::new(RecordMapping::DexAuthCode).await;
+    let store = Arc::new(KubernetesStore::new(env.client.clone()));
+    scenarios::one_winner_among_twenty_creators(&env, store.clone()).await;
+    scenarios::one_winner_per_swap_round(store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn dex_auth_codes_expire_get_swept_and_survive_renewal() {
+    let env = Env::new(RecordMapping::DexAuthCode).await;
+    scenarios::expiry_takeover_and_sweep(&env).await;
+    scenarios::renewed_record_survives_a_sweep(&env).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
+async fn the_sweeper_never_touches_auth_codes_that_dex_wrote() {
+    let env = Env::new(RecordMapping::DexAuthCode).await;
+    // What Dex itself writes: no managed-by label, a real client, long expired.
+    let dex_code: DynamicObject = serde_json::from_value(json!({
+        "apiVersion": "dex.coreos.com/v1",
+        "kind": "AuthCode",
+        "metadata": {"name": "mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dpo5zq", "namespace": DEX_NAMESPACE},
+        "clientID": "example-app",
+        "redirectURI": "https://app.example/callback",
+        "connectorID": "mock",
+        "connectorData": "c2VjcmV0",
+        "claims": {"userID": "u1", "username": "kilgore", "email": "kilgore@kilgore.trout"},
+        "scopes": ["openid"],
+        "expiry": "2001-01-01T00:00:00Z",
+    }))
+    .unwrap();
+    env.raw()
+        .create(&PostParams::default(), &dex_code)
+        .await
+        .unwrap();
+    let expired = unique_key("replay");
+    assert!(env
+        .store
+        .put_if_absent(&expired, b"x", Duration::from_millis(100))
+        .await
+        .unwrap());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(env.store.sweep().await.unwrap().deleted >= 1);
+    assert!(env.stored(&expired).await.is_none());
+    assert!(env
+        .raw()
+        .get_opt("mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dpo5zq")
+        .await
+        .unwrap()
+        .is_some());
+    env.raw()
+        .delete(
+            "mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dpo5zq",
+            &DeleteParams::default(),
+        )
         .await
         .unwrap();
 }

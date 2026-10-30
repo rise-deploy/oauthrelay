@@ -1,0 +1,23 @@
+# Dex creates this CRD itself on startup (storage type kubernetes). The Kind test installs the
+# same definition, without Dex, to exercise the Dex mapping of the Kubernetes transient store
+# against a real API server: namespaced, dex.coreos.com/v1, and a schema that accepts any object.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: authcodes.dex.coreos.com
+spec:
+  group: dex.coreos.com
+  names:
+    kind: AuthCode
+    listKind: AuthCodeList
+    plural: authcodes
+    singular: authcode
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true

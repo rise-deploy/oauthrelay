@@ -7,13 +7,14 @@ use axum::{
     http::{Request, Response},
 };
 use http_body_util::BodyExt;
-use kube::Client;
+use kube::{api::DynamicObject, Client};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, convert::Infallible, sync::Mutex};
 use tower::service_fn;
 
 const NAMESPACE: &str = "relay-state";
 const COLLECTION: &str = "/apis/oauthrelay.dev/v1alpha1/namespaces/relay-state/transientrecords";
+const DEX_COLLECTION: &str = "/apis/dex.coreos.com/v1/namespaces/relay-state/authcodes";
 const START: u64 = 1_800_000_000_000;
 
 #[derive(Default)]
@@ -28,8 +29,11 @@ struct ApiState {
     fail_with: Option<u16>,
 }
 
-#[derive(Clone, Default)]
-struct FakeApi(Arc<Mutex<ApiState>>);
+#[derive(Clone)]
+struct FakeApi {
+    state: Arc<Mutex<ApiState>>,
+    collection: &'static str,
+}
 
 fn status(code: u16, reason: &str) -> Response<Body> {
     let body = json!({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":reason,"reason":reason,"code":code});
@@ -50,9 +54,23 @@ fn query(uri: &axum::http::Uri) -> BTreeMap<String, String> {
     serde_urlencoded::from_str(uri.query().unwrap_or_default()).unwrap()
 }
 
+impl Default for FakeApi {
+    fn default() -> Self {
+        Self::serving(COLLECTION)
+    }
+}
+
 impl FakeApi {
+    fn serving(collection: &'static str) -> Self {
+        Self {
+            state: Arc::default(),
+            collection,
+        }
+    }
+
     fn client(&self) -> Client {
-        let state = self.0.clone();
+        let state = self.state.clone();
+        let collection = self.collection;
         Client::new(
             service_fn(move |request: Request<kube::client::Body>| {
                 let state = state.clone();
@@ -75,7 +93,7 @@ impl FakeApi {
                     }
                     let path = parts.uri.path();
                     let name = path
-                        .strip_prefix(COLLECTION)
+                        .strip_prefix(collection)
                         .unwrap_or_else(|| panic!("unexpected path {path}"))
                         .strip_prefix('/');
                     Ok(state.handle(parts.method.as_str(), name, &parts.uri, body))
@@ -86,11 +104,11 @@ impl FakeApi {
     }
 
     fn requests(&self) -> Vec<(String, String, Value)> {
-        std::mem::take(&mut self.0.lock().unwrap().requests)
+        std::mem::take(&mut self.state.lock().unwrap().requests)
     }
 
     fn object(&self, name: &str) -> Option<Value> {
-        self.0.lock().unwrap().objects.get(name).cloned()
+        self.state.lock().unwrap().objects.get(name).cloned()
     }
 }
 
@@ -192,13 +210,20 @@ impl ApiState {
 }
 
 fn kube_store(api: &FakeApi) -> (Arc<KubeClient>, KubernetesStore<KubeClient>) {
-    let client = Arc::new(KubeClient::new(
-        api.client(),
-        NAMESPACE,
-        RecordMapping::TransientRecord,
-    ));
+    kube_store_for(api, RecordMapping::TransientRecord)
+}
+
+fn kube_store_for(
+    api: &FakeApi,
+    mapping: RecordMapping,
+) -> (Arc<KubeClient>, KubernetesStore<KubeClient>) {
+    let client = Arc::new(KubeClient::new(api.client(), NAMESPACE, mapping));
     let store = KubernetesStore::with_clock(client.clone(), Arc::new(|| START));
     (client, store)
+}
+
+fn dex_api() -> FakeApi {
+    FakeApi::serving(DEX_COLLECTION)
 }
 
 const TTL: Duration = Duration::from_secs(300);
@@ -390,7 +415,7 @@ async fn lists_select_only_managed_objects_and_skip_undecodable_ones() {
     let (client, store) = kube_store(&api);
     assert!(store.put_if_absent("replay:a", b"1", TTL).await.unwrap());
     {
-        let mut state = api.0.lock().unwrap();
+        let mut state = api.state.lock().unwrap();
         // A foreign object without the label, and a labelled one that is not a valid record.
         state.objects.insert(
             "foreign".into(),
@@ -416,7 +441,7 @@ async fn lists_select_only_managed_objects_and_skip_undecodable_ones() {
 async fn a_malformed_object_under_a_records_name_is_an_error_not_an_absence() {
     let api = FakeApi::default();
     let (_, store) = kube_store(&api);
-    api.0.lock().unwrap().objects.insert(
+    api.state.lock().unwrap().objects.insert(
         object_name("replay:a"),
         json!({"metadata":{"name":object_name("replay:a"),"resourceVersion":"7"},"spec":{"key":"replay:a","value":"!!","expiresAt":"2030-01-01T00:00:00Z"}}),
     );
@@ -464,7 +489,7 @@ async fn status_codes_map_to_outcomes_and_other_failures_are_errors() {
     );
 
     for code in [403, 500, 503] {
-        api.0.lock().unwrap().fail_with = Some(code);
+        api.state.lock().unwrap().fail_with = Some(code);
         assert!(client.get("oauthrelay-x").await.is_err(), "{code}");
         assert!(client.create(record).await.is_err(), "{code}");
         assert!(client.replace(record, "1").await.is_err(), "{code}");
@@ -481,7 +506,7 @@ async fn probe_reports_a_forbidden_list() {
     let api = FakeApi::default();
     let (_, store) = kube_store(&api);
     store.probe().await.unwrap();
-    api.0.lock().unwrap().fail_with = Some(403);
+    api.state.lock().unwrap().fail_with = Some(403);
     let error = format!("{:#}", store.probe().await.unwrap_err());
     assert!(
         error.contains("transientrecords.oauthrelay.dev in namespace \"relay-state\""),
@@ -497,9 +522,9 @@ async fn probe_reports_a_forbidden_list() {
 async fn a_lost_response_is_resolved_end_to_end() {
     let api = FakeApi::default();
     let (_, store) = kube_store(&api);
-    api.0.lock().unwrap().lose_next_write_response = true;
+    api.state.lock().unwrap().lose_next_write_response = true;
     assert!(store.put_if_absent("replay:a", b"mine", TTL).await.unwrap());
-    api.0.lock().unwrap().lose_next_write_response = true;
+    api.state.lock().unwrap().lose_next_write_response = true;
     assert!(store
         .compare_and_swap("replay:a", b"mine", b"mine2", TTL)
         .await
@@ -591,4 +616,216 @@ fn the_crd_bundle_describes_the_namespaced_resource() {
         RecordMapping::from_resource_name("relays.oauthrelay.dev"),
         None
     );
+}
+
+#[tokio::test]
+async fn dex_auth_codes_have_the_shape_dex_expects_and_can_never_be_exchanged() {
+    let api = dex_api();
+    let (_, store) = kube_store_for(&api, RecordMapping::DexAuthCode);
+    assert!(store
+        .put_if_absent("replay:code:abc", &[0, 1, 2, 255], TTL)
+        .await
+        .unwrap());
+    let object = api.object(&object_name("replay:code:abc")).unwrap();
+    assert_eq!(object["apiVersion"], "dex.coreos.com/v1");
+    assert_eq!(object["kind"], "AuthCode");
+    assert_eq!(object["metadata"]["namespace"], NAMESPACE);
+    assert_eq!(
+        object["metadata"]["labels"],
+        json!({"app.kubernetes.io/managed-by":"oauthrelay","oauthrelay.dev/purpose":"replay"})
+    );
+    // Exactly the fields of Dex's AuthCode that carry the record, and nothing else: no claims
+    // and no scopes, and none of the unused string fields.
+    let fields: std::collections::BTreeSet<_> = object
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "apiVersion",
+            "clientID",
+            "code_challenge",
+            "code_challenge_method",
+            "connectorData",
+            "connectorID",
+            "expiry",
+            "kind",
+            "metadata",
+            "redirectURI",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(object["connectorData"], "AAEC/w==");
+    assert_eq!(object["expiry"], "2027-01-15T08:05:00.000Z");
+    assert_eq!(object["connectorID"], "oauthrelay");
+    // The client ID is not a Dex client, so `authCode.ClientID != client.ID` rejects the code
+    // for every real client; the redirect URI is not a URL a client could register either.
+    assert_eq!(object["clientID"], "oauthrelay:transient-record");
+    assert_eq!(object["redirectURI"], "urn:oauthrelay:transient-record");
+    // A random S256 challenge: 43 base64url characters, different for every write.
+    let challenge = object["code_challenge"].as_str().unwrap();
+    assert_eq!(object["code_challenge_method"], "S256");
+    assert_eq!(challenge.len(), 43);
+    assert!(challenge
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
+    let another = RecordMapping::DexAuthCode
+        .encode(
+            NAMESPACE,
+            &NewRecord {
+                name: "n",
+                key: "replay:code:abc",
+                value: b"x",
+                expires_at_ms: START,
+            },
+        )
+        .unwrap();
+    assert_ne!(another.data["code_challenge"], object["code_challenge"]);
+}
+
+#[test]
+fn dex_connector_data_is_padded_standard_base64_for_every_length() {
+    // Go's encoding/json decodes []byte only from padded standard base64; anything else makes
+    // Dex fail to list its authcodes.
+    for length in 0..=7 {
+        let value = vec![0xfb_u8; length];
+        let object = RecordMapping::DexAuthCode
+            .encode(
+                NAMESPACE,
+                &NewRecord {
+                    name: "n",
+                    key: "k",
+                    value: &value,
+                    expires_at_ms: START,
+                },
+            )
+            .unwrap();
+        let encoded = object.data["connectorData"].as_str().unwrap();
+        assert_eq!(encoded.len() % 4, 0, "{length}");
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')),
+            "{encoded}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dex_objects_work_end_to_end_like_the_default_mapping() {
+    let api = dex_api();
+    let (client, store) = kube_store_for(&api, RecordMapping::DexAuthCode);
+    let store = Arc::new(store);
+    // A lost response on create and on replace.
+    api.state.lock().unwrap().lose_next_write_response = true;
+    assert!(store.put_if_absent("refresh:a", b"one", TTL).await.unwrap());
+    api.state.lock().unwrap().lose_next_write_response = true;
+    assert!(store
+        .compare_and_swap("refresh:a", b"one", b"two", TTL)
+        .await
+        .unwrap());
+    assert_eq!(store.get("refresh:a").await.unwrap().unwrap().value, b"two");
+    assert!(!store
+        .put_if_absent("refresh:a", b"other", TTL)
+        .await
+        .unwrap());
+
+    // Concurrency.
+    let mut tasks = Vec::new();
+    for index in 0..20 {
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move {
+            store
+                .put_if_absent("replay:a", format!("writer-{index}").as_bytes(), TTL)
+                .await
+                .unwrap()
+        }));
+    }
+    let mut winners = 0;
+    for task in tasks {
+        winners += usize::from(task.await.unwrap());
+    }
+    assert_eq!(winners, 1);
+
+    // Expired records are taken over, and swept with a version precondition, but a code that
+    // Dex itself wrote (no managed-by label) is never listed or touched.
+    api.state.lock().unwrap().objects.insert(
+        "dex-own-code".into(),
+        json!({"apiVersion":"dex.coreos.com/v1","kind":"AuthCode",
+            "metadata":{"name":"dex-own-code","resourceVersion":"900"},
+            "clientID":"app","connectorData":"c2VjcmV0","expiry":"2001-01-01T00:00:00Z"}),
+    );
+    let later = KubernetesStore::with_clock(client.clone(), Arc::new(|| START + 10 * 60_000));
+    api.requests();
+    assert_eq!(
+        later.sweep().await.unwrap(),
+        SweepReport {
+            listed: 2,
+            deleted: 2,
+            skipped: 0
+        }
+    );
+    assert!(api.object("dex-own-code").is_some());
+    let requests = api.requests();
+    let list = requests
+        .iter()
+        .find(|(method, ..)| method == "GET")
+        .unwrap();
+    assert!(list
+        .1
+        .contains("labelSelector=app.kubernetes.io%2Fmanaged-by%3Doauthrelay"));
+    assert!(requests
+        .iter()
+        .filter(|(method, ..)| method == "DELETE")
+        .all(|(.., body)| !body["preconditions"]["resourceVersion"].is_null()));
+}
+
+#[test]
+fn dex_decoding_rejects_malformed_codes() {
+    let decode = |data: Value| {
+        let object: DynamicObject = serde_json::from_value(json!({
+            "metadata": {"name": "n", "resourceVersion": "1"},
+            "connectorData": data["connectorData"], "expiry": data["expiry"],
+        }))
+        .unwrap();
+        RecordMapping::DexAuthCode.decode(&object)
+    };
+    let stored =
+        decode(json!({"connectorData":"AAEC/w==","expiry":"2027-01-15T08:00:01.234Z"})).unwrap();
+    assert_eq!(stored.value, [0, 1, 2, 255]);
+    assert_eq!(stored.expires_at_ms, START + 1234);
+    assert!(decode(json!({"connectorData":"!!","expiry":"2027-01-15T08:00:00Z"})).is_err());
+    assert!(decode(json!({"connectorData":"AA==","expiry":"soon"})).is_err());
+    assert!(decode(json!({"expiry":"2027-01-15T08:00:00Z"})).is_err());
+    assert!(decode(json!({"connectorData":"AA=="})).is_err());
+}
+
+#[test]
+fn resource_names_select_the_mapping() {
+    for mapping in [RecordMapping::TransientRecord, RecordMapping::DexAuthCode] {
+        assert_eq!(
+            RecordMapping::from_resource_name(mapping.resource_name()),
+            Some(mapping)
+        );
+        let resource = mapping.api_resource();
+        assert_eq!(
+            mapping.resource_name(),
+            format!("{}.{}", resource.plural, resource.group)
+        );
+    }
+    let dex = RecordMapping::DexAuthCode.api_resource();
+    assert_eq!(
+        (
+            dex.group.as_str(),
+            dex.version.as_str(),
+            dex.kind.as_str(),
+            dex.plural.as_str()
+        ),
+        ("dex.coreos.com", "v1", "AuthCode", "authcodes")
+    );
+    assert_eq!(dex.api_version, "dex.coreos.com/v1");
 }

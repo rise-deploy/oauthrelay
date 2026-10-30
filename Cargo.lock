@@ -2705,6 +2705,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "oauthrelay-core",
+ "rand 0.9.5",
  "schemars",
  "serde",
  "serde-saphyr",

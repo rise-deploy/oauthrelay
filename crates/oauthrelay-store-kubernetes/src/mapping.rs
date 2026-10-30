@@ -5,10 +5,14 @@ use crate::{
     NewRecord, Stored,
 };
 use anyhow::{anyhow, Context};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use k8s_openapi::jiff::Timestamp;
 use kube::{
     api::{ApiResource, DynamicObject},
+    core::GroupVersionKind,
     CustomResourceExt,
 };
 use sha2::{Digest, Sha256};
@@ -104,18 +108,30 @@ pub(crate) fn max_expiry_millis() -> u64 {
 pub enum RecordMapping {
     /// oauthrelay's own `transientrecords.oauthrelay.dev`.
     TransientRecord,
+    /// Dex's `authcodes.dex.coreos.com`. A record is an `AuthCode` that Dex can never exchange:
+    /// its `clientID` is not a registered client and its PKCE challenge is random. Dex creates
+    /// the CRD itself and its garbage collector also removes expired codes.
+    DexAuthCode,
 }
+
+/// The `clientID` of every `AuthCode` the store writes. Dex rejects a code whose `clientID` is
+/// not the authenticating client's, and no Dex client has this ID.
+const DEX_CLIENT_ID: &str = "oauthrelay:transient-record";
+const DEX_REDIRECT_URI: &str = "urn:oauthrelay:transient-record";
+/// The `connectorID` of every `AuthCode` the store writes, for whoever reads the namespace.
+const DEX_CONNECTOR_ID: &str = "oauthrelay";
 
 impl RecordMapping {
     pub fn resource_name(self) -> &'static str {
         match self {
             Self::TransientRecord => "transientrecords.oauthrelay.dev",
+            Self::DexAuthCode => "authcodes.dex.coreos.com",
         }
     }
 
     /// The mapping for a `plural.group` resource name, if the store supports it.
     pub fn from_resource_name(name: &str) -> Option<Self> {
-        [Self::TransientRecord]
+        [Self::TransientRecord, Self::DexAuthCode]
             .into_iter()
             .find(|mapping| mapping.resource_name() == name)
     }
@@ -123,6 +139,10 @@ impl RecordMapping {
     pub fn api_resource(self) -> ApiResource {
         match self {
             Self::TransientRecord => TransientRecord::api_resource(),
+            Self::DexAuthCode => ApiResource::from_gvk_with_plural(
+                &GroupVersionKind::gvk("dex.coreos.com", "v1", "AuthCode"),
+                "authcodes",
+            ),
         }
     }
 
@@ -138,6 +158,20 @@ impl RecordMapping {
                     value: STANDARD.encode(record.value),
                     expires_at,
                 }
+            }),
+            // Go decodes `connectorData` ([]byte) from padded standard base64 and `expiry`
+            // (time.Time) from RFC 3339; a malformed field would make Dex's garbage collector
+            // fail to list every AuthCode, so both use exactly those encodings. The unused
+            // fields are omitted and decode as their zero values.
+            Self::DexAuthCode => serde_json::json!({
+                "clientID": DEX_CLIENT_ID,
+                "redirectURI": DEX_REDIRECT_URI,
+                "connectorID": DEX_CONNECTOR_ID,
+                "connectorData": STANDARD.encode(record.value),
+                "expiry": expires_at,
+                // A random S256 challenge: no code verifier can match it.
+                "code_challenge": URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+                "code_challenge_method": "S256",
             }),
         };
         Ok(object)
@@ -168,6 +202,21 @@ impl RecordMapping {
                     .with_context(|| format!("object {name:?} has an invalid value"))?;
                 let expires_at_ms = parse_time(&spec.expires_at)
                     .with_context(|| format!("object {name:?} has an invalid expiresAt"))?;
+                (value, expires_at_ms)
+            }
+            Self::DexAuthCode => {
+                let field = |field: &str| {
+                    object
+                        .data
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| anyhow!("object {name:?} has no {field}"))
+                };
+                let value = STANDARD
+                    .decode(field("connectorData")?)
+                    .with_context(|| format!("object {name:?} has an invalid connectorData"))?;
+                let expires_at_ms = parse_time(field("expiry")?)
+                    .with_context(|| format!("object {name:?} has an invalid expiry"))?;
                 (value, expires_at_ms)
             }
         };

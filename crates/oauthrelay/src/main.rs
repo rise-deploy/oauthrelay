@@ -225,12 +225,14 @@ enum StoreConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KubernetesResource {
     TransientRecord,
+    DexAuthCode,
 }
 
 impl KubernetesResource {
     fn parse(name: &str) -> Option<Self> {
         match name {
             "transientrecords.oauthrelay.dev" => Some(Self::TransientRecord),
+            "authcodes.dex.coreos.com" => Some(Self::DexAuthCode),
             _ => None,
         }
     }
@@ -298,7 +300,7 @@ fn parse_store_config(env: StoreEnv<'_>) -> anyhow::Result<StoreConfig> {
                 None => KubernetesResource::TransientRecord,
                 Some(name) => KubernetesResource::parse(name).ok_or_else(|| {
                     anyhow!(
-                        "OAUTHRELAY_STORE_KUBERNETES_RESOURCE must be transientrecords.oauthrelay.dev, got {name:?}"
+                        "OAUTHRELAY_STORE_KUBERNETES_RESOURCE must be transientrecords.oauthrelay.dev or authcodes.dex.coreos.com, got {name:?}"
                     )
                 })?,
             };
@@ -379,6 +381,7 @@ async fn configured_store() -> anyhow::Result<Arc<dyn TransientStore>> {
             )?;
             let mapping = match resource {
                 KubernetesResource::TransientRecord => RecordMapping::TransientRecord,
+                KubernetesResource::DexAuthCode => RecordMapping::DexAuthCode,
             };
             let client =
                 KubeClient::new(kube::Client::try_from(config)?, namespace.clone(), mapping);
@@ -942,7 +945,27 @@ mod tests {
                 "{sweep:?}"
             );
         }
-        for resource in ["", "relays.oauthrelay.dev", "transientrecords"] {
+        assert_eq!(
+            parse_store_config(StoreEnv {
+                kubernetes_resource: Some("authcodes.dex.coreos.com"),
+                kubernetes_namespace: Some("dex"),
+                ..store_env(Some("kubernetes"))
+            })
+            .unwrap(),
+            StoreConfig::Kubernetes {
+                resource: KubernetesResource::DexAuthCode,
+                namespace: Some("dex".into()),
+                sweep: Some(Duration::from_secs(60)),
+            }
+        );
+        for resource in [
+            "",
+            "relays.oauthrelay.dev",
+            "transientrecords",
+            "authcodes",
+            "refreshtokens.dex.coreos.com",
+            "AuthCodes.dex.coreos.com",
+        ] {
             assert!(
                 parse_store_config(StoreEnv {
                     kubernetes_resource: Some(resource),

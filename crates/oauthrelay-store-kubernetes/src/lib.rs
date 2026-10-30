@@ -11,6 +11,9 @@
 //! | `spec.value` | The opaque value, base64. |
 //! | `spec.expiresAt` | Expiry as RFC 3339 with millisecond precision. |
 //!
+//! The same records can live in Dex's `AuthCode` resource (`authcodes.dex.coreos.com`) instead; see
+//! [`RecordMapping::DexAuthCode`]. Everything below the field layout is identical.
+//!
 //! The runtime role needs `get`, `list`, `create`, `update` and `delete` on the resource in one
 //! namespace.
 //!

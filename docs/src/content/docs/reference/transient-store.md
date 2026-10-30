@@ -19,7 +19,7 @@ Select a backend with `OAUTHRELAY_STORE`:
 | --- | --- | --- |
 | `OAUTHRELAY_STORE` | `memory` | `memory`, `dynamodb`, or `kubernetes`. |
 | `OAUTHRELAY_STORE_DYNAMODB_TABLE` | — | DynamoDB table name. Required with `dynamodb`, rejected otherwise. |
-| `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | `transientrecords.oauthrelay.dev` | Resource that holds the records. Only valid with `kubernetes`. |
+| `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | `transientrecords.oauthrelay.dev` | Resource that holds the records: oauthrelay's own, or `authcodes.dex.coreos.com` (see [Using Dex's AuthCode resource](#using-dexs-authcode-resource)). Only valid with `kubernetes`. |
 | `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` | see [Kubernetes](#kubernetes) | Namespace that holds the records. Only valid with `kubernetes`. |
 | `OAUTHRELAY_STORE_KUBERNETES_SWEEP` | `60s` | How often expired records are deleted, or `off`. Only valid with `kubernetes`. |
 
@@ -250,6 +250,65 @@ another job cleans up). A sweep lists the records oauthrelay wrote (label select
 `resourceVersion` precondition, so a record that another replica renewed between the list and the
 delete is kept. Replicas sweeping at once is harmless: deletes are idempotent. The sweeper does
 not run on Lambda, which freezes the process between invocations.
+
+### Using Dex's AuthCode resource
+
+`OAUTHRELAY_STORE_KUBERNETES_RESOURCE=authcodes.dex.coreos.com` keeps the same records as Dex
+`AuthCode` objects instead, for a deployment that runs Dex with its Kubernetes storage and does
+not want another CRD. It is opt-in, and `TransientRecord` stays the recommended mapping:
+
+```console
+export OAUTHRELAY_STORE=kubernetes
+export OAUTHRELAY_STORE_KUBERNETES_RESOURCE=authcodes.dex.coreos.com
+export OAUTHRELAY_STORE_KUBERNETES_NAMESPACE=dex   # Dex's namespace
+```
+
+Dex installs `authcodes.dex.coreos.com` when it starts, so there is no CRD to apply; start
+oauthrelay after Dex (the startup check fails, and the pod restarts, until the resource exists).
+Everything except the object layout is identical to the default mapping: naming, expiry, the
+`resourceVersion` compare-and-swap, and the sweeper.
+
+| `AuthCode` field | Value |
+| --- | --- |
+| `metadata.name`, `metadata.labels` | As for `TransientRecord`. Dex names its own codes in lowercase base32 without hyphens, so the names never collide. |
+| `connectorData` | The value, base64 (Dex's `[]byte` encoding). |
+| `expiry` | Expiry, RFC 3339 with millisecond precision. |
+| `connectorID` | `oauthrelay`. The store key is not stored: `AuthCode` has no field for it. |
+| `clientID`, `redirectURI` | `oauthrelay:transient-record` and `urn:oauthrelay:transient-record`. |
+| `code_challenge`, `code_challenge_method` | 43 random base64url characters and `S256`. |
+| `claims`, `scopes` | Absent. |
+
+**Trust.** The service account needs `get`, `list`, `create`, `update`, and `delete` on `authcodes`
+in Dex's namespace, and Kubernetes RBAC cannot narrow that to the objects oauthrelay wrote. The
+same grant lets oauthrelay read Dex's own live authorization codes, which carry the user's claims
+and `connectorData` (for some connectors, upstream tokens), and delete or forge them. Oauthrelay
+itself only lists objects labelled `app.kubernetes.io/managed-by=oauthrelay`, but the permission
+is wider than the code. Use this mapping only when Dex and oauthrelay run as one trust domain;
+otherwise use `TransientRecord`, whose Role is confined to oauthrelay's own records. The Role in
+the [deployment example](https://github.com/rise-deploy/oauthrelay/blob/develop/deploy/kubernetes.yaml)
+carries the rule commented out, and it belongs in Dex's namespace:
+
+```yaml
+rules:
+  - apiGroups: [dex.coreos.com]
+    resources: [authcodes]
+    verbs: [get, list, create, update, delete]
+```
+
+**Why Dex cannot be tricked into using these objects.** Dex's token endpoint rejects an
+authorization code whose `clientID` is not the authenticating client's, and `oauthrelay:transient-record`
+is never a registered client. An object whose name was learned would also fail the PKCE check,
+because its `code_challenge` is random and no code verifier hashes to it, and it has no claims to
+issue tokens for. This is the reason the mapping is safe to use at all; it relies on no Dex client
+being configured with that ID.
+
+**Dex's garbage collector is not a TTL.** Dex deletes expired `AuthCode` objects every five
+minutes by default, at most 500 objects per run, shared with its own codes. A relay with rotating
+refresh tokens leaves one small object per refresh until its family ends, so at volume Dex's
+collector falls behind and etcd fills. That is why the oauthrelay sweeper is on by default for
+this mapping too, and why the savings of this mapping are limited to the CRD install and the extra
+API group in RBAC. Dex's collector and oauthrelay's sweeper may delete the same object; either
+way an expired record is already absent to oauthrelay.
 
 ### Rotating refresh tokens and sizing
 
