@@ -1,7 +1,7 @@
 use crate::{
     model::valid_scope_token,
     refresh_handle::{has_handle_prefix, open_handle, seal_token_response, SubstitutionError},
-    rotation::{RefreshOutcome, Rotator, UpstreamFailure, UpstreamRefresher},
+    rotation::{IssueError, RefreshOutcome, Rotator, UpstreamFailure, UpstreamRefresher},
     ClientAuth, ClientJwks, RefreshTokenMode, Relay, ResourceKey, ResourceResolver, Sealer,
     TransientStore, Upstream,
 };
@@ -857,7 +857,10 @@ async fn exchange_sealed_code(
             match rotator.issue_in_response(&stored).await {
                 Ok(Some(body)) => stored.body = body,
                 Ok(None) => {}
-                Err(()) => return refresh_state_unavailable(),
+                Err(IssueError::Store) => return refresh_state_unavailable(),
+                Err(IssueError::UnrecognizedBody) => {
+                    return substitution_failed(relay, SubstitutionError::UnrecognizedBody)
+                }
             }
         }
     }

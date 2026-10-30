@@ -169,9 +169,23 @@ unvalidated redirect URI is never reflected into a response.
   - *Abandoned claims.* A claim older than 60 seconds is presumed abandoned (its process was
     killed or suspended) and can be claimed again, so a crash cannot strand a handle. The
     upstream call itself is abandoned after 30 seconds and its claim released.
+  - *Revocation.* Revoking a family (reuse, or an upstream `invalid_grant`) writes the marker
+    and then deletes the record that holds the family's upstream token, found through the head
+    pointer or by following the rotated records from the presented handle; superseded records
+    are already token-free tombstones. A refresh that is in flight when the family is revoked
+    answers `invalid_grant` and removes the successor it created; it never returns tokens. The
+    upstream is asked only for the tokens of a family that is not revoked.
+  - *Content.* Like `sealed`, a 2xx body is read as a JSON object whatever its content type, a
+    form-encoded or other non-object 2xx body that names a `refresh_token` is refused with 502
+    `server_error` (code grant and refresh grant alike), only an upstream 4xx with JSON
+    `error: "invalid_grant"` revokes the family, and any other upstream error is passed through
+    with the claim released.
   - *Migration.* A `rrt1.` handle presented to a `rotating` relay is opened, refreshed, and
     replaced by an `rrt2.` successor in a new family, so switching `sealed` to `rotating` does
-    not sign users out. Raw upstream tokens are `invalid_grant`.
+    not sign users out. A sealed handle is stateless, so it cannot be spent: presenting the same
+    one again starts another family, until the provider stops honouring its token (known and
+    accepted). A sealed handle whose issued-at time plus `maxLifetimeSeconds` has passed is
+    `invalid_grant` instead of starting a family. Raw upstream tokens are `invalid_grant`.
   - *Storage.* Keys carry only a SHA-256 over the relay key and the handle (or family id). Record
     values are XChaCha20-Poly1305 envelopes whose associated data names the relay, the purpose,
     and the store key, so the store never holds a plaintext token and values cannot be moved
@@ -215,12 +229,13 @@ Replay protection uses `put_if_absent` on `replay:code:{envelope id}` for author
 makes the token endpoint return HTTP 503 `server_error` without consuming the code, and fails
 client-assertion authentication.
 
-Rotation uses three keys under `refresh:`: `refresh:handle:{hash}` holds a handle's record
+Rotation uses four keys under `refresh:`: `refresh:handle:{hash}` holds a handle's record
 (`Active`, `Claimed`, or a token-free `Rotated` tombstone) until its family expires;
 `refresh:grace:{hash}` holds the response of one rotation for the grace period plus ten seconds;
-`refresh:revoked:{hash}` marks a revoked family until it expires. A rotation costs about two
-strongly consistent reads and four writes, and leaves a tombstone of a few hundred bytes that
-lives until the family ends.
+`refresh:revoked:{hash}` marks a revoked family until it expires; `refresh:head:{hash}` names the
+family's newest handle record so that a revocation can delete the one record that still holds an
+upstream token. A rotation costs about two strongly consistent reads and five writes, and leaves a
+tombstone of about 0.3 KB that lives until the family ends.
 
 The standalone binary selects the backend with `OAUTHRELAY_STORE`. `memory` (default) is
 process-local and protects one process or one Lambda execution environment. `dynamodb`

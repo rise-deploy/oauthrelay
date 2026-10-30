@@ -102,7 +102,10 @@ even when the provider returned none; present that one next.
 | Provider answers `invalid_grant` | The provider's error, and the family is revoked. |
 | Provider answers success without a JSON object body | 502 `server_error`; the handle stays usable. |
 | Transient store unreachable | 503 `server_error`. |
-| `rrt1.` handle from this relay when it was `sealed` | Accepted once; the response carries an `rrt2.` handle in a new family. |
+| `rrt1.` handle from this relay when it was `sealed`, younger than `maxLifetimeSeconds` | Accepted (and accepted again if presented again: sealed handles are stateless); the response carries an `rrt2.` handle in a new family. |
+| `rrt1.` handle older than `maxLifetimeSeconds` | 400 `invalid_grant`. |
+| Provider answers a 2xx body that is not a JSON object but contains `refresh_token` (code or refresh grant) | 502 `server_error`; the token is never returned. |
+| The family is revoked while the request is in flight | 400 `invalid_grant`; no tokens are returned. |
 
 A relay in this mode with no transient store configured returns 500 `server_error` from the
 authorize endpoint and both grants and logs the cause.

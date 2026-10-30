@@ -3341,7 +3341,7 @@ async fn rotating_mode_migrates_sealed_handles_and_rejects_raw_tokens() {
         fixture.sealer.as_ref(),
         &ResourceKey::new("google").unwrap(),
         "rotating",
-        1,
+        unix_now(),
     )
     .unwrap();
     let (status, body) = fixture.refresh(&sealed).await;
@@ -3351,6 +3351,19 @@ async fn rotating_mode_migrates_sealed_handles_and_rejects_raw_tokens() {
     let (status, _) = fixture.refresh(handle).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(fixture.upstream_refreshes(), ["rotating", "rotated"]);
+
+    // A sealed handle older than the family lifetime is not migrated.
+    let expired = seal_handle(
+        fixture.sealer.as_ref(),
+        &ResourceKey::new("google").unwrap(),
+        "rotating",
+        unix_now() - DEFAULT_MAX_LIFETIME_SECONDS,
+    )
+    .unwrap();
+    let (status, body) = fixture.refresh(&expired).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_grant");
+    assert_eq!(fixture.upstream_refreshes().len(), 2);
 
     for presented in ["rotating", "", "rrt2.", "rrt2.unknown"] {
         let (status, body) = fixture.refresh(presented).await;
@@ -3437,4 +3450,69 @@ async fn rotating_relay_without_a_store_fails_with_a_server_error() {
         let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
         assert_eq!(body["error"], "server_error");
     }
+}
+
+#[tokio::test]
+async fn rotating_mode_fails_closed_on_a_form_encoded_success_body() {
+    let fixture = RotatingFixture::new(ROTATING_GRACE_SECONDS).await;
+    let handle = fixture.handle_for("form-encoded").await;
+    for _ in 0..2 {
+        let response = post_token(&fixture.app, "google", &refresh_form(&handle)).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = String::from_utf8(response_body(response).await).unwrap();
+        assert!(!body.contains("raw-secret"), "{body}");
+        assert!(body.contains("server_error"));
+    }
+    assert_eq!(
+        fixture.upstream_refreshes().len(),
+        2,
+        "the claim is released after an unusable response"
+    );
+
+    let code = authorization_code_with(
+        &fixture.app,
+        "google",
+        Some(&pkce_challenge(SEALED_VERIFIER)),
+        "&login_hint=form-body",
+    )
+    .await;
+    let response = post_token(
+        &fixture.app,
+        "google",
+        &code_grant_form(&code, SEALED_VERIFIER),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = String::from_utf8(response_body(response).await).unwrap();
+    assert!(!body.contains("raw-secret"), "{body}");
+    fixture.task.abort();
+}
+
+#[tokio::test]
+async fn rotating_mode_treats_json_as_json_whatever_the_content_type() {
+    let fixture = RotatingFixture::new(ROTATING_GRACE_SECONDS).await;
+    let handle = fixture.handle_for("plain-json").await;
+    let response = post_token(&fixture.app, "google", &refresh_form(&handle)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+    let body = String::from_utf8(response_body(response).await).unwrap();
+    assert!(!body.contains("plain-rotated"), "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert!(value["refresh_token"]
+        .as_str()
+        .unwrap()
+        .starts_with("rrt2."));
+    fixture.task.abort();
+}
+
+#[tokio::test]
+async fn rotating_mode_never_forwards_handle_prefixed_tokens_unopened() {
+    let fixture = RotatingFixture::new(ROTATING_GRACE_SECONDS).await;
+    for presented in ["rrt1.anything", "rrt2.anything", "rrt9.anything"] {
+        let (status, body) = fixture.refresh(presented).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{presented}");
+        assert_eq!(body["error"], "invalid_grant", "{presented}");
+    }
+    assert!(fixture.upstream_refreshes().is_empty());
+    fixture.task.abort();
 }

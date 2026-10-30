@@ -322,12 +322,24 @@ refresh token and the client must always store the latest one.
   same token. The relay revokes the whole family, including the newest handle, and answers
   `invalid_grant`; the user signs in again. The relay logs a `refresh_token_reuse` security event
   (target `oauthrelay::security`) with the relay name and a hash of the family, never a token.
+- **Revocation erases the token.** Revoking a family deletes the stored upstream token as well as
+  blocking the handles, and a refresh that was in flight when the revocation happened answers
+  `invalid_grant` instead of returning tokens.
+- **Provider responses.** As in `sealed` mode, any successful body is read as JSON whatever its
+  content type, a successful body that is not JSON but contains a `refresh_token` (such as a
+  form-encoded one) is answered with HTTP 502 `server_error` and never returned, and the claim is
+  released. Only a provider 4xx with the JSON error `invalid_grant` revokes the family; every other
+  provider error is passed through and leaves the handle usable. Handles (`rrt<N>.`) are never
+  forwarded to the provider.
 - **Maximum lifetime.** A family ends `maxLifetimeSeconds` after the sign-in that created it,
   however actively it is used. After that a refresh fails with `invalid_grant`.
 - **Upstream errors.** A network error or provider error response is returned to the client and
   leaves the handle usable for a retry. A provider `invalid_grant` revokes the family.
 - **Switching modes.** A relay changed from `sealed` to `rotating` accepts the `rrt1.` handles it
-  issued earlier once and replaces them with `rrt2.` handles, so users stay signed in. Changed from
+  issued earlier and replaces them with `rrt2.` handles in a new family, so users stay signed in.
+  A sealed handle is stateless and cannot be spent: presenting the same `rrt1.` handle again starts
+  another family, until the provider stops honouring its upstream token (a known limitation). A
+  sealed handle older than `maxLifetimeSeconds` is rejected with `invalid_grant`. Changed from
   `rotating` back to `sealed`, or to `passthrough`, every `rrt2.` handle is rejected with
   `invalid_grant` and users sign in again. Raw upstream tokens are rejected in both modes.
 - **A store is required.** A `rotating` relay needs a transient store shared by every serving

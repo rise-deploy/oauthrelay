@@ -36,6 +36,7 @@ prefix.
 | `refresh:handle:{hash}` | `rotating` relays | The handle's record, sealed: `Active`, `Claimed`, or a `Rotated` tombstone | until the family's maximum lifetime |
 | `refresh:grace:{hash}` | `rotating` relays | The response of one rotation, sealed | grace period plus ten seconds |
 | `refresh:revoked:{hash}` | `rotating` relays | `1`, present when the family is revoked | until the family's maximum lifetime |
+| `refresh:head:{hash}` | `rotating` relays | The store key of the family's newest handle record (a hash, not secret) | until the family's maximum lifetime |
 
 The `{hash}` in `refresh:` keys is a SHA-256 over the relay name and the handle or family ID, so the
 store cannot be used to recover a handle. Values are sealed with `OAUTHRELAY_SEAL_KEY` and bound
@@ -103,19 +104,19 @@ refresh tokens cost more, because each refresh is a small transaction in the sto
 
 | Per refresh grant | Operations |
 | --- | --- |
-| Rotation | 2 strongly consistent reads (handle, revoked marker) and 4 writes: claim, response, successor, and the final tombstone swap |
+| Rotation | 2 strongly consistent reads (handle, revoked marker) and 5 writes: claim, response, successor, the final tombstone swap, and the head pointer |
 | Duplicate within the grace period | 3 reads, no writes |
 
 Write capacity depends on item size, charged in 1 KB units. Plan on 1 to 3 units for the record
-writes (an upstream refresh token sealed is roughly 0.2 to 2 KB; the tombstone is about 0.2 KB) and
+writes (an upstream refresh token sealed is roughly 0.2 to 2 KB; the tombstone is about 0.3 KB) and
 1 to 7 for the response write, whose size is that of your provider's token response, base64-encoded
-(a response with an ID token is typically 1 to 4 KB). A typical refresh therefore costs about 5 to
-12 write units and 2 read units. Active sessions refresh about once per access-token lifetime, so
+(a response with an ID token is typically 1 to 4 KB). A typical refresh therefore costs about 6 to
+13 write units and 2 read units. Active sessions refresh about once per access-token lifetime, so
 multiply by sessions and by one refresh per hour for a provider with one-hour access tokens.
 
-Storage is dominated by tombstones. Each rotation leaves one, about 0.2 KB, which has to stay until
+Storage is dominated by tombstones. Each rotation leaves one, about 0.3 KB, which has to stay until
 the family ends so a replay can be recognised. A session that refreshes hourly leaves roughly 720
-of them over the default 30-day family (about 150 KB). Shorten `maxLifetimeSeconds` to bound this,
+of them over the default 30-day family (about 220 KB). Shorten `maxLifetimeSeconds` to bound this,
 and keep Time to Live enabled so expired items are eventually reclaimed. Response records last only
 seconds and add no lasting storage.
 

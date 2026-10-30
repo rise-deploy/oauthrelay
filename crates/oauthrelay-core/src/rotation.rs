@@ -14,6 +14,11 @@
 //! | `refresh:handle:{hash(handle)}` | the handle's [`Record`] | until the family expires |
 //! | `refresh:grace:{hash(handle, claim id)}` | the token response returned for that rotation | grace period plus a margin |
 //! | `refresh:revoked:{hash(family id)}` | `1`, present when the family is revoked | until the family expires |
+//! | `refresh:head:{hash(family id)}` | the store key of the family's newest handle record (not secret) | until the family expires |
+//!
+//! The head pointer lets a revocation find and delete the one record that still holds an upstream
+//! token without walking the family's history; each `Rotated` tombstone also names its
+//! successor, so a stale pointer is repaired by following the chain.
 //!
 //! Record and response values are sealed with the relay's [`Sealer`]. The associated data binds
 //! the relay key, the purpose, and the store key, so the store never holds a plaintext token and a
@@ -30,7 +35,9 @@
 //! written by someone else.
 
 use crate::{
-    refresh_handle::{open_handle, upstream_refresh_token, with_refresh_token, HANDLE_PREFIX},
+    refresh_handle::{
+        names_refresh_token, open_handle, upstream_refresh_token, with_refresh_token, HANDLE_PREFIX,
+    },
     router::StoredResponse,
     RefreshTokens, ResourceKey, Sealer, StoreError, TransientStore,
 };
@@ -47,6 +54,10 @@ const HANDLE_BYTES: usize = 32;
 const HANDLE_KEY_PREFIX: &str = "refresh:handle:";
 const GRACE_KEY_PREFIX: &str = "refresh:grace:";
 const REVOKED_KEY_PREFIX: &str = "refresh:revoked:";
+const HEAD_KEY_PREFIX: &str = "refresh:head:";
+/// Longest chain of rotated records followed when erasing a revoked family. The head pointer
+/// makes the walk one or two hops; the bound only limits the damage of a stale pointer.
+const MAX_ERASE_HOPS: usize = 1_000;
 const RECORD_PURPOSE: &str = "refresh-record";
 const GRACE_PURPOSE: &str = "refresh-grace";
 /// How long a recorded response outlives the grace period, so a request that arrives right at
@@ -105,6 +116,15 @@ pub(crate) trait UpstreamRefresher: Send + Sync {
     async fn refresh(&self, upstream_token: &str) -> Result<StoredResponse, UpstreamFailure>;
 }
 
+/// Why a code-grant response could not be given a handle. Neither case returns the response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IssueError {
+    /// The store failed.
+    Store,
+    /// A 2xx body that is not a JSON object yet carries a refresh token.
+    UnrecognizedBody,
+}
+
 /// What the router should answer.
 #[derive(Debug)]
 pub(crate) enum RefreshOutcome {
@@ -159,6 +179,8 @@ enum State {
     Rotated {
         rotated_ms: u64,
         claim_id: [u8; 16],
+        /// Store key of the successor's record.
+        successor_key: String,
     },
 }
 
@@ -229,19 +251,30 @@ impl Rotator {
     }
 
     /// Replaces the `refresh_token` of a successful code-grant response with a new family's first
-    /// handle. `Ok(None)` means the response has no refresh token and passes unchanged.
+    /// handle. `Ok(None)` means the response has no refresh token and passes unchanged. Like the
+    /// `sealed` mode, a 2xx body that is not a JSON object but names a `refresh_token` is refused
+    /// rather than returned.
     pub(crate) async fn issue_in_response(
         &self,
         response: &StoredResponse,
-    ) -> Result<Option<Vec<u8>>, ()> {
+    ) -> Result<Option<Vec<u8>>, IssueError> {
         let Some(token) = upstream_refresh_token(response.status, &response.body) else {
-            return Ok(None);
+            return if is_success(response)
+                && serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+                    &response.body,
+                )
+                .is_err()
+                && names_refresh_token(&response.body)
+            {
+                Err(IssueError::UnrecognizedBody)
+            } else {
+                Ok(None)
+            };
         };
-        let handle = self.issue(&token).await?;
-        match with_refresh_token(response.status, &response.body, &handle) {
-            Some(body) => Ok(Some(body)),
-            None => Err(()),
-        }
+        let handle = self.issue(&token).await.map_err(|()| IssueError::Store)?;
+        with_refresh_token(response.status, &response.body, &handle)
+            .map(Some)
+            .ok_or(IssueError::UnrecognizedBody)
     }
 
     /// Runs a refresh grant for `presented`.
@@ -278,6 +311,12 @@ impl Rotator {
         let Ok(opened) = open_handle(self.sealer.as_ref(), &self.relay, presented) else {
             return Ok(RefreshOutcome::InvalidGrant);
         };
+        // The sealed handle records when it was issued. Past the maximum lifetime it no longer
+        // earns a family: the user signs in again.
+        let issued_ms = opened.issued_at.saturating_mul(1000);
+        if (self.clock)() >= issued_ms.saturating_add(self.max_lifetime.as_millis() as u64) {
+            return Ok(RefreshOutcome::InvalidGrant);
+        }
         let response = match self.ask_upstream(upstream, &opened.upstream_token).await {
             Ok(response) => response,
             Err(failure) => return Ok(RefreshOutcome::UpstreamFailed(failure)),
@@ -354,11 +393,12 @@ impl Rotator {
                 State::Rotated {
                     rotated_ms,
                     claim_id,
+                    ..
                 } => {
                     let within_grace =
                         now.saturating_sub(*rotated_ms) <= self.grace.as_millis() as u64;
                     if !within_grace {
-                        return self.reuse_detected(&loaded.record).await;
+                        return self.reuse_detected(&handle_key, &loaded.record).await;
                     }
                     let grace_key = self.grace_key(&handle_key, claim_id);
                     if let Some(response) = self.load_grace_response(&grace_key).await? {
@@ -442,7 +482,7 @@ impl Rotator {
         };
         if is_invalid_grant(&response) {
             // The upstream no longer honours this family's token, so no member can succeed.
-            self.revoke(&claim.family_id, claim.family_expires_ms)
+            self.revoke(&claim.family_id, claim.family_expires_ms, handle_key)
                 .await?;
             tracing::warn!(
                 target: "oauthrelay::refresh",
@@ -492,6 +532,21 @@ impl Rotator {
             )
             .await
         {
+            Ok(Commit::Rotated) if self.is_revoked(&claim.family_id).await? => {
+                // The family was revoked while this refresh was in flight. The revocation could
+                // not see the successor yet, so remove what this refresh created.
+                let grace_key = self.grace_key(handle_key, &claim.claim_id);
+                self.discard(&[&grace_key, &self.handle_key(&successor_handle)])
+                    .await;
+                tracing::warn!(
+                    target: "oauthrelay::refresh",
+                    relay = %self.relay,
+                    %family,
+                    outcome = "revoked_in_flight",
+                    "family was revoked while a refresh was in flight; tokens withheld"
+                );
+                Ok(RefreshOutcome::InvalidGrant)
+            }
             Ok(Commit::Rotated) => {
                 tracing::info!(
                     target: "oauthrelay::refresh",
@@ -502,6 +557,10 @@ impl Rotator {
                     "refresh token rotated"
                 );
                 Ok(RefreshOutcome::Response(response))
+            }
+            Ok(Commit::Lost) if self.is_revoked(&claim.family_id).await? => {
+                // The revocation deleted the claimed record this refresh was about to rotate.
+                Ok(RefreshOutcome::InvalidGrant)
             }
             Ok(Commit::Lost) => {
                 tracing::warn!(
@@ -574,6 +633,7 @@ impl Rotator {
                     state: State::Rotated {
                         rotated_ms: now,
                         claim_id: claim.claim_id,
+                        successor_key: successor_key.clone(),
                     },
                 },
             )
@@ -592,6 +652,25 @@ impl Rotator {
             .compare_and_swap(handle_key, &claim.bytes, &rotated, family_ttl)
             .await?;
         if swapped {
+            // The head pointer is an accelerator: if this fails the next revocation follows the
+            // chain from the old head, so the rotation still stands.
+            let moved = self
+                .store
+                .compare_and_swap(
+                    &self.head_key(&claim.family_id),
+                    handle_key.as_bytes(),
+                    successor_key.as_bytes(),
+                    family_ttl,
+                )
+                .await;
+            if !matches!(moved, Ok(true)) {
+                tracing::warn!(
+                    target: "oauthrelay::refresh",
+                    relay = %self.relay,
+                    family = %self.family_label(&claim.family_id),
+                    "family head pointer was not advanced"
+                );
+            }
             Ok(Commit::Rotated)
         } else {
             self.discard(&[&grace_key, &successor_key]).await;
@@ -650,8 +729,8 @@ impl Rotator {
         }
     }
 
-    async fn reuse_detected(&self, record: &Record) -> Result<RefreshOutcome> {
-        self.revoke(&record.family_id, record.family_expires_ms)
+    async fn reuse_detected(&self, handle_key: &str, record: &Record) -> Result<RefreshOutcome> {
+        self.revoke(&record.family_id, record.family_expires_ms, handle_key)
             .await?;
         tracing::warn!(
             target: "oauthrelay::security",
@@ -684,22 +763,29 @@ impl Rotator {
         let family_expires_ms = now.saturating_add(self.max_lifetime.as_millis() as u64);
         let ttl = ttl_until(family_expires_ms, now).ok_or(Fault::Conflict)?;
         let key = self.handle_key(handle);
+        let family_id = random_array::<16>();
         let bytes = self.seal(
             RECORD_PURPOSE,
             &key,
             &Record {
-                family_id: random_array::<16>(),
+                family_id,
                 family_expires_ms,
                 state: State::Active {
                     upstream_token: upstream_token.to_owned(),
                 },
             },
         )?;
-        if self.store.put_if_absent(&key, &bytes, ttl).await? {
-            Ok(())
-        } else {
-            Err(Fault::Conflict)
+        if !self.store.put_if_absent(&key, &bytes, ttl).await? {
+            return Err(Fault::Conflict);
         }
+        if !self
+            .store
+            .put_if_absent(&self.head_key(&family_id), key.as_bytes(), ttl)
+            .await?
+        {
+            return Err(Fault::Conflict);
+        }
+        Ok(())
     }
 
     async fn load(&self, key: &str) -> Result<Option<Loaded>> {
@@ -724,14 +810,68 @@ impl Rotator {
         Ok(self.store.get(&self.family_key(family_id)).await?.is_some())
     }
 
-    async fn revoke(&self, family_id: &[u8; 16], family_expires_ms: u64) -> Result<()> {
+    /// Revokes the family and erases the upstream token it still stores.
+    ///
+    /// The marker is written first, so a refresh that is in flight sees the revocation when it
+    /// finishes. The erase then deletes the family's one token-bearing record, found through the
+    /// head pointer and through `known_key` (a record of the family the caller holds); records
+    /// that already hold no token stay as tombstones. The erase runs even when the marker already
+    /// exists, so a revocation that was interrupted is completed by the next one.
+    async fn revoke(
+        &self,
+        family_id: &[u8; 16],
+        family_expires_ms: u64,
+        known_key: &str,
+    ) -> Result<()> {
         let Some(ttl) = ttl_until(family_expires_ms, (self.clock)()) else {
             return Ok(());
         };
-        // An existing marker means the family is already revoked.
         self.store
             .put_if_absent(&self.family_key(family_id), b"1", ttl)
             .await?;
+        let head_key = self.head_key(family_id);
+        let head = self
+            .store
+            .get(&head_key)
+            .await?
+            .and_then(|entry| String::from_utf8(entry.value).ok());
+        if let Some(head) = head.as_deref() {
+            self.erase_tokens(head).await?;
+        }
+        if head.as_deref() != Some(known_key) {
+            self.erase_tokens(known_key).await?;
+        }
+        Ok(())
+    }
+
+    /// Follows the chain of rotated records from `start` and deletes the first record that holds
+    /// an upstream token.
+    async fn erase_tokens(&self, start: &str) -> Result<()> {
+        let mut key = start.to_owned();
+        for _ in 0..MAX_ERASE_HOPS {
+            let loaded = match self.load(&key).await {
+                Ok(Some(loaded)) => loaded,
+                Ok(None) => return Ok(()),
+                // A record this relay cannot open is not worth keeping around.
+                Err(Fault::Sealing) => {
+                    self.store.delete(&key).await?;
+                    return Ok(());
+                }
+                Err(fault) => return Err(fault),
+            };
+            match loaded.record.state {
+                State::Active { .. } | State::Claimed { .. } => {
+                    self.store.delete(&key).await?;
+                    return Ok(());
+                }
+                State::Rotated { successor_key, .. } => key = successor_key,
+            }
+        }
+        tracing::error!(
+            target: "oauthrelay::refresh",
+            relay = %self.relay,
+            "revoked family still has a token-bearing record beyond the erase hop limit"
+        );
         Ok(())
     }
 
@@ -743,6 +883,10 @@ impl Rotator {
     /// claim id keeps two claimants of the same handle from sharing a record.
     fn grace_key(&self, handle_key: &str, claim_id: &[u8; 16]) -> String {
         self.digest_key(GRACE_KEY_PREFIX, &[handle_key.as_bytes(), claim_id])
+    }
+
+    fn head_key(&self, family_id: &[u8; 16]) -> String {
+        self.digest_key(HEAD_KEY_PREFIX, &[family_id])
     }
 
     fn family_key(&self, family_id: &[u8; 16]) -> String {
@@ -1154,7 +1298,14 @@ mod tests {
         for (store_key, value) in writes.iter() {
             assert!(store_key.starts_with("refresh:"), "{store_key}");
             let value = String::from_utf8_lossy(value);
-            assert!(value.starts_with("v1."), "values are sealed envelopes");
+            if store_key.starts_with("refresh:head:") {
+                // The head pointer names another store key, which is a hash.
+                assert!(value.starts_with("refresh:handle:"));
+            } else if store_key.starts_with("refresh:revoked:") {
+                assert_eq!(value, "1");
+            } else {
+                assert!(value.starts_with("v1."), "values are sealed envelopes");
+            }
             for secret in ["up-secret-0", "up-1", "access-1", &first, &second] {
                 assert!(!store_key.contains(secret) && !value.contains(secret));
             }
@@ -1225,7 +1376,11 @@ mod tests {
         let family = harness.load(&first).await.unwrap();
         harness
             .rotator
-            .revoke(&family.record.family_id, family.record.family_expires_ms)
+            .revoke(
+                &family.record.family_id,
+                family.record.family_expires_ms,
+                &harness.rotator.handle_key(&first),
+            )
             .await
             .unwrap();
         assert_invalid_grant(harness.refresh(&first, &upstream).await);
@@ -1486,7 +1641,13 @@ mod tests {
     async fn sealed_handles_migrate_into_a_rotating_family() {
         let harness = Harness::new();
         let upstream = FakeUpstream::scripted(vec![no_rotation("a1")]);
-        let legacy = seal_handle(harness.sealer.as_ref(), &key("app"), "up-legacy", 1).unwrap();
+        let legacy = seal_handle(
+            harness.sealer.as_ref(),
+            &key("app"),
+            "up-legacy",
+            START_MS / 1000,
+        )
+        .unwrap();
         assert!(legacy.starts_with("rrt1."));
         let handle = successor(harness.refresh(&legacy, &upstream).await);
         assert!(handle.starts_with("rrt2."));
@@ -1500,7 +1661,13 @@ mod tests {
         assert_eq!(next.calls(), ["up-legacy"]);
 
         // Another relay's sealed handle, and a failed upstream, do not migrate.
-        let foreign = seal_handle(harness.sealer.as_ref(), &key("other"), "up-x", 1).unwrap();
+        let foreign = seal_handle(
+            harness.sealer.as_ref(),
+            &key("other"),
+            "up-x",
+            START_MS / 1000,
+        )
+        .unwrap();
         assert_invalid_grant(harness.refresh(&foreign, &upstream).await);
         let failing =
             FakeUpstream::scripted(vec![Ok(json_response(400, r#"{"error":"invalid_grant"}"#))]);
@@ -1591,6 +1758,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issuing_follows_the_same_content_and_fail_closed_rules_as_sealed_mode() {
+        let harness = Harness::new();
+        // JSON is recognised whatever the content type says.
+        let plain = StoredResponse {
+            status: 200,
+            content_type: Some("text/plain".into()),
+            body: br#"{"refresh_token":"up-0","a":1}"#.to_vec(),
+        };
+        let body = harness
+            .rotator
+            .issue_in_response(&plain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8(body).unwrap().contains("rrt2."));
+        // A body that is not a JSON object but carries a refresh token is never returned.
+        for body in [
+            "access_token=a&refresh_token=up-secret",
+            r#"[{"refresh_token":"up-secret"}]"#,
+        ] {
+            let response = StoredResponse {
+                status: 200,
+                content_type: Some("application/x-www-form-urlencoded".into()),
+                body: body.as_bytes().to_vec(),
+            };
+            assert_eq!(
+                harness
+                    .rotator
+                    .issue_in_response(&response)
+                    .await
+                    .unwrap_err(),
+                IssueError::UnrecognizedBody,
+                "{body}"
+            );
+        }
+        // Non-2xx and bodies without a refresh token pass through.
+        for response in [
+            json_response(400, "refresh_token=x"),
+            json_response(200, "access_token=a&token_type=Bearer"),
+        ] {
+            assert!(harness
+                .rotator
+                .issue_in_response(&response)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn only_an_invalid_grant_error_revokes_the_family() {
+        let harness = Harness::new();
+        let first = harness.issue("up-0").await;
+        let family = harness.load(&first).await.unwrap();
+        let upstream = FakeUpstream::scripted(vec![
+            Ok(json_response(401, r#"{"error":"invalid_client"}"#)),
+            Ok(json_response(400, r#"{"error":"invalid_request"}"#)),
+            Ok(json_response(
+                400,
+                r#"{"error":"invalid_scope","note":"invalid_grant"}"#,
+            )),
+            Ok(json_response(403, "invalid_grant")),
+            Ok(json_response(429, r#"{"error":"temporarily_unavailable"}"#)),
+            Ok(json_response(200, r#"{"error":"invalid_grant"}"#)),
+        ]);
+        for expected in [401, 400, 400, 403, 429] {
+            match harness.refresh(&first, &upstream).await {
+                RefreshOutcome::Response(response) => assert_eq!(response.status, expected),
+                other => panic!("{other:?}"),
+            }
+            assert!(!harness.revoked(&family).await, "status {expected}");
+        }
+        // A 2xx is a success whatever it says; it has no token to wrap, so it is unusable.
+        assert!(matches!(
+            harness.refresh(&first, &upstream).await,
+            RefreshOutcome::Response(_)
+        ));
+        // The handle was released every time and still works.
+        assert_eq!(upstream.calls().len(), 6);
+        assert!(!harness.revoked(&family).await);
+
+        // The JSON `invalid_grant` error revokes whatever content type it arrives with.
+        let plain = FakeUpstream::scripted(vec![Ok(StoredResponse {
+            status: 400,
+            content_type: Some("text/plain".into()),
+            body: br#"{"error":"invalid_grant"}"#.to_vec(),
+        })]);
+        let second = harness.issue("up-1").await;
+        let second_family = harness.load(&second).await.unwrap();
+        assert!(matches!(
+            harness.refresh(&second, &plain).await,
+            RefreshOutcome::Response(response) if response.status == 400
+        ));
+        assert!(harness.revoked(&second_family).await);
+    }
+
+    #[tokio::test]
+    async fn sealed_handles_past_the_maximum_lifetime_are_rejected() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let issued = START_MS / 1000;
+        let handle = |issued_at: u64| {
+            seal_handle(harness.sealer.as_ref(), &key("app"), "up-legacy", issued_at).unwrap()
+        };
+        // Just inside the lifetime migrates; at and beyond it does not reach the upstream.
+        let recent = handle(issued - LIFETIME_SECONDS + 1);
+        assert!(matches!(
+            harness.refresh(&recent, &upstream).await,
+            RefreshOutcome::Response(_)
+        ));
+        let expired = handle(issued - LIFETIME_SECONDS);
+        assert_invalid_grant(harness.refresh(&expired, &upstream).await);
+        assert_invalid_grant(harness.refresh(&handle(0), &upstream).await);
+        assert_eq!(upstream.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revocation_erases_the_stored_upstream_token() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let first = harness.issue("up-0").await;
+        let second = successor(harness.refresh(&first, &upstream).await);
+        let third = successor(harness.refresh(&second, &upstream).await);
+        let family = harness.load(&first).await.unwrap();
+        let head = harness.rotator.handle_key(&third);
+        assert!(harness.load(&third).await.is_some());
+
+        // Reuse of the oldest handle erases the newest record, which held the only token.
+        harness.advance(Duration::from_secs(GRACE_SECONDS + 1));
+        assert_invalid_grant(harness.refresh(&first, &upstream).await);
+        assert!(harness.revoked(&family).await);
+        assert!(harness.store.get(&head).await.unwrap().is_none());
+        // Superseded records stay as token-free tombstones until the family expires.
+        for rotated in [&first, &second] {
+            assert!(matches!(
+                harness.load(rotated).await.unwrap().record.state,
+                State::Rotated { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_finds_the_token_when_the_head_pointer_is_missing() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let first = harness.issue("up-0").await;
+        let second = successor(harness.refresh(&first, &upstream).await);
+        let third = successor(harness.refresh(&second, &upstream).await);
+        let family = harness.load(&first).await.unwrap();
+        harness
+            .store
+            .delete(&harness.rotator.head_key(&family.record.family_id))
+            .await
+            .unwrap();
+        harness.advance(Duration::from_secs(GRACE_SECONDS + 1));
+        // The chain from the presented handle leads to the newest record.
+        assert_invalid_grant(harness.refresh(&first, &upstream).await);
+        assert!(harness.load(&third).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_upstream_invalid_grant_erases_the_claimed_record() {
+        let harness = Harness::new();
+        let first = harness.issue("up-0").await;
+        let upstream =
+            FakeUpstream::scripted(vec![Ok(json_response(400, r#"{"error":"invalid_grant"}"#))]);
+        harness.refresh(&first, &upstream).await;
+        assert!(harness.load(&first).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_family_revoked_while_a_refresh_is_in_flight_gets_no_tokens() {
+        for erase in [false, true] {
+            let harness = Harness::new();
+            let first = harness.issue("up-0").await;
+            let family = harness.load(&first).await.unwrap();
+            let slow = FakeUpstream::slow(Duration::from_millis(200));
+            let winner = {
+                let rotator = harness.rotator.clone();
+                let first = first.clone();
+                let slow = slow.clone();
+                tokio::spawn(async move { rotator.refresh(&first, slow.as_ref()).await })
+            };
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            if erase {
+                // A full revocation deletes the claimed record out from under the winner.
+                harness
+                    .rotator
+                    .revoke(
+                        &family.record.family_id,
+                        family.record.family_expires_ms,
+                        &harness.rotator.handle_key(&first),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                // Only the marker is in place when the winner commits, so the winner itself must
+                // notice and withhold the tokens it was about to return.
+                assert!(harness
+                    .store
+                    .put_if_absent(
+                        &harness.rotator.family_key(&family.record.family_id),
+                        b"1",
+                        Duration::from_secs(60)
+                    )
+                    .await
+                    .unwrap());
+            }
+            assert!(
+                matches!(winner.await.unwrap(), RefreshOutcome::InvalidGrant),
+                "erase: {erase}"
+            );
+            // Nothing the winner wrote survives: the old record is a tombstone or gone, and
+            // there is no successor to refresh.
+            let after = FakeUpstream::scripted(vec![]);
+            assert_invalid_grant(harness.refresh(&first, &after).await);
+            assert!(after.calls().is_empty());
+            let writes = harness.store.writes.lock().unwrap().clone();
+            for (key, _) in writes
+                .iter()
+                .filter(|(key, _)| key.starts_with("refresh:handle:"))
+            {
+                if *key == harness.rotator.handle_key(&first) {
+                    continue;
+                }
+                assert!(
+                    harness.store.get(key).await.unwrap().is_none(),
+                    "successor record must be removed (erase: {erase})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn issuing_substitutes_only_responses_that_carry_a_refresh_token() {
         let harness = Harness::new();
         let with = json_response(201, r#"{"access_token":"a","refresh_token":"up-0","x":1}"#);
@@ -1613,11 +2014,6 @@ mod tests {
             json_response(200, r#"{"access_token":"a"}"#),
             json_response(200, r#"{"refresh_token":""}"#),
             json_response(400, r#"{"refresh_token":"up-0"}"#),
-            StoredResponse {
-                status: 200,
-                content_type: Some("text/plain".into()),
-                body: b"refresh_token=up-0".to_vec(),
-            },
         ] {
             assert!(harness
                 .rotator

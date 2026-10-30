@@ -28,7 +28,6 @@ struct RefreshHandle {
 #[derive(Debug)]
 pub(crate) struct OpenedHandle {
     pub upstream_token: String,
-    #[allow(dead_code)]
     pub issued_at: u64,
 }
 
@@ -93,7 +92,7 @@ pub(crate) enum SubstitutionError {
 
 /// Whether `body` names a `refresh_token` as a member or field (`refresh_token=`,
 /// `"refresh_token":`), which a body that is not a JSON object must not be allowed to carry.
-fn names_refresh_token(body: &[u8]) -> bool {
+pub(crate) fn names_refresh_token(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body);
     text.match_indices(REFRESH_TOKEN_MEMBER).any(|(at, name)| {
         text[at + name.len()..]
