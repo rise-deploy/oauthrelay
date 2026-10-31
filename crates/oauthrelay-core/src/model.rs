@@ -20,12 +20,16 @@ impl ResourceKey {
             || value.ends_with('/')
             || value.split('/').any(|part| {
                 part.is_empty()
+                    || part == "."
+                    || part == ".."
                     || !part
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
             })
         {
-            return Err("must contain non-empty URL-safe path segments".into());
+            return Err(
+                "must contain non-empty URL-safe path segments other than `.` and `..`".into(),
+            );
         }
         Ok(Self(value))
     }
@@ -580,6 +584,18 @@ pub type RelayMap = std::collections::HashMap<ResourceKey, Arc<Relay>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_keys_are_plain_path_segments() {
+        for valid in ["google", "a/b", "a.b", "a-b_c", "...", "a/..b"] {
+            assert!(ResourceKey::new(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "", "/", "a/", "/a", "a//b", ".", "..", "a/.", "a/../b", "./a", "a%2Fb", "a b",
+        ] {
+            assert!(ResourceKey::new(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn redirect_matchers_are_explicit_and_distinct() {

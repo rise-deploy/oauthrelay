@@ -107,6 +107,10 @@ Several relays referencing one upstream use the same provider callback. The flow
 sealed with the upstream key as associated data and carries the originating relay key. The
 authorization-code envelope is sealed with the relay key.
 
+The route table is the built-in `DefaultLayout`. An embedding replaces it by passing its own `PathLayout`
+to `router`; the router renders every URL it issues (upstream `redirect_uri`, discovery endpoints, default
+`private_key_jwt` audience) through the layout. The callback is keyed by the upstream key, every other endpoint by the relay key.
+
 Unknown relay or upstream keys return 404. The token endpoint uses RFC 6749 error bodies. An
 unvalidated redirect URI is never reflected into a response.
 

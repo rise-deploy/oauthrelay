@@ -18,6 +18,34 @@ upstream name `U`, oauthrelay serves:
 | `GET /healthz` | Reports standalone process liveness. |
 | `GET /readyz` | Reports readiness after initial provider snapshots are available. |
 
+## Embedding: custom URL layout
+
+The routes above are the built-in layout (`DefaultLayout`). A Rust host that embeds
+`oauthrelay_core::router` can serve the same endpoints under its own paths by passing an
+`Arc<dyn PathLayout>`:
+
+```rust
+pub trait PathLayout: Send + Sync + 'static {
+    /// Maps a request path below `public_url` (no leading slash) to an endpoint and key.
+    fn parse(&self, path: &str) -> Option<(Endpoint, ResourceKey)>;
+    /// The path below `public_url` (no leading slash) serving `endpoint` for `key`.
+    fn path(&self, endpoint: Endpoint, key: &ResourceKey) -> String;
+}
+```
+
+`Endpoint` is `Authorize`, `Callback`, `Token`, `Discovery`, or `Jwks`. Every endpoint is keyed by
+the relay key except `Callback`, which is keyed by the upstream key. A layout may place the callback
+under the same key as the relay, for example `/oidc/{project}/{extension}/callback`; that only lines
+up when the relay key equals its upstream key, otherwise the callback lands under the upstream's key.
+`parse` receives the raw request path below `public_url` without its leading slash: percent-escapes
+are not decoded, and repeated or empty segments are passed through as-is.
+
+The router renders every URL it hands out through `path`: the upstream `redirect_uri`, the
+`authorization_endpoint` and `token_endpoint` in the discovery document, and the default
+`private_key_jwt` audience. `path` must therefore invert `parse`. `DefaultLayout::new(KeyStrategy)`
+keeps the built-in routes; for `KeyStrategy::Custom` it renders keys verbatim, so the mapper must
+accept the key parts it is given.
+
 ## Authorization endpoint
 
 Only authorization-code flow and query response mode are accepted. oauthrelay owns and replaces
@@ -119,6 +147,25 @@ even when the provider returned none; present that one next.
 
 A relay in this mode with no transient store configured returns 500 `server_error` from the
 authorize endpoint and both grants and logs the cause.
+
+### Sealer unavailable
+
+A library embedder can supply a `Sealer` backed by a remote key service. When it reports
+`SealError::Unavailable`, or does not answer within five seconds during a rotation, the request fails
+without treating the value as invalid:
+
+- The token endpoint (code and refresh grants) returns 503 `server_error` and never returns a token.
+  The authorize and callback endpoints return a bare 503.
+- A refresh handle is usable again once the claim lease (at most 60 seconds) has expired. If the
+  provider rotated its refresh token during the failed attempt, the next refresh may be rejected by
+  the provider.
+- A `sealed`-mode authorization code stays redeemable. A `rotating`-mode code is consumed, because
+  its family is written to the store first; a retry answers `invalid_grant`.
+- Revoking a family still succeeds, so the client gets the usual `invalid_grant` or the provider's
+  error. The revocation marker blocks the family; the stored token it could not erase expires with the
+  family.
+
+A value the sealer reports as invalid keeps its `invalid_grant` (or 400) answer.
 
 ## Transparent metadata
 

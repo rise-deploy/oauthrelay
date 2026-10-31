@@ -5,7 +5,7 @@
 //! key and to this purpose through the associated data. Only the relay that issued a handle can
 //! open it, and seal-key rotation applies through the sealer's previous-key mechanism.
 
-use crate::{ResourceKey, Sealer};
+use crate::{ResourceKey, SealError, Sealer};
 use serde::{
     de::{MapAccess, Visitor},
     ser::SerializeMap,
@@ -35,36 +35,55 @@ fn associated_data(relay: &ResourceKey) -> Vec<u8> {
     format!("refresh:{relay}").into_bytes()
 }
 
+/// Why a handle could not be sealed or opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandleError {
+    /// Not a handle this relay issued: wrong shape, tampered with, issued for another relay, or
+    /// sealed under a key that is no longer configured. (When sealing: the value could not be
+    /// encoded or sealed.)
+    Invalid,
+    /// The sealer could not be reached; the handle may be fine.
+    SealerUnavailable,
+}
+
+impl From<SealError> for HandleError {
+    fn from(error: SealError) -> Self {
+        match error {
+            SealError::Unavailable => Self::SealerUnavailable,
+            SealError::InvalidKey | SealError::InvalidEnvelope => Self::Invalid,
+        }
+    }
+}
+
 /// Seals an upstream refresh token into a handle for `relay`.
-pub(crate) fn seal_handle(
+pub(crate) async fn seal_handle(
     sealer: &dyn Sealer,
     relay: &ResourceKey,
     upstream_token: &str,
     issued_at: u64,
-) -> Result<String, ()> {
+) -> Result<String, HandleError> {
     let plaintext = postcard::to_stdvec(&RefreshHandle {
         upstream_token: upstream_token.to_owned(),
         issued_at,
     })
-    .map_err(|_| ())?;
-    let envelope = sealer
-        .seal(&plaintext, &associated_data(relay))
-        .map_err(|_| ())?;
+    .map_err(|_| HandleError::Invalid)?;
+    let envelope = sealer.seal(&plaintext, &associated_data(relay)).await?;
     Ok(format!("{HANDLE_PREFIX}{envelope}"))
 }
 
 /// Opens a handle issued by `relay`. Anything else, including a raw upstream token, a handle
 /// issued for another relay, or a tampered handle, is rejected.
-pub(crate) fn open_handle(
+pub(crate) async fn open_handle(
     sealer: &dyn Sealer,
     relay: &ResourceKey,
     handle: &str,
-) -> Result<OpenedHandle, ()> {
-    let envelope = handle.strip_prefix(HANDLE_PREFIX).ok_or(())?;
-    let plaintext = sealer
-        .unseal(envelope, &associated_data(relay))
-        .map_err(|_| ())?;
-    let handle: RefreshHandle = postcard::from_bytes(&plaintext).map_err(|_| ())?;
+) -> Result<OpenedHandle, HandleError> {
+    let envelope = handle
+        .strip_prefix(HANDLE_PREFIX)
+        .ok_or(HandleError::Invalid)?;
+    let plaintext = sealer.unseal(envelope, &associated_data(relay)).await?;
+    let handle: RefreshHandle =
+        postcard::from_bytes(&plaintext).map_err(|_| HandleError::Invalid)?;
     Ok(OpenedHandle {
         upstream_token: handle.upstream_token,
         issued_at: handle.issued_at,
@@ -80,11 +99,13 @@ pub(crate) fn has_handle_prefix(token: &str) -> bool {
     })
 }
 
-/// Why a token response could not be substituted. Neither case may return the upstream body.
+/// Why a token response could not be substituted. No case may return the upstream body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SubstitutionError {
     /// Sealing or encoding the handle failed.
     Sealing,
+    /// The sealer could not be reached.
+    SealerUnavailable,
     /// A successful response is not a JSON object yet appears to carry a refresh token (for
     /// example a form-encoded `refresh_token=` pair), so it cannot be rewritten safely.
     UnrecognizedBody,
@@ -109,7 +130,7 @@ pub(crate) fn names_refresh_token(body: &[u8]) -> bool {
 /// string `refresh_token` and does not look like it hides one. Member order and the bytes of
 /// every other member are preserved; only inter-member whitespace is normalized. `Err` means the
 /// response must not be returned, as it would expose the upstream token.
-pub(crate) fn seal_token_response(
+pub(crate) async fn seal_token_response(
     sealer: &dyn Sealer,
     relay: &ResourceKey,
     status: u16,
@@ -138,7 +159,11 @@ pub(crate) fn seal_token_response(
             continue;
         }
         let handle = seal_handle(sealer, relay, &token, issued_at)
-            .map_err(|()| SubstitutionError::Sealing)?;
+            .await
+            .map_err(|error| match error {
+                HandleError::SealerUnavailable => SubstitutionError::SealerUnavailable,
+                HandleError::Invalid => SubstitutionError::Sealing,
+            })?;
         *value = serde_json::to_string(&handle)
             .ok()
             .and_then(|json| RawValue::from_string(json).ok())
@@ -233,47 +258,57 @@ mod tests {
         ResourceKey::new(name).unwrap()
     }
 
-    fn seal(sealer: &XChaChaSealer, body: &str) -> Option<String> {
+    async fn seal(sealer: &XChaChaSealer, body: &str) -> Option<String> {
         seal_token_response(sealer, &key("app"), 200, body.as_bytes(), 42)
+            .await
             .unwrap()
             .map(|bytes| String::from_utf8(bytes).unwrap())
     }
 
-    #[test]
-    fn handle_round_trips_and_is_bound_to_the_relay() {
+    #[tokio::test]
+    async fn handle_round_trips_and_is_bound_to_the_relay() {
         let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
-        let handle = seal_handle(&sealer, &key("app"), "upstream-token", 7).unwrap();
+        let handle = seal_handle(&sealer, &key("app"), "upstream-token", 7)
+            .await
+            .unwrap();
         assert!(handle.starts_with("rrt1."));
         assert!(!handle.contains("upstream-token"));
-        let opened = open_handle(&sealer, &key("app"), &handle).unwrap();
+        let opened = open_handle(&sealer, &key("app"), &handle).await.unwrap();
         assert_eq!(opened.upstream_token, "upstream-token");
         assert_eq!(opened.issued_at, 7);
-        assert!(open_handle(&sealer, &key("other"), &handle).is_err());
-        assert!(open_handle(&sealer, &key("app"), "upstream-token").is_err());
-        assert!(open_handle(&sealer, &key("app"), &handle["rrt1.".len()..]).is_err());
-        assert!(open_handle(&sealer, &key("app"), "rrt1.").is_err());
+        assert!(open_handle(&sealer, &key("other"), &handle).await.is_err());
+        assert!(open_handle(&sealer, &key("app"), "upstream-token")
+            .await
+            .is_err());
+        assert!(open_handle(&sealer, &key("app"), &handle["rrt1.".len()..])
+            .await
+            .is_err());
+        assert!(open_handle(&sealer, &key("app"), "rrt1.").await.is_err());
     }
 
-    #[test]
-    fn handles_survive_seal_key_rotation() {
+    #[tokio::test]
+    async fn handles_survive_seal_key_rotation() {
         let old = XChaChaSealer::new(&[1; 32], None).unwrap();
-        let handle = seal_handle(&old, &key("app"), "upstream-token", 7).unwrap();
+        let handle = seal_handle(&old, &key("app"), "upstream-token", 7)
+            .await
+            .unwrap();
         let rotated = XChaChaSealer::new(&[2; 32], Some(&[1; 32])).unwrap();
         assert_eq!(
             open_handle(&rotated, &key("app"), &handle)
+                .await
                 .unwrap()
                 .upstream_token,
             "upstream-token"
         );
         let retired = XChaChaSealer::new(&[2; 32], None).unwrap();
-        assert!(open_handle(&retired, &key("app"), &handle).is_err());
+        assert!(open_handle(&retired, &key("app"), &handle).await.is_err());
     }
 
-    #[test]
-    fn substitution_preserves_member_order_and_other_members() {
+    #[tokio::test]
+    async fn substitution_preserves_member_order_and_other_members() {
         let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
         let body = r#"{"z":1.50,"refresh_token":"secret","a":{"y":[1, 2],"b":null},"big":123456789012345678901234567890}"#;
-        let sealed = seal(&sealer, body).unwrap();
+        let sealed = seal(&sealer, body).await.unwrap();
         assert!(!sealed.contains("secret"));
         let (head, tail) = sealed.split_once(r#""refresh_token":""#).unwrap();
         assert_eq!(head, r#"{"z":1.50,"#);
@@ -284,14 +319,15 @@ mod tests {
         );
         assert_eq!(
             open_handle(&sealer, &key("app"), handle)
+                .await
                 .unwrap()
                 .upstream_token,
             "secret"
         );
     }
 
-    #[test]
-    fn unchanged_when_there_is_no_refresh_token_to_substitute() {
+    #[tokio::test]
+    async fn unchanged_when_there_is_no_refresh_token_to_substitute() {
         let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
         for body in [
             r#"{"access_token":"a"}"#,
@@ -302,7 +338,7 @@ mod tests {
             "access_token=a&token_type=Bearer",
             "",
         ] {
-            assert_eq!(seal(&sealer, body), None, "{body}");
+            assert_eq!(seal(&sealer, body).await, None, "{body}");
         }
         for status in [400, 302, 500] {
             assert_eq!(
@@ -312,23 +348,26 @@ mod tests {
                     status,
                     br#"{"refresh_token":"secret"}"#,
                     0
-                ),
+                )
+                .await,
                 Ok(None),
                 "{status}"
             );
         }
     }
 
-    #[test]
-    fn json_is_recognised_whatever_the_content_type() {
+    #[tokio::test]
+    async fn json_is_recognised_whatever_the_content_type() {
         // The content type is not an input: a 2xx body is a JSON object or it is not.
         let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
-        let sealed = seal(&sealer, r#"{"refresh_token":"secret","x":1}"#).unwrap();
+        let sealed = seal(&sealer, r#"{"refresh_token":"secret","x":1}"#)
+            .await
+            .unwrap();
         assert!(!sealed.contains("secret") && sealed.contains(r#""x":1"#));
     }
 
-    #[test]
-    fn a_non_json_success_body_that_carries_a_refresh_token_fails_closed() {
+    #[tokio::test]
+    async fn a_non_json_success_body_that_carries_a_refresh_token_fails_closed() {
         let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
         for body in [
             "access_token=a&refresh_token=secret&token_type=Bearer",
@@ -339,7 +378,7 @@ mod tests {
             "{\"refresh_token\": \"secret\"",
         ] {
             assert_eq!(
-                seal_token_response(&sealer, &key("app"), 200, body.as_bytes(), 0),
+                seal_token_response(&sealer, &key("app"), 200, body.as_bytes(), 0).await,
                 Err(SubstitutionError::UnrecognizedBody),
                 "{body}"
             );
