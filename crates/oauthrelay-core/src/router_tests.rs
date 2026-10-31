@@ -61,6 +61,9 @@ enum EndpointConfiguration {
     Discovered,
     Explicit,
     ExplicitWithoutJwks,
+    /// Explicit endpoints and no JWKS, against an upstream that serves neither a discovery
+    /// document nor a JWKS.
+    OAuth2Only,
 }
 
 async fn mock_discovery(State(state): State<MockIdpState>) -> Json<Value> {
@@ -259,10 +262,30 @@ struct SignedFixtureState {
     nonce: Arc<StdMutex<Option<String>>>,
     authorize: Arc<StdMutex<Vec<(String, String)>>>,
     claim_overrides: Arc<StdMutex<serde_json::Map<String, Value>>>,
+    discovery: Arc<StdMutex<SignedDiscovery>>,
 }
 
-async fn signed_discovery(State(state): State<SignedFixtureState>) -> Json<Value> {
-    Json(json!({
+/// What the signed fixture's discovery endpoint serves.
+#[derive(Clone, Copy)]
+enum SignedDiscovery {
+    Full,
+    WithoutJwks,
+    Unavailable,
+}
+
+/// Whether the signed fixture's upstream configures its JWKS.
+#[derive(Clone, Copy)]
+enum SignedJwks {
+    Configured,
+    Unconfigured,
+}
+
+async fn signed_discovery(State(state): State<SignedFixtureState>) -> Response {
+    let mode = *state.discovery.lock().unwrap();
+    if matches!(mode, SignedDiscovery::Unavailable) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut doc = json!({
         "issuer": state.issuer,
         "authorization_endpoint": state.base.join("authorize").unwrap(),
         "token_endpoint": state.base.join("token").unwrap(),
@@ -271,7 +294,11 @@ async fn signed_discovery(State(state): State<SignedFixtureState>) -> Json<Value
         "response_types_supported": ["code"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"]
-    }))
+    });
+    if matches!(mode, SignedDiscovery::WithoutJwks) {
+        doc.as_object_mut().unwrap().remove("jwks_uri");
+    }
+    Json(doc).into_response()
 }
 
 async fn signed_authorize(State(state): State<SignedFixtureState>, uri: Uri) -> Response {
@@ -412,6 +439,21 @@ async fn setup_signed_policy(
     profile: RelayProfile,
     required_id_token_claims: HashMap<String, String>,
     id_token_policy: Option<crate::IdTokenPolicy>,
+) -> SignedProfile {
+    setup_signed_upstream(
+        profile,
+        required_id_token_claims,
+        id_token_policy,
+        SignedJwks::Configured,
+    )
+    .await
+}
+
+async fn setup_signed_upstream(
+    profile: RelayProfile,
+    required_id_token_claims: HashMap<String, String>,
+    id_token_policy: Option<crate::IdTokenPolicy>,
+    jwks_source: SignedJwks,
 ) -> (
     Router,
     SignedFixtureState,
@@ -446,6 +488,7 @@ async fn setup_signed_policy(
         nonce: Arc::new(StdMutex::new(None)),
         authorize: Arc::new(StdMutex::new(Vec::new())),
         claim_overrides: Arc::new(StdMutex::new(serde_json::Map::new())),
+        discovery: Arc::new(StdMutex::new(SignedDiscovery::Full)),
     };
     let idp = Router::new()
         .route("/.well-known/openid-configuration", get(signed_discovery))
@@ -471,7 +514,7 @@ async fn setup_signed_policy(
         issuer_url: Url::parse(&fixture.issuer).unwrap(),
         authorization_endpoint: Some(base.join("authorize").unwrap()),
         token_endpoint: Some(base.join("token").unwrap()),
-        jwks_uri: Some(base.join("jwks").unwrap()),
+        jwks_uri: matches!(jwks_source, SignedJwks::Configured).then(|| base.join("jwks").unwrap()),
         client_id: "upstream-client".into(),
         client_secret: SecretString::new("upstream-secret"),
         token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
@@ -638,19 +681,29 @@ async fn setup_with_upstream_auth(
 
 /// Serves the mock identity provider on a random local port.
 async fn start_mock_idp() -> (Url, MockCapture, tokio::task::JoinHandle<()>) {
+    start_mock_idp_serving(false).await
+}
+
+/// `oauth2_only` leaves out the discovery document and the JWKS, as an upstream without OIDC does.
+async fn start_mock_idp_serving(
+    oauth2_only: bool,
+) -> (Url, MockCapture, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let base = Url::parse(&format!("http://{address}/")).unwrap();
     let capture = MockCapture::default();
-    let idp = Router::new()
-        .route("/.well-known/openid-configuration", get(mock_discovery))
+    let mut idp = Router::new()
         .route("/authorize", get(mock_authorize))
-        .route("/token", post(mock_token))
-        .route("/jwks", get(mock_jwks))
-        .with_state(MockIdpState {
-            base: base.clone(),
-            capture: capture.clone(),
-        });
+        .route("/token", post(mock_token));
+    if !oauth2_only {
+        idp = idp
+            .route("/.well-known/openid-configuration", get(mock_discovery))
+            .route("/jwks", get(mock_jwks));
+    }
+    let idp = idp.with_state(MockIdpState {
+        base: base.clone(),
+        capture: capture.clone(),
+    });
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
     (base, capture, task)
 }
@@ -667,7 +720,11 @@ async fn setup_with_sealer(
     token_endpoint_auth_method: TokenEndpointAuthMethod,
     sealer: Arc<dyn Sealer>,
 ) -> (Router, tokio::task::JoinHandle<()>, MockCapture) {
-    let (base, capture, task) = start_mock_idp().await;
+    let (base, capture, task) = start_mock_idp_serving(matches!(
+        endpoint_configuration,
+        EndpointConfiguration::OAuth2Only
+    ))
+    .await;
     let key = ResourceKey::new(key).unwrap();
     let authorization_endpoint =
         (!matches!(endpoint_configuration, EndpointConfiguration::Discovered))
@@ -2601,6 +2658,169 @@ async fn discovery_supplies_jwks_when_other_endpoints_are_explicit() {
     assert_eq!(
         serde_json::from_slice::<Value>(&response_body(jwks).await).unwrap(),
         json!({ "keys": [] })
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn oauth2_only_upstream_runs_the_flow_without_discovery_or_jwks() {
+    let (app, sealer, task, capture) = setup_with_refresh_tokens(
+        "github",
+        ClientAuth::UpstreamClient,
+        default_layout(KeyStrategy::SingleSegment),
+        None,
+        EndpointConfiguration::OAuth2Only,
+        SEALED,
+    )
+    .await;
+
+    let code = authorization_code(&app, "github", Some(&pkce_challenge(SEALED_VERIFIER))).await;
+    let response = post_token(
+        &app,
+        "github",
+        &confidential_code_grant_form(&code, SEALED_VERIFIER),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    let handle = body["refresh_token"].as_str().unwrap();
+    assert_eq!(
+        open_handle(sealer.as_ref(), &capture.binding(), handle)
+            .await
+            .unwrap()
+            .upstream_token,
+        "refresh"
+    );
+    let response = post_token(&app, "github", &confidential_refresh_form(handle)).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        capture.token.lock().unwrap().last().unwrap().clone(),
+        [
+            ("grant_type".to_owned(), "refresh_token".to_owned()),
+            ("refresh_token".to_owned(), "refresh".to_owned()),
+            ("client_id".to_owned(), "upstream-client".to_owned()),
+            ("client_secret".to_owned(), "upstream-secret".to_owned()),
+        ]
+    );
+
+    let discovery = relay_discovery(&app, "github").await;
+    assert_eq!(
+        discovery["authorization_endpoint"],
+        "https://relay.example/relay/github/authorize"
+    );
+    assert_eq!(
+        discovery["token_endpoint"],
+        "https://relay.example/relay/github/token"
+    );
+    assert!(discovery.get("jwks_uri").is_none(), "{discovery}");
+    let issuer = discovery["issuer"].as_str().unwrap();
+    assert!(issuer.starts_with("http://127.0.0.1:") && !issuer.ends_with('/'));
+
+    let jwks = app
+        .oneshot(
+            Request::get("/relay/github/jwks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jwks.status(), StatusCode::NOT_FOUND);
+    task.abort();
+}
+
+#[tokio::test]
+async fn explicit_endpoints_with_a_discovery_document_lacking_jwks_uri_have_no_jwks() {
+    let (app, _, task, _, _) = setup_signed_upstream(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Unconfigured,
+    )
+    .await;
+    // `Full` is the fixture default: its discovery document supplies the JWKS.
+    let discovery = relay_discovery(&app, "profile").await;
+    assert!(discovery["jwks_uri"].as_str().unwrap().ends_with("/jwks"));
+    task.abort();
+
+    let (app, fixture, task, _, _) = setup_signed_upstream(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Unconfigured,
+    )
+    .await;
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::WithoutJwks;
+    let discovery = relay_discovery(&app, "profile").await;
+    assert!(discovery.get("jwks_uri").is_none(), "{discovery}");
+    let jwks = app
+        .oneshot(
+            Request::get("/relay/profile/jwks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jwks.status(), StatusCode::NOT_FOUND);
+    task.abort();
+}
+
+/// Redeems the signed fixture's code at the relay, as its Cognito-shaped confidential client.
+async fn redeem_signed_code(app: &Router, redirect_uri: &str) -> Response {
+    let (code, verifier) = signed_authorization_code(app, redirect_uri).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", verifier.as_str()),
+        ("client_id", "upstream-client"),
+        ("client_secret", "upstream-secret"),
+    ])
+    .unwrap();
+    post_token(app, "profile", &form).await
+}
+
+#[tokio::test]
+async fn id_token_validation_fails_closed_when_the_upstream_has_no_jwks() {
+    let policy = || -> crate::IdTokenPolicy {
+        serde_json::from_value(json!({"required": {"email_verified": {"booleanEquals": true}}}))
+            .unwrap()
+    };
+    let claims = || HashMap::from([("email".to_owned(), "person@example.com".to_owned())]);
+    for discovery in [SignedDiscovery::Unavailable, SignedDiscovery::WithoutJwks] {
+        for (required, policy) in [
+            (claims(), None),
+            (HashMap::new(), Some(policy())),
+            (claims(), Some(policy())),
+        ] {
+            let (app, fixture, task, redirect_uri, _) = setup_signed_upstream(
+                RelayProfile::Cognito,
+                required,
+                policy,
+                SignedJwks::Unconfigured,
+            )
+            .await;
+            *fixture.discovery.lock().unwrap() = discovery;
+            let response = redeem_signed_code(&app, &redirect_uri).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+            assert_eq!(body["error"], "server_error");
+            assert!(body.get("access_token").is_none());
+            assert!(body.get("id_token").is_none());
+            task.abort();
+        }
+    }
+
+    // The same upstream admits the token once discovery supplies the JWKS.
+    let (app, _, task, redirect_uri, _) = setup_signed_upstream(
+        RelayProfile::Cognito,
+        claims(),
+        Some(policy()),
+        SignedJwks::Unconfigured,
+    )
+    .await;
+    assert_eq!(
+        redeem_signed_code(&app, &redirect_uri).await.status(),
+        StatusCode::OK
     );
     task.abort();
 }

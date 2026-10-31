@@ -65,7 +65,7 @@ An upstream and a relay may use the same name because identities include the res
 | `spec.issuerUrl` | yes | Absolute HTTP(S) issuer URL used for discovery and preserved as the transparent trust authority. |
 | `spec.endpoints.authorization` | no | Explicit upstream authorization endpoint. Discovery supplies it when omitted. |
 | `spec.endpoints.token` | no | Explicit upstream token endpoint. Discovery supplies it when omitted. |
-| `spec.endpoints.jwks` | no | Explicit upstream JWKS endpoint. Discovery supplies it when omitted. |
+| `spec.endpoints.jwks` | no | Explicit upstream JWKS endpoint. When omitted, the upstream's discovery document supplies it if it has one; otherwise the upstream has no JWKS. |
 | `spec.oauthClient.clientId` | yes | Provider OAuth client ID. |
 | `spec.oauthClient.clientSecret` | yes | Provider OAuth client secret as a [secret value](#secret-values). |
 | `spec.oauthClient.tokenEndpointAuthMethod` | no | How oauthrelay authenticates at the upstream token endpoint: `client_secret_post` (default) or `client_secret_basic`. |
@@ -87,9 +87,22 @@ https://login.example.com/oidc/upstream/google/callback
 Here `OAUTHRELAY_PUBLIC_URL` is `https://login.example.com/oidc`. Set it to another path, such as
 `https://login.example.com/services/oauthrelay`, to serve the same API under that path instead.
 
-Explicit endpoints are useful for providers without standard discovery. Each omitted endpoint is
-resolved from `{issuerUrl}/.well-known/openid-configuration`. The issuer and JWKS remain
-upstream-owned by the relay contract.
+Explicit endpoints are useful for providers without standard discovery, such as OAuth2-only
+providers like GitHub, Notion, or Snowflake OAuth. The authorization and token endpoints are
+required: an omitted one is resolved from `{issuerUrl}/.well-known/openid-configuration`, and the
+relay answers 502 while that document cannot be fetched. Configure both and oauthrelay does not need
+the discovery document for them.
+
+The JWKS is optional. Without `spec.endpoints.jwks`, oauthrelay fetches the discovery document on a
+best-effort basis and uses its `jwks_uri`. When that document is unreachable, malformed, or has no
+`jwks_uri`, the upstream has no JWKS: the relay's discovery metadata omits `jwks_uri`, its `/jwks`
+endpoint answers 404, and nothing answers 502 on account of it. A failed fetch is not retried for 30
+seconds. The issuer remains upstream-owned by the relay contract.
+
+A relay with `requiredIdTokenClaims` or `idTokenPolicy` must verify the upstream ID token, which
+needs the JWKS. When the upstream has none, authorization-code redemption fails closed with HTTP
+502 `server_error` and the code stays unconsumed; the relay never admits an unverified ID token.
+Do not configure either policy for an upstream that issues no ID tokens.
 
 ## Relay
 
@@ -177,7 +190,9 @@ authorization-code token request must still repeat the exact redirect URI stored
 
 `requiredIdTokenClaims` applies to successful authorization-code exchanges. oauthrelay verifies
 the upstream ID-token signature, issuer, audience, lifetime, subject, issued-at time, nonce when
-requested, authorized party, and access-token hash when present. Every configured claim must exist
+requested, authorized party, and access-token hash when present, using the upstream JWKS. When the
+upstream has no JWKS, redemption fails closed with `server_error` instead of skipping verification.
+Every configured claim must exist
 as a string with the exact configured value. The policy reads only signed ID-token claims; it does
 not read UserInfo. A failed policy returns `invalid_grant` without returning upstream tokens. Relay
 codes remain single-use after a failed check. Refresh grants do not evaluate this policy because an

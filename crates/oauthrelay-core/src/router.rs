@@ -39,6 +39,9 @@ const REPLAY_ASSERTION_PREFIX: &str = "replay:client-assertion:";
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+/// How long a failed optional discovery fetch is remembered, so an upstream without a discovery
+/// document is not queried by every request that could use one.
+const DISCOVERY_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 const ID_TOKEN_CLOCK_SKEW: u64 = 60;
 /// Signature algorithms accepted for `private_key_jwt` client assertions.
 const CLIENT_ASSERTION_ALGORITHMS: [Algorithm; 9] = [
@@ -916,9 +919,10 @@ async fn validate_id_token_policy(
         return Err(IdTokenValidationError::Rejected);
     }
 
+    // Validation has no fallback: an upstream without a JWKS cannot admit a token that policy
+    // applies to.
     let jwks_uri = resolve_jwks_uri(state, upstream)
         .await
-        .map_err(|_| IdTokenValidationError::Unavailable)?
         .ok_or(IdTokenValidationError::Unavailable)?;
     let value = cached_json(state, &jwks_uri, JWKS_TTL)
         .await
@@ -1640,14 +1644,18 @@ async fn verify_private_key_jwt(
 }
 
 async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Response {
-    let discovery = discovery_url(&upstream.issuer_url);
-    let mut doc = if !needs_endpoint_discovery(upstream) {
-        json!({})
-    } else {
-        match cached_json(state, &discovery, DISCOVERY_TTL).await {
-            Ok(value) => value,
+    let mut doc = if endpoints_need_discovery(upstream) {
+        match cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => return StatusCode::BAD_GATEWAY.into_response(),
             Err(status) => return status.into_response(),
         }
+    } else if upstream.jwks_uri.is_some() {
+        json!({})
+    } else {
+        optional_discovery(state, upstream)
+            .await
+            .unwrap_or_else(|| json!({}))
     };
     let endpoints = match resolve_endpoints_from_doc(upstream, &doc) {
         Ok(value) => value,
@@ -1792,11 +1800,7 @@ fn describe_relay(doc: &mut serde_json::Map<String, Value>, relay: &Relay) {
 }
 
 async fn jwks(state: &AppState, upstream: &Upstream) -> Response {
-    let url = match resolve_jwks_uri(state, upstream).await {
-        Ok(value) => value,
-        Err(status) => return status.into_response(),
-    };
-    let Some(url) = url else {
+    let Some(url) = resolve_jwks_uri(state, upstream).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     match cached_json(state, &url, JWKS_TTL).await {
@@ -1811,32 +1815,63 @@ struct ResolvedEndpoints {
     jwks_uri: Option<Url>,
 }
 
+/// The authorization and token endpoints are required: they come from the configuration, or from
+/// the upstream's discovery document, whose failure fails the request.
 async fn resolve_endpoints(
     state: &AppState,
     upstream: &Upstream,
 ) -> Result<ResolvedEndpoints, StatusCode> {
-    if upstream.authorization_endpoint.is_some() && upstream.token_endpoint.is_some() {
+    if !endpoints_need_discovery(upstream) {
         return resolve_endpoints_from_doc(upstream, &json!({}));
     }
     let doc = cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await?;
     resolve_endpoints_from_doc(upstream, &doc)
 }
 
-async fn resolve_jwks_uri(
-    state: &AppState,
-    upstream: &Upstream,
-) -> Result<Option<Url>, StatusCode> {
+/// The upstream's JWKS URI, or `None` when it has no JWKS. Without a configured `jwks_uri` the
+/// upstream's discovery document is consulted on a best-effort basis, because an OAuth2-only
+/// upstream has none. An unreachable or malformed discovery document means "no JWKS", never an
+/// error, so callers that need a JWKS must treat `None` as a failure.
+async fn resolve_jwks_uri(state: &AppState, upstream: &Upstream) -> Option<Url> {
     if upstream.jwks_uri.is_some() {
-        return Ok(upstream.jwks_uri.clone());
+        return upstream.jwks_uri.clone();
     }
-    let doc = cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await?;
-    Ok(url_field(&doc, "jwks_uri"))
+    url_field(&optional_discovery(state, upstream).await?, "jwks_uri")
 }
 
-fn needs_endpoint_discovery(upstream: &Upstream) -> bool {
-    upstream.authorization_endpoint.is_none()
-        || upstream.token_endpoint.is_none()
-        || upstream.jwks_uri.is_none()
+/// The upstream's discovery document, for the members that are optional. A failed fetch is
+/// remembered for [`DISCOVERY_RETRY_COOLDOWN`].
+async fn optional_discovery(state: &AppState, upstream: &Upstream) -> Option<Value> {
+    let url = discovery_url(&upstream.issuer_url);
+    let absent = format!("absent:{url}");
+    if state
+        .cache
+        .lock()
+        .await
+        .get(&absent)
+        .is_some_and(|entry| entry.fetched.elapsed() < DISCOVERY_RETRY_COOLDOWN)
+    {
+        return None;
+    }
+    match cached_json(state, &url, DISCOVERY_TTL).await {
+        Ok(doc) if doc.is_object() => Some(doc),
+        _ => {
+            state.cache.lock().await.insert(
+                absent,
+                CachedJson {
+                    fetched: std::time::Instant::now(),
+                    value: Value::Null,
+                },
+            );
+            None
+        }
+    }
+}
+
+/// Only the authorization and token endpoints are required, so only their absence needs the
+/// discovery document. A missing `jwks_uri` means the upstream has no JWKS.
+fn endpoints_need_discovery(upstream: &Upstream) -> bool {
+    upstream.authorization_endpoint.is_none() || upstream.token_endpoint.is_none()
 }
 
 fn resolve_endpoints_from_doc(
