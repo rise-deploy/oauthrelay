@@ -805,6 +805,29 @@ async fn exchange_sealed_code(
             "ID token validation is unavailable",
         );
     }
+    // Handles carry the binding of the relay and upstream that obtained this response, so they
+    // belong to the upstream identity that issued its refresh token.
+    let binding = HandleBinding::with_fingerprint(relay.key.clone(), envelope.handle_fingerprint);
+    // Sealing commits nothing, so it runs before the replay marker: a sealer failure leaves the
+    // code redeemable. (Rotating mode writes its family to the store, so it follows the marker.)
+    let sealed_body = if relay.refresh_tokens.mode == RefreshTokenMode::Sealed && validation.is_ok()
+    {
+        let upstream_response = &envelope.upstream_response;
+        match seal_token_response(
+            state.cfg.sealer.as_ref(),
+            &binding,
+            upstream_response.status,
+            &upstream_response.body,
+            unix_now(),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return substitution_failed(relay, error),
+        }
+    } else {
+        None
+    };
     if let Some(store) = &state.cfg.store {
         let key = format!(
             "{REPLAY_CODE_PREFIX}{}",
@@ -839,23 +862,12 @@ async fn exchange_sealed_code(
     if validation == Err(IdTokenValidationError::Rejected) {
         return required_claims_error();
     }
-    let binding = HandleBinding::with_fingerprint(relay.key.clone(), envelope.handle_fingerprint);
     let mut stored = envelope.upstream_response;
     match relay.refresh_tokens.mode {
         RefreshTokenMode::Passthrough => {}
         RefreshTokenMode::Sealed => {
-            match seal_token_response(
-                state.cfg.sealer.as_ref(),
-                &binding,
-                stored.status,
-                &stored.body,
-                unix_now(),
-            )
-            .await
-            {
-                Ok(Some(body)) => stored.body = body,
-                Ok(None) => {}
-                Err(error) => return substitution_failed(relay, error),
+            if let Some(body) = sealed_body {
+                stored.body = body;
             }
         }
         RefreshTokenMode::Rotating => {
