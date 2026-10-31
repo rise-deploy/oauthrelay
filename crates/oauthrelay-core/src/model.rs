@@ -366,7 +366,9 @@ impl Relay {
                 "clientAuthentication.type: Public requires refreshTokens.mode: rotating, \
                 because a public client's refresh tokens must be rotated; set refreshTokens.mode \
                 to rotating, or authenticate the relying party with ClientSecret, UpstreamClient \
-                or PrivateKeyJwt"
+                or PrivateKeyJwt. rotating needs a transient store shared by every serving \
+                instance (OAUTHRELAY_STORE, e.g. dynamodb or kubernetes); the default memory \
+                store only suits a single instance"
                     .into(),
             );
         }
@@ -662,7 +664,8 @@ mod tests {
         for mode in [RefreshTokenMode::Passthrough, RefreshTokenMode::Sealed] {
             let error = relay(ClientAuth::Public, mode).validate().unwrap_err();
             assert!(
-                error.contains("Public requires refreshTokens.mode: rotating"),
+                error.contains("Public requires refreshTokens.mode: rotating")
+                    && error.contains("OAUTHRELAY_STORE"),
                 "{error}"
             );
             for confidential in [

@@ -116,6 +116,13 @@ upstream references, and API failures retain the complete last valid snapshot. F
 deleting an upstream while a relay references it keeps that snapshot active; deleting the relay
 as well permits the removal to take effect. Readiness follows the runtime's first-snapshot rule.
 
+Because one invalid resource holds back every later change in the namespace, the `Relay` CRD
+rejects some invalid relays at admission. Its CEL rule (`x-kubernetes-validations`) refuses a
+`Public` relay whose `refreshTokens.mode` is not `rotating`, so `kubectl apply` reports the error
+instead of the provider log. A relay stored before the CRD carried the rule, or applied to a cluster
+running an older CRD, still reaches the provider: it then fails startup, or after startup freezes the
+namespace's snapshot until it is fixed or deleted.
+
 File, SSM, and Kubernetes providers can be enabled together, in that precedence order. Each
 provider must supply a valid graph itself. On duplicate `(kind, name)` identities, the earlier
 provider wins. Lambda uses complete reads at invocation refresh boundaries.

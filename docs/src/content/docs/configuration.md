@@ -248,6 +248,9 @@ native app, cannot keep a credential, and [RFC 9700 section
 tokens to be sender-constrained or rotated; the relay does not sender-constrain them. A `Public`
 relay with `passthrough` (the default) or `sealed` fails validation, naming the relay: at startup the
 configuration is rejected, and a provider refresh keeps its last good snapshot and logs the error.
+The Kubernetes `Relay` CRD also rejects it at admission (see
+[Kubernetes provider](/oauthrelay/reference/kubernetes-provider/)). `rotating` needs a transient
+store shared by every serving instance; see [Rotating refresh tokens](#rotating-refresh-tokens).
 
 In every mode, including `passthrough`, a refresh token that starts with `rrt` followed by digits
 and a dot (such as `rrt1.`) is a relay handle, never an upstream token, and is never forwarded to

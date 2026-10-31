@@ -83,6 +83,9 @@ export function resourceDocuments(secretArn, clientId) {
           default: ['openid', 'email', 'profile'],
           allowed: ['openid', 'email', 'profile'],
         },
+        // Public relays must rotate. The Lambda keeps the default per-instance memory store, which
+        // is acceptable only because this script never presents a refresh token; a real Lambda
+        // deployment of a rotating relay needs OAUTHRELAY_STORE=dynamodb.
         refreshTokens: { mode: 'rotating' },
         clientAuthentication: { type: 'Public' },
         redirectPolicy: [{ loopback: 'http://127.0.0.1/oauth/callback' }],

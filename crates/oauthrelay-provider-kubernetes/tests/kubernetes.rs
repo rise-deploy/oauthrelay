@@ -281,6 +281,32 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         );
     }
 
+    // The CRD's CEL rule rejects a Public relay without rotating refresh tokens at admission.
+    for refresh_tokens in [
+        None,
+        Some(json!({})),
+        Some(json!({"mode":"passthrough"})),
+        Some(json!({"mode":"sealed"})),
+    ] {
+        let mut invalid = relay("public-without-rotation", json!({"type":"Public"}));
+        match &refresh_tokens {
+            Some(value) => invalid["spec"]["refreshTokens"] = value.clone(),
+            None => {
+                invalid["spec"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("refreshTokens");
+            }
+        }
+        let result = dynamic_relays
+            .create(&dry_run, &serde_json::from_value(invalid).unwrap())
+            .await;
+        assert!(
+            matches!(&result, Err(kube::Error::Api(status)) if status.code == 422 && status.message.contains("Public requires refreshTokens.mode: rotating")),
+            "API must reject a Public relay with {refresh_tokens:?}: {result:?}"
+        );
+    }
+
     let provider = Arc::new(
         KubernetesProvider::new(restricted, "oauthrelay", Duration::from_secs(60)).unwrap(),
     );
