@@ -39,9 +39,19 @@ const REPLAY_ASSERTION_PREFIX: &str = "replay:client-assertion:";
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
-/// How long a failed optional discovery fetch is remembered, so an upstream without a discovery
-/// document is not queried by every request that could use one.
-const DISCOVERY_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+/// How long a definite absence of an optional discovery document is remembered, so an upstream
+/// without one is not queried by every request that could use it.
+#[cfg(not(test))]
+const DISCOVERY_ABSENT_COOLDOWN: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DISCOVERY_ABSENT_COOLDOWN: Duration = Duration::from_millis(400);
+/// Deadline of every discovery and JWKS fetch, so a blackholed upstream cannot hang the requests
+/// that wait on it. Token and refresh requests are not bounded here: they use the embedder's
+/// client as configured.
+#[cfg(not(test))]
+const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 const ID_TOKEN_CLOCK_SKEW: u64 = 60;
 /// Signature algorithms accepted for `private_key_jwt` client assertions.
 const CLIENT_ASSERTION_ALGORITHMS: [Algorithm; 9] = [
@@ -72,7 +82,7 @@ impl ClientAssertionHttpClient {
 
 impl Default for ClientAssertionHttpClient {
     fn default() -> Self {
-        Self::new(reqwest::Client::builder()).expect("default client assertion HTTP client")
+        Self::new(crate::default_client_builder()).expect("default client assertion HTTP client")
     }
 }
 
@@ -100,6 +110,8 @@ struct AppState {
     /// The path of `public_url` without a trailing slash; every request path starts with it.
     route_prefix: String,
     cache: Arc<Mutex<HashMap<String, CachedJson>>>,
+    /// When the upstream's optional discovery document was last found to be absent, by URL.
+    absent_discovery: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     assertion_cache: Arc<ClientAssertionCache>,
 }
 
@@ -202,6 +214,7 @@ pub fn router(
         layout,
         route_prefix,
         cache: Arc::new(Mutex::new(HashMap::new())),
+        absent_discovery: Arc::new(Mutex::new(HashMap::new())),
         assertion_cache: Arc::default(),
     };
     Router::new().route(&route, any(dispatch)).with_state(state)
@@ -923,6 +936,8 @@ async fn validate_id_token_policy(
     // applies to.
     let jwks_uri = resolve_jwks_uri(state, upstream)
         .await
+        .ok()
+        .flatten()
         .ok_or(IdTokenValidationError::Unavailable)?;
     let value = cached_json(state, &jwks_uri, JWKS_TTL)
         .await
@@ -1646,16 +1661,17 @@ async fn verify_private_key_jwt(
 async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Response {
     let mut doc = if endpoints_need_discovery(upstream) {
         match cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await {
-            Ok(value) if value.is_object() => value,
-            Ok(_) => return StatusCode::BAD_GATEWAY.into_response(),
+            Ok(value) => value,
             Err(status) => return status.into_response(),
         }
     } else if upstream.jwks_uri.is_some() {
         json!({})
     } else {
-        optional_discovery(state, upstream)
-            .await
-            .unwrap_or_else(|| json!({}))
+        match optional_discovery(state, upstream).await {
+            Ok(Some(doc)) => doc,
+            Ok(None) => json!({}),
+            Err(status) => return status.into_response(),
+        }
     };
     let endpoints = match resolve_endpoints_from_doc(upstream, &doc) {
         Ok(value) => value,
@@ -1800,8 +1816,10 @@ fn describe_relay(doc: &mut serde_json::Map<String, Value>, relay: &Relay) {
 }
 
 async fn jwks(state: &AppState, upstream: &Upstream) -> Response {
-    let Some(url) = resolve_jwks_uri(state, upstream).await else {
-        return StatusCode::NOT_FOUND.into_response();
+    let url = match resolve_jwks_uri(state, upstream).await {
+        Ok(Some(url)) => url,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(status) => return status.into_response(),
     };
     match cached_json(state, &url, JWKS_TTL).await {
         Ok(value) => Json(value).into_response(),
@@ -1828,43 +1846,69 @@ async fn resolve_endpoints(
     resolve_endpoints_from_doc(upstream, &doc)
 }
 
-/// The upstream's JWKS URI, or `None` when it has no JWKS. Without a configured `jwks_uri` the
-/// upstream's discovery document is consulted on a best-effort basis, because an OAuth2-only
-/// upstream has none. An unreachable or malformed discovery document means "no JWKS", never an
-/// error, so callers that need a JWKS must treat `None` as a failure.
-async fn resolve_jwks_uri(state: &AppState, upstream: &Upstream) -> Option<Url> {
+/// The upstream's JWKS URI, or `None` when the upstream definitely has no JWKS. Without a
+/// configured `jwks_uri` the upstream's discovery document is consulted, because an OAuth2-only
+/// upstream has none. An upstream that cannot be reached is an error, not an absence: callers
+/// that need a JWKS fail on both, and callers that can do without one must not mistake an outage
+/// for a missing JWKS.
+async fn resolve_jwks_uri(
+    state: &AppState,
+    upstream: &Upstream,
+) -> Result<Option<Url>, StatusCode> {
     if upstream.jwks_uri.is_some() {
-        return upstream.jwks_uri.clone();
+        return Ok(upstream.jwks_uri.clone());
     }
-    url_field(&optional_discovery(state, upstream).await?, "jwks_uri")
+    Ok(optional_discovery(state, upstream)
+        .await?
+        .and_then(|doc| url_field(&doc, "jwks_uri")))
 }
 
-/// The upstream's discovery document, for the members that are optional. A failed fetch is
-/// remembered for [`DISCOVERY_RETRY_COOLDOWN`].
-async fn optional_discovery(state: &AppState, upstream: &Upstream) -> Option<Value> {
+/// The upstream's discovery document, for the members that are optional. `None` means the
+/// upstream definitely has none: it answers 404 or 410, or answers something that is not a JSON
+/// object. That answer is remembered for [`DISCOVERY_ABSENT_COOLDOWN`]. Any other failure to fetch
+/// it (a transport error, a timeout, a 5xx) is a 502 and is retried by the next request.
+async fn optional_discovery(
+    state: &AppState,
+    upstream: &Upstream,
+) -> Result<Option<Value>, StatusCode> {
     let url = discovery_url(&upstream.issuer_url);
-    let absent = format!("absent:{url}");
+    let key = url.to_string();
+    // A cached document wins over the marker, so the required and optional paths agree on it.
+    if let Some(entry) = state.cache.lock().await.get(&key) {
+        if entry.fetched.elapsed() < DISCOVERY_TTL {
+            return Ok(Some(entry.value.clone()));
+        }
+    }
     if state
-        .cache
+        .absent_discovery
         .lock()
         .await
-        .get(&absent)
-        .is_some_and(|entry| entry.fetched.elapsed() < DISCOVERY_RETRY_COOLDOWN)
+        .get(&key)
+        .is_some_and(|since| since.elapsed() < DISCOVERY_ABSENT_COOLDOWN)
     {
-        return None;
+        return Ok(None);
     }
-    match cached_json(state, &url, DISCOVERY_TTL).await {
-        Ok(doc) if doc.is_object() => Some(doc),
-        _ => {
+    match fetch_json_object(&state.cfg.http, &url).await {
+        Ok(doc) => {
+            state.absent_discovery.lock().await.remove(&key);
             state.cache.lock().await.insert(
-                absent,
+                key,
                 CachedJson {
                     fetched: std::time::Instant::now(),
-                    value: Value::Null,
+                    value: doc.clone(),
                 },
             );
-            None
+            Ok(Some(doc))
         }
+        Err(FetchFailure::Absent) => {
+            state
+                .absent_discovery
+                .lock()
+                .await
+                .insert(key, std::time::Instant::now());
+            Ok(None)
+        }
+        Err(FetchFailure::Unavailable) => Err(StatusCode::BAD_GATEWAY),
     }
 }
 
@@ -1956,6 +2000,42 @@ async fn client_assertion_jwks(
     Ok(set)
 }
 
+/// Why a metadata document could not be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FetchFailure {
+    /// The upstream definitely has no such document: it answers 404 or 410, or answers 2xx with
+    /// something that is not a JSON object.
+    Absent,
+    /// Nothing is known about the document: a transport error, a timeout, or any other status.
+    Unavailable,
+}
+
+/// Fetches a JSON object within [`METADATA_FETCH_TIMEOUT`]. Only objects are returned, so only
+/// objects are ever cached.
+async fn fetch_json_object(http: &reqwest::Client, url: &Url) -> Result<Value, FetchFailure> {
+    let response = http
+        .get(url.clone())
+        .timeout(METADATA_FETCH_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| FetchFailure::Unavailable)?;
+    let status = response.status();
+    if matches!(status.as_u16(), 404 | 410) {
+        return Err(FetchFailure::Absent);
+    }
+    if !status.is_success() {
+        return Err(FetchFailure::Unavailable);
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| FetchFailure::Unavailable)?;
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => Ok(value),
+        _ => Err(FetchFailure::Absent),
+    }
+}
+
 async fn cached_json(state: &AppState, url: &Url, ttl: Duration) -> Result<Value, StatusCode> {
     cached_json_with_client(&state.cache, &state.cfg.http, url, ttl).await
 }
@@ -1975,15 +2055,9 @@ async fn cached_json_with_client(
             }
         }
     }
-    let response = http
-        .get(url.clone())
-        .send()
+    let value = fetch_json_object(http, url)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if !response.status().is_success() {
-        return Err(StatusCode::BAD_GATEWAY);
-    }
-    let value: Value = response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
     cache.lock().await.insert(
         key,
         CachedJson {

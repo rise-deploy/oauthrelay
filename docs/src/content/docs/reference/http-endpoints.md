@@ -178,8 +178,9 @@ upstream issuer. Configure transparent-relay relying parties with manual endpoin
 
 The document starts from the upstream's discovery metadata (or an empty document when the
 authorization, token, and JWKS endpoints are all configured explicitly, or when an upstream with
-explicit authorization and token endpoints has no reachable discovery document) and keeps what still holds for a client of the relay: the
-issuer, `jwks_uri` (omitted when the upstream has no JWKS), `userinfo_endpoint` (it takes the upstream access token, which the relay never
+explicit authorization and token endpoints definitely has no discovery document) and keeps what
+still holds for a client of the relay: the issuer, `jwks_uri` (omitted when the upstream has no
+JWKS), `userinfo_endpoint` (it takes the upstream access token, which the relay never
 replaces), `end_session_endpoint`, ID-token, claim, and subject-type members, and members
 oauthrelay does not recognize, except endpoints. Members that describe the relay's own endpoints
 are replaced:

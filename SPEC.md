@@ -259,12 +259,16 @@ unvalidated redirect URI is never reflected into a response.
 - Discovery and JWKS responses are cached for bounded TTLs.
 - Endpoint resolution: `authorization_endpoint` and `token_endpoint` are required, from configuration
   or else from the upstream discovery document (502 when it cannot be fetched). `jwks_uri` is
-  optional: configured, else taken from a best-effort discovery fetch, else absent. A failed
-  best-effort fetch means "no JWKS" (discovery omits `jwks_uri`, `/jwks` answers 404) and is not
-  retried for 30 seconds. Configuring both required endpoints never makes a request 502 because of
-  discovery. ID-token validation (`requiredIdTokenClaims`, `idTokenPolicy`, and the `azp` and
-  `at_hash` checks) needs the JWKS and fails closed with 502 `server_error`, leaving the code
-  unconsumed, when there is none.
+  optional: configured, else taken from the discovery document, else absent. The upstream
+  definitely has no JWKS when discovery answers 404 or 410, answers 2xx with something that is not
+  a JSON object, or is a valid document without `jwks_uri`: relay discovery then omits `jwks_uri`,
+  `/jwks` answers 404, and the absence is not re-checked for 30 seconds. A transport error, a
+  timeout (10 seconds per discovery or JWKS fetch), or any other status is "cannot be asked", not
+  "no JWKS": discovery and `/jwks` answer 502 and the next request asks again. Only JSON objects
+  are cached. Configuring both required endpoints and `jwks_uri` never requests discovery.
+  ID-token validation (`requiredIdTokenClaims`, `idTokenPolicy`, and the `azp` and `at_hash`
+  checks) needs the JWKS and fails closed with 502 `server_error`, leaving the code unconsumed,
+  when there is none or it cannot be fetched.
 
 ## Transient store
 

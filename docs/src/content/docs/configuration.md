@@ -93,15 +93,21 @@ required: an omitted one is resolved from `{issuerUrl}/.well-known/openid-config
 relay answers 502 while that document cannot be fetched. Configure both and oauthrelay does not need
 the discovery document for them.
 
-The JWKS is optional. Without `spec.endpoints.jwks`, oauthrelay fetches the discovery document on a
-best-effort basis and uses its `jwks_uri`. When that document is unreachable, malformed, or has no
-`jwks_uri`, the upstream has no JWKS: the relay's discovery metadata omits `jwks_uri`, its `/jwks`
-endpoint answers 404, and nothing answers 502 on account of it. A failed fetch is not retried for 30
-seconds. The issuer remains upstream-owned by the relay contract.
+The JWKS is optional. Without `spec.endpoints.jwks`, oauthrelay consults the discovery document
+and uses its `jwks_uri`. The upstream has no JWKS when the document is definitely absent: it
+answers 404 or 410, answers with something that is not a JSON object, or is a valid document
+without `jwks_uri`. Then the relay's discovery metadata omits `jwks_uri` and its `/jwks` endpoint
+answers 404. oauthrelay does not look for an absent document again for 30 seconds.
+
+An upstream that cannot be asked is not an upstream without a JWKS. A transport error, a timeout
+(each fetch of discovery or JWKS metadata has a 10 second deadline), or any other status, such as a
+5xx, makes relay discovery and `/jwks` answer 502, and the next request asks again. The issuer
+remains upstream-owned by the relay contract.
 
 A relay with `requiredIdTokenClaims` or `idTokenPolicy` must verify the upstream ID token, which
-needs the JWKS. When the upstream has none, authorization-code redemption fails closed with HTTP
-502 `server_error` and the code stays unconsumed; the relay never admits an unverified ID token.
+needs the JWKS. When the upstream has none, or cannot be asked for it, authorization-code redemption
+fails closed with HTTP 502 `server_error` and the code stays unconsumed; the relay never admits an
+unverified ID token.
 Do not configure either policy for an upstream that issues no ID tokens.
 
 ## Relay
@@ -191,12 +197,12 @@ authorization-code token request must still repeat the exact redirect URI stored
 `requiredIdTokenClaims` applies to successful authorization-code exchanges. oauthrelay verifies
 the upstream ID-token signature, issuer, audience, lifetime, subject, issued-at time, nonce when
 requested, authorized party, and access-token hash when present, using the upstream JWKS. When the
-upstream has no JWKS, redemption fails closed with `server_error` instead of skipping verification.
-Every configured claim must exist
-as a string with the exact configured value. The policy reads only signed ID-token claims; it does
-not read UserInfo. A failed policy returns `invalid_grant` without returning upstream tokens. Relay
-codes remain single-use after a failed check. Refresh grants do not evaluate this policy because an
-upstream refresh response does not always contain an ID token.
+upstream has no JWKS, or it cannot be fetched, redemption fails closed with `server_error` instead
+of skipping verification. Every configured claim must exist as a string with the exact configured
+value. The policy reads only signed ID-token claims; it does not read UserInfo. A failed policy
+returns `invalid_grant` without returning upstream tokens. Relay codes remain single-use after a
+failed check. Refresh grants do not evaluate this policy because an upstream refresh response does
+not always contain an ID token.
 
 ### ID-token admission policy
 
@@ -622,9 +628,11 @@ Rust embedders configure trust-fetch TLS roots through
 `ClientAssertionHttpClient::new(reqwest::ClientBuilder)` and supply the result as
 `RelayConfig.client_assertion_http`. Its constructor enforces the redirect policy and deadline.
 The `RelayConfig.http` client controls upstream traffic independently.
-Both clients are `reqwest` 0.13 types, so an embedder must use the same major version. The
-standalone service builds its clients with the bundled Mozilla root certificates rather than the
-host's store; an embedder's builder chooses its own roots.
+Both clients are `reqwest` 0.13 types, so an embedder must use the same major version.
+`oauthrelay_core::default_client_builder()` returns a builder that trusts the bundled Mozilla root
+certificates (`webpki-roots`) instead of the host's store, so it also works in container images
+without a system CA bundle. The standalone service and `ClientAssertionHttpClient::default()` use
+it. A `reqwest::Client::new()` uses the platform verifier, which fails to build in such images.
 
 ```yaml
 clientAuthentication:

@@ -46,7 +46,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
-webpki-root-certs.workspace = true
 
 [[bin]]
 name = "oauthrelay"

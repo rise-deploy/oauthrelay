@@ -13,7 +13,7 @@
 //!     public_url: "https://rise.example.com/oidc".parse().unwrap(),
 //!     sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
 //!     store: None,
-//!     http: reqwest::Client::new(),
+//!     http: oauthrelay_core::default_client_builder().build().unwrap(),
 //!     client_assertion_http: Default::default(),
 //!     redirect: Default::default(),
 //! };
@@ -23,6 +23,7 @@
 //! ```
 
 mod config;
+mod http_client;
 mod id_token_policy;
 mod jwks;
 mod layout;
@@ -35,6 +36,7 @@ mod seal;
 mod store;
 
 pub use config::*;
+pub use http_client::default_client_builder;
 pub use id_token_policy::*;
 pub use jwks::*;
 pub use layout::*;

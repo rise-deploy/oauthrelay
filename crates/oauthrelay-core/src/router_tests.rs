@@ -263,6 +263,8 @@ struct SignedFixtureState {
     authorize: Arc<StdMutex<Vec<(String, String)>>>,
     claim_overrides: Arc<StdMutex<serde_json::Map<String, Value>>>,
     discovery: Arc<StdMutex<SignedDiscovery>>,
+    /// How many times the discovery endpoint was requested.
+    discovery_hits: Arc<AtomicUsize>,
 }
 
 /// What the signed fixture's discovery endpoint serves.
@@ -270,20 +272,41 @@ struct SignedFixtureState {
 enum SignedDiscovery {
     Full,
     WithoutJwks,
-    Unavailable,
+    NotFound,
+    Gone,
+    ServerError,
+    /// Never answers.
+    Hang,
+    NotJson,
+    /// A JSON document that is not an object.
+    Array,
 }
 
-/// Whether the signed fixture's upstream configures its JWKS.
+/// What the signed fixture's upstream configures explicitly.
 #[derive(Clone, Copy)]
 enum SignedJwks {
+    /// Authorization, token, and JWKS endpoints.
     Configured,
+    /// Authorization and token endpoints, without a JWKS.
     Unconfigured,
+    /// Nothing: every endpoint comes from discovery.
+    Discovered,
 }
 
 async fn signed_discovery(State(state): State<SignedFixtureState>) -> Response {
+    state.discovery_hits.fetch_add(1, Ordering::SeqCst);
     let mode = *state.discovery.lock().unwrap();
-    if matches!(mode, SignedDiscovery::Unavailable) {
-        return StatusCode::NOT_FOUND.into_response();
+    match mode {
+        SignedDiscovery::NotFound => return StatusCode::NOT_FOUND.into_response(),
+        SignedDiscovery::Gone => return StatusCode::GONE.into_response(),
+        SignedDiscovery::ServerError => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        SignedDiscovery::Hang => {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return StatusCode::OK.into_response();
+        }
+        SignedDiscovery::NotJson => return "<html>not discovery</html>".into_response(),
+        SignedDiscovery::Array => return Json(json!(["not", "an", "object"])).into_response(),
+        SignedDiscovery::Full | SignedDiscovery::WithoutJwks => {}
     }
     let mut doc = json!({
         "issuer": state.issuer,
@@ -489,6 +512,7 @@ async fn setup_signed_upstream(
         authorize: Arc::new(StdMutex::new(Vec::new())),
         claim_overrides: Arc::new(StdMutex::new(serde_json::Map::new())),
         discovery: Arc::new(StdMutex::new(SignedDiscovery::Full)),
+        discovery_hits: Arc::new(AtomicUsize::new(0)),
     };
     let idp = Router::new()
         .route("/.well-known/openid-configuration", get(signed_discovery))
@@ -512,8 +536,10 @@ async fn setup_signed_upstream(
     let upstream = Arc::new(Upstream {
         key: key.clone(),
         issuer_url: Url::parse(&fixture.issuer).unwrap(),
-        authorization_endpoint: Some(base.join("authorize").unwrap()),
-        token_endpoint: Some(base.join("token").unwrap()),
+        authorization_endpoint: (!matches!(jwks_source, SignedJwks::Discovered))
+            .then(|| base.join("authorize").unwrap()),
+        token_endpoint: (!matches!(jwks_source, SignedJwks::Discovered))
+            .then(|| base.join("token").unwrap()),
         jwks_uri: matches!(jwks_source, SignedJwks::Configured).then(|| base.join("jwks").unwrap()),
         client_id: "upstream-client".into(),
         client_secret: SecretString::new("upstream-secret"),
@@ -2764,14 +2790,13 @@ async fn explicit_endpoints_with_a_discovery_document_lacking_jwks_uri_have_no_j
     task.abort();
 }
 
-/// Redeems the signed fixture's code at the relay, as its Cognito-shaped confidential client.
-async fn redeem_signed_code(app: &Router, redirect_uri: &str) -> Response {
-    let (code, verifier) = signed_authorization_code(app, redirect_uri).await;
+/// Redeems a code of the signed fixture at the relay, as its Cognito-shaped confidential client.
+async fn redeem_code(app: &Router, redirect_uri: &str, code: &str, verifier: &str) -> Response {
     let form = serde_urlencoded::to_string([
         ("grant_type", "authorization_code"),
-        ("code", code.as_str()),
+        ("code", code),
         ("redirect_uri", redirect_uri),
-        ("code_verifier", verifier.as_str()),
+        ("code_verifier", verifier),
         ("client_id", "upstream-client"),
         ("client_secret", "upstream-secret"),
     ])
@@ -2779,42 +2804,95 @@ async fn redeem_signed_code(app: &Router, redirect_uri: &str) -> Response {
     post_token(app, "profile", &form).await
 }
 
+/// Obtains a fresh code from the signed fixture and redeems it once.
+async fn redeem_signed_code(app: &Router, redirect_uri: &str) -> Response {
+    let (code, verifier) = signed_authorization_code(app, redirect_uri).await;
+    redeem_code(app, redirect_uri, &code, &verifier).await
+}
+
+async fn get_status(app: &Router, path: &str) -> StatusCode {
+    app.clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+fn id_token_policy_requiring_verified_email() -> crate::IdTokenPolicy {
+    serde_json::from_value(json!({"required": {"email_verified": {"booleanEquals": true}}}))
+        .unwrap()
+}
+
+fn required_email_claim() -> HashMap<String, String> {
+    HashMap::from([("email".to_owned(), "person@example.com".to_owned())])
+}
+
+/// Longer than the test build's absence cooldown.
+async fn outlast_the_absence_cooldown() {
+    tokio::time::sleep(DISCOVERY_ABSENT_COOLDOWN + Duration::from_millis(200)).await;
+}
+
+/// An upstream without a JWKS configured, whose discovery document the test controls.
+async fn setup_signed_without_jwks() -> (Router, SignedFixtureState, tokio::task::JoinHandle<()>) {
+    let (app, fixture, task, _, _) = setup_signed_upstream(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Unconfigured,
+    )
+    .await;
+    (app, fixture, task)
+}
+
 #[tokio::test]
 async fn id_token_validation_fails_closed_when_the_upstream_has_no_jwks() {
-    let policy = || -> crate::IdTokenPolicy {
-        serde_json::from_value(json!({"required": {"email_verified": {"booleanEquals": true}}}))
-            .unwrap()
+    let combinations = || {
+        [
+            (required_email_claim(), None),
+            (
+                HashMap::new(),
+                Some(id_token_policy_requiring_verified_email()),
+            ),
+            (
+                required_email_claim(),
+                Some(id_token_policy_requiring_verified_email()),
+            ),
+        ]
     };
-    let claims = || HashMap::from([("email".to_owned(), "person@example.com".to_owned())]);
-    for discovery in [SignedDiscovery::Unavailable, SignedDiscovery::WithoutJwks] {
-        for (required, policy) in [
-            (claims(), None),
-            (HashMap::new(), Some(policy())),
-            (claims(), Some(policy())),
-        ] {
-            let (app, fixture, task, redirect_uri, _) = setup_signed_upstream(
-                RelayProfile::Cognito,
-                required,
-                policy,
-                SignedJwks::Unconfigured,
-            )
-            .await;
-            *fixture.discovery.lock().unwrap() = discovery;
-            let response = redeem_signed_code(&app, &redirect_uri).await;
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
-            assert_eq!(body["error"], "server_error");
-            assert!(body.get("access_token").is_none());
-            assert!(body.get("id_token").is_none());
-            task.abort();
-        }
+    // Every way the JWKS can be missing, whether the upstream has none or cannot be asked,
+    // rejects the redemption, with each kind of policy.
+    let modes = [
+        SignedDiscovery::NotFound,
+        SignedDiscovery::Gone,
+        SignedDiscovery::WithoutJwks,
+        SignedDiscovery::NotJson,
+        SignedDiscovery::Array,
+        SignedDiscovery::ServerError,
+    ];
+    for (index, mode) in modes.into_iter().enumerate() {
+        let (required, policy) = combinations().into_iter().nth(index % 3).unwrap();
+        let (app, fixture, task, redirect_uri, _) = setup_signed_upstream(
+            RelayProfile::Cognito,
+            required,
+            policy,
+            SignedJwks::Unconfigured,
+        )
+        .await;
+        *fixture.discovery.lock().unwrap() = mode;
+        let response = redeem_signed_code(&app, &redirect_uri).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{index}");
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body["error"], "server_error");
+        assert!(body.get("access_token").is_none());
+        assert!(body.get("id_token").is_none());
+        task.abort();
     }
 
     // The same upstream admits the token once discovery supplies the JWKS.
     let (app, _, task, redirect_uri, _) = setup_signed_upstream(
         RelayProfile::Cognito,
-        claims(),
-        Some(policy()),
+        required_email_claim(),
+        Some(id_token_policy_requiring_verified_email()),
         SignedJwks::Unconfigured,
     )
     .await;
@@ -2822,6 +2900,174 @@ async fn id_token_validation_fails_closed_when_the_upstream_has_no_jwks() {
         redeem_signed_code(&app, &redirect_uri).await.status(),
         StatusCode::OK
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_failed_redemption_without_a_jwks_leaves_the_code_unconsumed() {
+    for mode in [SignedDiscovery::NotFound, SignedDiscovery::ServerError] {
+        let (app, fixture, task, redirect_uri, _) = setup_signed_upstream(
+            RelayProfile::Cognito,
+            required_email_claim(),
+            None,
+            SignedJwks::Unconfigured,
+        )
+        .await;
+        *fixture.discovery.lock().unwrap() = mode;
+        let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+        for _ in 0..2 {
+            let response = redeem_code(&app, &redirect_uri, &code, &verifier).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+            assert_eq!(body["error"], "server_error");
+        }
+        // Once the JWKS is available, the same code redeems, and only once.
+        *fixture.discovery.lock().unwrap() = SignedDiscovery::Full;
+        outlast_the_absence_cooldown().await;
+        let response = redeem_code(&app, &redirect_uri, &code, &verifier).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let replay = redeem_code(&app, &redirect_uri, &code, &verifier).await;
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_definite_absence_of_discovery_means_no_jwks_and_is_remembered_briefly() {
+    for mode in [
+        SignedDiscovery::NotFound,
+        SignedDiscovery::Gone,
+        SignedDiscovery::NotJson,
+        SignedDiscovery::Array,
+    ] {
+        let (app, fixture, task) = setup_signed_without_jwks().await;
+        *fixture.discovery.lock().unwrap() = mode;
+        let discovery = relay_discovery(&app, "profile").await;
+        assert!(discovery.get("jwks_uri").is_none(), "{discovery}");
+        assert_eq!(
+            get_status(&app, "/relay/profile/jwks").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_status(&app, "/relay/profile/jwks").await,
+            StatusCode::NOT_FOUND
+        );
+        // One fetch answered all three requests.
+        assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 1);
+
+        // After the cooldown the document is looked for again. A malformed one was not cached
+        // as if it were a document, so a valid one replaces it at once.
+        outlast_the_absence_cooldown().await;
+        assert_eq!(
+            get_status(&app, "/relay/profile/jwks").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 2);
+        *fixture.discovery.lock().unwrap() = SignedDiscovery::Full;
+        outlast_the_absence_cooldown().await;
+        assert_eq!(
+            get_status(&app, "/relay/profile/jwks").await,
+            StatusCode::OK
+        );
+        assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 3);
+        // A fetched document is cached: the upstream's later answers do not matter.
+        *fixture.discovery.lock().unwrap() = SignedDiscovery::NotFound;
+        assert!(relay_discovery(&app, "profile").await["jwks_uri"].is_string());
+        assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 3);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_upstream_is_a_502_and_never_a_degraded_discovery_document() {
+    let (app, fixture, task) = setup_signed_without_jwks().await;
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::ServerError;
+    for _ in 0..2 {
+        assert_eq!(
+            get_status(&app, "/relay/profile/.well-known/openid-configuration").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            get_status(&app, "/relay/profile/jwks").await,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+    // An outage is not remembered: every request asks again.
+    assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 4);
+
+    // A blackholed upstream times out into the same 502, within the fetch deadline.
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::Hang;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        get_status(&app, "/relay/profile/.well-known/openid-configuration").await,
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::BAD_GATEWAY
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
+
+    // The upstream recovers at once.
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::Full;
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::OK
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_configured_jwks_uri_never_asks_for_discovery() {
+    let (app, fixture, task, _, _) = setup_signed_upstream(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Configured,
+    )
+    .await;
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::NotFound;
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::OK
+    );
+    assert!(relay_discovery(&app, "profile").await["jwks_uri"].is_string());
+    assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_remembered_absence_does_not_hide_a_document_the_required_path_fetched() {
+    // Nothing is configured, so the authorization endpoint needs discovery while the JWKS only
+    // consults it when it can.
+    let (app, fixture, task, redirect_uri, _) = setup_signed_upstream(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Discovered,
+    )
+    .await;
+    let authorize = format!(
+        "/relay/profile/authorize?redirect_uri={}&state=s&scope=openid",
+        url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>()
+    );
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::NotFound;
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::NOT_FOUND
+    );
+    // The required path does not take the optional path's word for it.
+    assert_eq!(get_status(&app, &authorize).await, StatusCode::BAD_GATEWAY);
+    assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 2);
+
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::Full;
+    assert_eq!(get_status(&app, &authorize).await, StatusCode::FOUND);
+    // Within the cooldown of the earlier absence, the fetched document is used.
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::OK
+    );
+    assert_eq!(fixture.discovery_hits.load(Ordering::SeqCst), 3);
     task.abort();
 }
 
@@ -3817,6 +4063,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
         layout: default_layout(KeyStrategy::SingleSegment),
         route_prefix: String::new(),
         cache: Arc::new(Mutex::new(HashMap::new())),
+        absent_discovery: Arc::default(),
         assertion_cache: Arc::default(),
     };
     let state = make_state(Some(cache.clone() as Arc<dyn TransientStore>));
@@ -3937,6 +4184,7 @@ fn assertion_test_state() -> AppState {
         layout: default_layout(KeyStrategy::SingleSegment),
         route_prefix: String::new(),
         cache: Arc::default(),
+        absent_discovery: Arc::default(),
         assertion_cache: Arc::default(),
     }
 }
