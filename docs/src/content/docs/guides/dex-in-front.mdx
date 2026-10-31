@@ -238,7 +238,7 @@ issuer, so `iss` and `aud` are Dex's and the Dex client's, as described in the
 
 Choose it when Dex cannot be upgraded, or when an application wants oauthrelay's own features
 directly: redirect policies, `PrivateKeyJwt` client authentication, or sealed and rotating refresh
-tokens for browser clients.
+tokens. Browser clients use `Public` relays, which accept only rotating refresh tokens.
 
 See [Configuration](/oauthrelay/configuration/) for the complete `Upstream` and `Relay` field
 reference, and the [Dex OIDC connector documentation](https://dexidp.io/docs/connectors/oidc/) for

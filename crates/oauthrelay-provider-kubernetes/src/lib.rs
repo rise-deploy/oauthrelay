@@ -64,7 +64,9 @@ impl JsonSchema for KubernetesRelaySpec {
         "KubernetesRelaySpec".into()
     }
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schema::structural::<RelayResourceSpec>()
+        let mut schema = schema::structural::<RelayResourceSpec>();
+        schema::require_rotating_for_public(&mut schema);
+        schema
     }
 }
 

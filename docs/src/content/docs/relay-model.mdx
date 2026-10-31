@@ -39,8 +39,10 @@ oauthrelay. Amazon Cognito is a useful example because its OIDC provider configu
 of those fields independently.
 
 :::caution
-Metadata served below an oauthrelay URL preserves the upstream `issuer` and `jwks_uri` and rewrites
-the authorization and token endpoints. It is useful as relay metadata, but it is not a portable
+Metadata served below an oauthrelay URL preserves the upstream `issuer` and `jwks_uri`, rewrites
+the authorization and token endpoints, and describes the relay's own capabilities, such as its
+token endpoint authentication methods (see
+[Transparent metadata](/oauthrelay/reference/http-endpoints/#transparent-metadata)). It is useful as relay metadata, but it is not a portable
 OIDC Discovery contract: standard discovery requires the metadata URL and advertised issuer to
 identify the same issuer.
 :::

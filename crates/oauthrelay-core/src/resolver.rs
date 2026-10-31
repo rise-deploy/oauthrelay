@@ -152,7 +152,7 @@ mod tests {
             key: ResourceKey::new(key).unwrap(),
             upstream: ResourceKey::new(upstream).unwrap(),
             generation: None,
-            client_auth: ClientAuth::Public,
+            client_auth: ClientAuth::UpstreamClient,
             scopes: vec![],
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),

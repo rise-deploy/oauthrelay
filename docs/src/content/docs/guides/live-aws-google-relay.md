@@ -64,10 +64,15 @@ Each run has a unique `oauthrelay-e2e-<run-id>` namespace. The script creates:
 
 - a temporary private ECR repository containing the selected single-architecture image;
 - a Secrets Manager secret for the Google client secret;
-- one SSM `Upstream` and one public `Relay` resource;
+- one SSM `Upstream` and one `Public` `Relay` resource with rotating refresh tokens;
 - a least-privilege Lambda execution role;
 - a Lambda function and unauthenticated Function URL; and
 - the function's CloudWatch log group when Lambda emits logs.
+
+The relay is `Public`, so it must use rotating refresh tokens, yet the function keeps the default
+per-instance memory store. That is acceptable only because the test never presents a refresh
+token; a Lambda deployment that serves refresh grants of a rotating relay needs
+`OAUTHRELAY_STORE=dynamodb` (see [Transient store](/oauthrelay/reference/transient-store/)).
 
 The Function URL is intentionally public for the duration of this test. oauthrelay is served below
 its `/oidc` public base, while `/readyz` remains at the Function URL root. The run-scoped SSM

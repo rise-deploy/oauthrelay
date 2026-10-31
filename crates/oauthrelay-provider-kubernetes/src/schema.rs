@@ -15,6 +15,20 @@ pub(crate) fn structural<T: JsonSchema>() -> Schema {
     Schema::try_from(value).expect("generated schema is an object")
 }
 
+/// Rejects a `Public` relay without rotating refresh tokens at admission, the rule
+/// `Relay::validate` enforces when the provider compiles the namespace. Without it the API server
+/// would accept such a relay, and the invalid snapshot would hold back every later change in the
+/// namespace. `refreshTokens` and its `mode` may be omitted, which means `passthrough`.
+pub(crate) fn require_rotating_for_public(schema: &mut Schema) {
+    schema.insert(
+        "x-kubernetes-validations".into(),
+        json!([{
+            "rule": "self.clientAuthentication.type != 'Public' || (has(self.refreshTokens) && has(self.refreshTokens.mode) && self.refreshTokens.mode == 'rotating')",
+            "message": "clientAuthentication.type: Public requires refreshTokens.mode: rotating"
+        }]),
+    );
+}
+
 /// Hoists object properties out of schemars unions to satisfy Kubernetes structural
 /// schema rules while preserving each alternative's validation constraints. The
 /// `allOf` wrappers keep kube's schema rewriter from hoisting those constraints too.
