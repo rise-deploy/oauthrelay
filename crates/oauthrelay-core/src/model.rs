@@ -203,11 +203,28 @@ pub enum RefreshTokenMode {
     Rotating,
 }
 
+/// Development-time widenings of redirect and CORS matching, set by the serving `RelayConfig`.
+///
+/// Both default to off. A widening never applies unless its flag is on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RedirectOptions {
+    /// Loopback matchers also match the hosts `localhost` and `*.localhost` (RFC 6761 §6.3).
+    pub allow_localhost_loopback: bool,
+    /// `Origin` matchers may name and match `http://` origins.
+    pub allow_http_origins: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub enum RedirectMatcher {
+    /// One complete redirect URI, compared exactly.
     Uri(String),
+    /// Every path and query at one origin. HTTPS, or HTTP when
+    /// [`RedirectOptions::allow_http_origins`] is on.
     Origin(Origin),
+    /// One exact path and query on an IP-literal loopback host, on any port.
     Loopback(String),
+    /// Every path and query on an IP-literal loopback host, on any port.
+    LoopbackOrigin(Origin),
 }
 
 impl RedirectMatcher {
@@ -225,9 +242,38 @@ impl RedirectMatcher {
         Ok(Self::Origin(origin))
     }
 
+    /// An `http://` origin matcher. It matches only while
+    /// [`RedirectOptions::allow_http_origins`] is on, and [`Relay::validate_for`] rejects it
+    /// otherwise.
+    pub fn http_origin(value: &str) -> Result<Self, String> {
+        let origin = Origin::parse(value)?;
+        if origin.url().scheme() != "http" {
+            return Err("must use http".into());
+        }
+        Ok(Self::Origin(origin))
+    }
+
     pub fn loopback(value: &str) -> Result<Self, String> {
         validate_loopback_uri(value)?;
         Ok(Self::Loopback(value.to_owned()))
+    }
+
+    /// `http://127.0.0.1` or `http://[::1]`: any port, path, and query on that host.
+    pub fn loopback_origin(value: &str) -> Result<Self, String> {
+        let error = || {
+            "must be http://127.0.0.1 or http://[::1] without a port, path, query, user information, or fragment"
+                .to_owned()
+        };
+        validate_raw_uri(value)?;
+        if !matches!(raw_path_and_query(value), Some("" | "/")) {
+            return Err(error());
+        }
+        let origin = Origin::parse(value).map_err(|_| error())?;
+        validate_loopback_origin(&origin).map_err(|_| error())?;
+        if !canonical_authority(value, origin.url()) {
+            return Err(error());
+        }
+        Ok(Self::LoopbackOrigin(origin))
     }
 
     fn identity(&self) -> String {
@@ -235,6 +281,7 @@ impl RedirectMatcher {
             Self::Uri(value) => format!("uri\0{value}"),
             Self::Origin(value) => format!("origin\0{}", value.url()),
             Self::Loopback(value) => format!("loopback\0{value}"),
+            Self::LoopbackOrigin(value) => format!("loopback_origin\0{}", value.url()),
         }
     }
 }
@@ -300,7 +347,7 @@ impl Upstream {
 }
 
 impl Relay {
-    pub fn redirect_allowed(&self, redirect: &str, allow_localhost_loopback: bool) -> bool {
+    pub fn redirect_allowed(&self, redirect: &str, options: RedirectOptions) -> bool {
         if validate_raw_uri(redirect).is_err() {
             return false;
         }
@@ -313,19 +360,28 @@ impl Relay {
         self.redirect_policy.iter().any(|matcher| match matcher {
             RedirectMatcher::Uri(value) => validate_exact_uri(value).is_ok() && value == redirect,
             RedirectMatcher::Origin(origin) => {
-                origin.url().scheme() == "https" && origin.matches(&url)
+                origin_permitted(origin, options)
+                    && origin.matches(&url)
+                    && (url.scheme() == "https" || canonical_authority(redirect, &url))
             }
             RedirectMatcher::Loopback(value) => Url::parse(value).is_ok_and(|base| {
                 validate_loopback_uri(value).is_ok()
                     && url.scheme() == "http"
-                    && loopback_host_matches(&base, &url, allow_localhost_loopback)
+                    && loopback_host_matches(&base, &url, options.allow_localhost_loopback)
+                    && canonical_authority(redirect, &url)
                     && raw_path_and_query(value)
                         .is_some_and(|tail| raw_path_and_query(redirect) == Some(tail))
             }),
+            RedirectMatcher::LoopbackOrigin(base) => {
+                validate_loopback_origin(base).is_ok()
+                    && url.scheme() == "http"
+                    && loopback_host_matches(base.url(), &url, options.allow_localhost_loopback)
+                    && canonical_authority(redirect, &url)
+            }
         })
     }
 
-    pub fn cors_origin_allowed(&self, origin: &Url, allow_localhost_loopback: bool) -> bool {
+    pub fn cors_origin_allowed(&self, origin: &Url, options: RedirectOptions) -> bool {
         if !valid_origin_url(origin) {
             return false;
         }
@@ -335,16 +391,48 @@ impl Relay {
                     && Url::parse(value).is_ok_and(|redirect| same_origin(&redirect, origin))
             }
             RedirectMatcher::Origin(allowed) => {
-                allowed.url().scheme() == "https" && allowed.matches(origin)
+                origin_permitted(allowed, options) && allowed.matches(origin)
             }
             RedirectMatcher::Loopback(value) => Url::parse(value).is_ok_and(|base| {
                 validate_loopback_uri(value).is_ok()
                     && origin.scheme() == "http"
-                    && loopback_host_matches(&base, origin, allow_localhost_loopback)
+                    && loopback_host_matches(&base, origin, options.allow_localhost_loopback)
             }),
+            RedirectMatcher::LoopbackOrigin(base) => {
+                validate_loopback_origin(base).is_ok()
+                    && origin.scheme() == "http"
+                    && loopback_host_matches(base.url(), origin, options.allow_localhost_loopback)
+            }
         })
     }
 
+    /// Validates the relay for a server running with `options`: everything [`Relay::validate`]
+    /// checks, and additionally that no matcher depends on a widening `options` leaves off, so a
+    /// relay whose matcher could never match fails loudly instead of rejecting every redirect.
+    pub fn validate_for(&self, options: RedirectOptions) -> Result<(), String> {
+        self.validate()?;
+        if !options.allow_http_origins {
+            if let Some(origin) = self
+                .redirect_policy
+                .iter()
+                .find_map(|matcher| match matcher {
+                    RedirectMatcher::Origin(origin) if origin.url().scheme() != "https" => {
+                        Some(origin)
+                    }
+                    _ => None,
+                })
+            {
+                return Err(format!(
+                    "redirect_policy origin {} uses http, which requires allow_http_origins (OAUTHRELAY_ALLOW_HTTP_ORIGINS)",
+                    origin.url().origin().ascii_serialization()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the relay's structure. `http://` origins are structurally valid here; whether the
+    /// serving configuration permits them is checked by [`Relay::validate_for`].
     pub fn validate(&self) -> Result<(), String> {
         if self
             .required_id_token_claims
@@ -387,11 +475,10 @@ impl Relay {
         for matcher in &self.redirect_policy {
             match matcher {
                 RedirectMatcher::Uri(value) => validate_exact_uri(value)?,
-                RedirectMatcher::Origin(value) if value.url().scheme() != "https" => {
-                    return Err("redirect_policy origin must use https".into())
-                }
+                // `Origin::parse` admits only http(s); `validate_for` gates http.
                 RedirectMatcher::Origin(_) => {}
                 RedirectMatcher::Loopback(value) => validate_loopback_uri(value)?,
+                RedirectMatcher::LoopbackOrigin(value) => validate_loopback_origin(value)?,
             }
             if !redirects.insert(matcher.identity()) {
                 return Err("redirect_policy must not contain duplicates".into());
@@ -509,6 +596,39 @@ fn validate_loopback_base(url: &Url) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_loopback_origin(origin: &Origin) -> Result<(), String> {
+    validate_loopback_base(origin.url())?;
+    if origin.url().path() != "/" || origin.url().query().is_some() {
+        return Err("loopback origin must not contain a path or query".into());
+    }
+    Ok(())
+}
+
+fn origin_permitted(origin: &Origin, options: RedirectOptions) -> bool {
+    match origin.url().scheme() {
+        "https" => true,
+        "http" => options.allow_http_origins,
+        _ => false,
+    }
+}
+
+/// Whether `raw` spells its scheme and authority exactly as `url` serializes them (ASCII case
+/// aside) and continues with a path, a query, or nothing. Lenient parser forms such as `http:/host`,
+/// `http:///host`, shortened or zero-padded IPv4 hosts, percent-encoded hosts, padded or explicit
+/// default ports, and empty user information never pass.
+fn canonical_authority(raw: &str, url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let prefix = match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    };
+    raw.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+        && matches!(raw.as_bytes().get(prefix.len()), None | Some(b'/' | b'?'))
+}
+
 fn valid_redirect_url(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.host().is_some()
@@ -531,7 +651,28 @@ fn is_ip_loopback(url: &Url) -> bool {
 fn loopback_host_matches(base: &Url, candidate: &Url, allow_localhost: bool) -> bool {
     base.host() == candidate.host()
         || (allow_localhost
-            && matches!(candidate.host(), Some(Host::Domain(domain)) if domain.eq_ignore_ascii_case("localhost")))
+            && matches!(candidate.host(), Some(Host::Domain(domain)) if is_localhost_name(domain)))
+}
+
+/// `localhost`, or a non-empty sequence of DNS labels ending in `.localhost` (RFC 6761 §6.3),
+/// compared without regard to ASCII case. Empty labels and a trailing dot are rejected.
+fn is_localhost_name(domain: &str) -> bool {
+    let domain = domain.to_ascii_lowercase();
+    if domain == "localhost" {
+        return true;
+    }
+    domain.len() <= 253
+        && domain.strip_suffix(".localhost").is_some_and(|labels| {
+            !labels.is_empty()
+                && labels.split('.').all(|label| {
+                    (1..=63).contains(&label.len())
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                })
+        })
 }
 
 fn raw_path_and_query(value: &str) -> Option<&str> {
@@ -566,6 +707,23 @@ pub type RelayMap = std::collections::HashMap<ResourceKey, Arc<Relay>>;
 mod tests {
     use super::*;
 
+    const OFF: RedirectOptions = RedirectOptions {
+        allow_localhost_loopback: false,
+        allow_http_origins: false,
+    };
+    const LOCALHOST: RedirectOptions = RedirectOptions {
+        allow_localhost_loopback: true,
+        allow_http_origins: false,
+    };
+    const HTTP_ORIGINS: RedirectOptions = RedirectOptions {
+        allow_localhost_loopback: false,
+        allow_http_origins: true,
+    };
+    const ALL: RedirectOptions = RedirectOptions {
+        allow_localhost_loopback: true,
+        allow_http_origins: true,
+    };
+
     #[test]
     fn redirect_matchers_are_explicit_and_distinct() {
         let relay = Relay {
@@ -585,31 +743,29 @@ mod tests {
                 RedirectMatcher::loopback("http://[::1]/oauth/callback").unwrap(),
             ],
         };
+        assert!(relay.redirect_allowed("https://exact.example/cb?channel=stable&next=%2Fhome", OFF));
+        assert!(
+            !relay.redirect_allowed("https://exact.example/cb?next=%2Fhome&channel=stable", OFF)
+        );
+        assert!(
+            !relay.redirect_allowed("https://exact.example/cb?channel=stable&next=%2fhome", OFF)
+        );
+        assert!(relay.redirect_allowed("https://preview.example.com/any/path?x=1", OFF));
+        assert!(!relay.redirect_allowed("https://preview.example.com:8443/any/path", OFF));
+        assert!(relay.redirect_allowed("http://127.0.0.1:49152/oauth/callback?source=cli", OFF));
+        assert!(relay.redirect_allowed("http://[::1]:49152/oauth/callback", OFF));
+        assert!(!relay.redirect_allowed("http://localhost:49152/oauth/callback?source=cli", OFF));
         assert!(relay.redirect_allowed(
-            "https://exact.example/cb?channel=stable&next=%2Fhome",
-            false
+            "http://localhost:49152/oauth/callback?source=cli",
+            LOCALHOST
         ));
-        assert!(!relay.redirect_allowed(
-            "https://exact.example/cb?next=%2Fhome&channel=stable",
-            false
-        ));
-        assert!(!relay.redirect_allowed(
-            "https://exact.example/cb?channel=stable&next=%2fhome",
-            false
-        ));
-        assert!(relay.redirect_allowed("https://preview.example.com/any/path?x=1", false));
-        assert!(!relay.redirect_allowed("https://preview.example.com:8443/any/path", false));
-        assert!(relay.redirect_allowed("http://127.0.0.1:49152/oauth/callback?source=cli", false));
-        assert!(relay.redirect_allowed("http://[::1]:49152/oauth/callback", false));
-        assert!(!relay.redirect_allowed("http://localhost:49152/oauth/callback?source=cli", false));
-        assert!(relay.redirect_allowed("http://localhost:49152/oauth/callback?source=cli", true));
         let normalized_path = Relay {
             redirect_policy: vec![
                 RedirectMatcher::loopback("http://127.0.0.1/a/../callback").unwrap()
             ],
             ..relay.clone()
         };
-        assert!(!normalized_path.redirect_allowed("http://127.0.0.1:49152/callback", false));
+        assert!(!normalized_path.redirect_allowed("http://127.0.0.1:49152/callback", OFF));
         for bad in [
             "http://127.0.0.1:49152\\evil/oauth/callback?source=cli",
             "http://127.0.0.1:49152\\@evil.test/oauth/callback?source=cli",
@@ -622,7 +778,7 @@ mod tests {
             "https://user@preview.example.com/cb",
             "https://preview.example.com/cb#fragment",
         ] {
-            assert!(!relay.redirect_allowed(bad, true), "{bad}");
+            assert!(!relay.redirect_allowed(bad, LOCALHOST), "{bad}");
         }
         assert!(relay.validate().is_ok());
     }
@@ -662,11 +818,308 @@ mod tests {
                 RedirectMatcher::loopback("http://127.0.0.1/callback").unwrap(),
             ],
         };
-        assert!(relay.cors_origin_allowed(&Url::parse("https://exact.example").unwrap(), false));
-        assert!(!relay.redirect_allowed("https://exact.example/other", false));
-        assert!(relay.cors_origin_allowed(&Url::parse("https://preview.example").unwrap(), false));
-        assert!(relay.cors_origin_allowed(&Url::parse("http://127.0.0.1:49152").unwrap(), false));
-        assert!(!relay.cors_origin_allowed(&Url::parse("http://localhost:49152").unwrap(), false));
-        assert!(relay.cors_origin_allowed(&Url::parse("http://localhost:49152").unwrap(), true));
+        assert!(relay.cors_origin_allowed(&Url::parse("https://exact.example").unwrap(), OFF));
+        assert!(!relay.redirect_allowed("https://exact.example/other", OFF));
+        assert!(relay.cors_origin_allowed(&Url::parse("https://preview.example").unwrap(), OFF));
+        assert!(relay.cors_origin_allowed(&Url::parse("http://127.0.0.1:49152").unwrap(), OFF));
+        assert!(!relay.cors_origin_allowed(&Url::parse("http://localhost:49152").unwrap(), OFF));
+        assert!(
+            relay.cors_origin_allowed(&Url::parse("http://localhost:49152").unwrap(), LOCALHOST)
+        );
+    }
+
+    fn relay_with(redirect_policy: Vec<RedirectMatcher>) -> Relay {
+        Relay {
+            key: ResourceKey::new("dev").unwrap(),
+            upstream: ResourceKey::new("google").unwrap(),
+            client_auth: ClientAuth::Public,
+            scopes: vec![],
+            allowed_scopes: None,
+            required_id_token_claims: HashMap::new(),
+            id_token_policy: None,
+            refresh_tokens: RefreshTokens::default(),
+            redirect_policy,
+        }
+    }
+
+    fn cors(relay: &Relay, origin: &str, options: RedirectOptions) -> bool {
+        relay.cors_origin_allowed(&Url::parse(origin).unwrap(), options)
+    }
+
+    #[test]
+    fn loopback_origin_matcher_shape() {
+        for good in [
+            "http://127.0.0.1",
+            "http://127.0.0.1/",
+            "http://[::1]",
+            "http://[::1]/",
+        ] {
+            assert!(RedirectMatcher::loopback_origin(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "https://127.0.0.1",
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1/callback",
+            "http://127.0.0.1/.",
+            "http://127.0.0.1/a/..",
+            "http://127.0.0.1//",
+            "http://127.0.0.1?",
+            "http://127.0.0.1?x=1",
+            "http://127.0.0.1#",
+            "http://127.0.0.1#x",
+            "http://user@127.0.0.1",
+            "http://@127.0.0.1",
+            "http://127.0.0.2",
+            "http://localhost",
+            "http://app.localhost",
+            "http://example.com",
+            "http://127.0.0.1\\",
+            "http:/127.0.0.1",
+            "http:127.0.0.1",
+            "ws://127.0.0.1",
+            "file:///tmp",
+            " http://127.0.0.1",
+        ] {
+            assert!(RedirectMatcher::loopback_origin(bad).is_err(), "{bad}");
+        }
+        let duplicate = relay_with(vec![
+            RedirectMatcher::loopback_origin("http://127.0.0.1").unwrap(),
+            RedirectMatcher::loopback_origin("http://127.0.0.1/").unwrap(),
+        ]);
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .contains("must not contain duplicates"));
+        let distinct = relay_with(vec![
+            RedirectMatcher::loopback_origin("http://127.0.0.1").unwrap(),
+            RedirectMatcher::loopback("http://127.0.0.1/").unwrap(),
+        ]);
+        assert!(distinct.validate().is_ok());
+    }
+
+    #[test]
+    fn loopback_origin_matches_any_port_path_and_query() {
+        let relay = relay_with(vec![
+            RedirectMatcher::loopback_origin("http://127.0.0.1").unwrap(),
+            RedirectMatcher::loopback_origin("http://[::1]").unwrap(),
+        ]);
+        assert!(relay.validate().is_ok());
+        for good in [
+            "http://127.0.0.1",
+            "http://127.0.0.1/",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3000/",
+            "http://127.0.0.1:49152/oauth/callback",
+            "http://127.0.0.1:49152/any/other/path?x=1&y=%2F",
+            "http://127.0.0.1:1/?",
+            "http://127.0.0.1?next=%2F",
+            "HTTP://127.0.0.1:8080/cb",
+            "http://[::1]:49152/auth/callback?state=x",
+        ] {
+            assert!(relay.redirect_allowed(good, OFF), "{good}");
+        }
+        for bad in [
+            // Scheme, host, and userinfo.
+            "https://127.0.0.1:49152/cb",
+            "ws://127.0.0.1:49152/cb",
+            "http://127.0.0.2:49152/cb",
+            "http://evil.test:49152/cb",
+            "http://localhost.evil.test:49152/cb",
+            "http://user@127.0.0.1:49152/cb",
+            "http://user:pass@127.0.0.1:49152/cb",
+            "http://@127.0.0.1:49152/cb",
+            "http://127.0.0.1:49152@evil.test/cb",
+            "http://127.0.0.1.evil.test/cb",
+            // Fragments.
+            "http://127.0.0.1:49152/cb#fragment",
+            "http://127.0.0.1:49152/cb#",
+            "http://evil.test#@127.0.0.1/cb",
+            // Raw-URI hygiene and lenient parser forms.
+            "http://127.0.0.1:49152\\evil/cb",
+            "http://127.0.0.1:49152\\@evil.test/cb",
+            "http:/127.0.0.1:49152/cb",
+            "http:///127.0.0.1:49152/cb",
+            "http:127.0.0.1:49152/cb",
+            "http://127.1:49152/cb",
+            "http://0x7f.0.0.1:49152/cb",
+            "http://2130706433:49152/cb",
+            "http://%31%32%37.0.0.1:49152/cb",
+            "http://127.0.0.1:049152/cb",
+            "http://127.0.0.1:80/cb",
+            "http://[0:0:0:0:0:0:0:1]:49152/cb",
+            "http://127.0.0.1:49152/c b",
+            "http://127.0.0.1:49152/cb\t",
+            "http://127.0.0.1:49152/caf\u{e9}",
+            "//127.0.0.1:49152/cb",
+            "/cb",
+        ] {
+            assert!(!relay.redirect_allowed(bad, ALL), "{bad}");
+        }
+        assert!(!relay.redirect_allowed("http://localhost:49152/cb", OFF));
+        assert!(!relay.redirect_allowed("http://localhost:49152/cb", HTTP_ORIGINS));
+        assert!(relay.redirect_allowed("http://localhost:49152/cb", LOCALHOST));
+        assert!(relay.redirect_allowed("http://app.localhost:49152/any?x=1", LOCALHOST));
+        assert!(!relay.redirect_allowed("http://app.localhost:49152/any", OFF));
+
+        assert!(cors(&relay, "http://127.0.0.1:49152", OFF));
+        assert!(cors(&relay, "http://[::1]:3000", OFF));
+        assert!(!cors(&relay, "https://127.0.0.1:49152", ALL));
+        assert!(!cors(&relay, "http://127.0.0.2:49152", ALL));
+        assert!(!cors(&relay, "http://localhost:49152", OFF));
+        assert!(cors(&relay, "http://localhost:49152", LOCALHOST));
+        assert!(cors(&relay, "http://app.localhost:49152", LOCALHOST));
+        assert!(!cors(&relay, "http://app.localhost:49152", OFF));
+
+        // The matcher does not broaden exact loopback or non-loopback matching.
+        let exact = relay_with(vec![
+            RedirectMatcher::loopback("http://127.0.0.1/cb").unwrap()
+        ]);
+        assert!(!exact.redirect_allowed("http://127.0.0.1:49152/other", ALL));
+    }
+
+    #[test]
+    fn loopback_matchers_admit_localhost_subdomains_only_under_the_flag() {
+        let relay = relay_with(vec![
+            RedirectMatcher::loopback("http://127.0.0.1/oauth/callback").unwrap(),
+            RedirectMatcher::loopback_origin("http://[::1]").unwrap(),
+        ]);
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "app.localhost",
+            "App.LocalHost",
+            "a.b.c.localhost",
+            "my-app.localhost",
+            "1.localhost",
+            "xn--bcher-kva.localhost",
+        ] {
+            let redirect = format!("http://{host}:49152/oauth/callback");
+            assert!(relay.redirect_allowed(&redirect, LOCALHOST), "{redirect}");
+            assert!(!relay.redirect_allowed(&redirect, OFF), "{redirect}");
+            assert!(
+                !relay.redirect_allowed(&redirect, HTTP_ORIGINS),
+                "{redirect}"
+            );
+            let origin = format!("http://{host}:49152");
+            assert!(cors(&relay, &origin, LOCALHOST), "{origin}");
+            assert!(!cors(&relay, &origin, OFF), "{origin}");
+        }
+        let long_label = format!("{}.localhost", "a".repeat(64));
+        let long_name = format!("{}localhost", "a.".repeat(127));
+        for host in [
+            "localhost.evil.com",
+            "evil.localhost.com",
+            "localhost.",
+            "a..localhost",
+            ".localhost",
+            "x.localhost.",
+            "xlocalhost",
+            "x-localhost",
+            "-x.localhost",
+            "x-.localhost",
+            "a_b.localhost",
+            "localhost.localhost.evil",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            let redirect = format!("http://{host}:49152/oauth/callback");
+            assert!(!relay.redirect_allowed(&redirect, ALL), "{redirect}");
+            if let Ok(origin) = Url::parse(&format!("http://{host}:49152")) {
+                assert!(!relay.cors_origin_allowed(&origin, ALL), "{host}");
+            }
+        }
+        for bad in [
+            "https://app.localhost:49152/oauth/callback",
+            "http://app.localhost:49152/oauth/callback#x",
+            "http://user@app.localhost:49152/oauth/callback",
+            "http://app.localhost%2e:49152/oauth/callback",
+            "http:/app.localhost:49152/oauth/callback",
+            "http://app.localhost:49152\\@evil.test/oauth/callback",
+        ] {
+            assert!(!relay.redirect_allowed(bad, ALL), "{bad}");
+        }
+        // The exact matcher keeps its path and query rules on localhost names.
+        assert!(relay.redirect_allowed("http://app.localhost:1/anything?x=1", LOCALHOST));
+        let exact = relay_with(vec![RedirectMatcher::loopback(
+            "http://127.0.0.1/oauth/callback",
+        )
+        .unwrap()]);
+        assert!(!exact.redirect_allowed("http://app.localhost:1/anything", LOCALHOST));
+        assert!(!exact.redirect_allowed("http://app.localhost:1/oauth/callback?x=1", LOCALHOST));
+        // Loopback names never satisfy non-loopback matchers.
+        let https = relay_with(vec![RedirectMatcher::uri("https://app.example/cb").unwrap()]);
+        assert!(!https.redirect_allowed("http://app.localhost:1/cb", ALL));
+        assert!(!cors(&https, "http://app.localhost:1", ALL));
+    }
+
+    #[test]
+    fn http_origins_match_only_under_the_flag() {
+        assert!(RedirectMatcher::http_origin("http://dev.example:3000").is_ok());
+        assert!(RedirectMatcher::http_origin("http://127.0.0.1:3000").is_ok());
+        assert!(RedirectMatcher::http_origin("https://dev.example").is_err());
+        assert!(RedirectMatcher::http_origin("http://dev.example/callback").is_err());
+        assert!(RedirectMatcher::http_origin("http://user@dev.example").is_err());
+        assert!(RedirectMatcher::http_origin("http://dev.example#x").is_err());
+        assert!(RedirectMatcher::http_origin("http://dev.example?x").is_err());
+        assert!(RedirectMatcher::http_origin("ftp://dev.example").is_err());
+
+        let relay = relay_with(vec![
+            RedirectMatcher::http_origin("http://dev.example:3000").unwrap(),
+            RedirectMatcher::origin("https://secure.example").unwrap(),
+        ]);
+        assert!(relay.validate().is_ok());
+        assert!(relay.validate_for(HTTP_ORIGINS).is_ok());
+        assert!(relay.validate_for(ALL).is_ok());
+        for options in [OFF, LOCALHOST] {
+            let error = relay.validate_for(options).unwrap_err();
+            assert!(error.contains("http://dev.example:3000"), "{error}");
+            assert!(error.contains("OAUTHRELAY_ALLOW_HTTP_ORIGINS"), "{error}");
+        }
+        let https_only = relay_with(vec![
+            RedirectMatcher::origin("https://secure.example").unwrap()
+        ]);
+        assert!(https_only.validate_for(OFF).is_ok());
+
+        for good in [
+            "http://dev.example:3000",
+            "http://dev.example:3000/",
+            "http://dev.example:3000/any/path?x=1",
+            "http://DEV.example:3000/cb",
+        ] {
+            assert!(relay.redirect_allowed(good, HTTP_ORIGINS), "{good}");
+            assert!(!relay.redirect_allowed(good, OFF), "{good}");
+            assert!(!relay.redirect_allowed(good, LOCALHOST), "{good}");
+        }
+        for bad in [
+            "https://dev.example:3000/cb",
+            "http://dev.example/cb",
+            "http://dev.example:3001/cb",
+            "http://dev.example.evil.test:3000/cb",
+            "http://dev.example:3000@evil.test/cb",
+            "http://user@dev.example:3000/cb",
+            "http://dev.example:3000/cb#fragment",
+            "http://dev.example:3000\\@evil.test/cb",
+            "http:/dev.example:3000/cb",
+            "http:///dev.example:3000/cb",
+            "http://dev.example:03000/cb",
+            "http://%64ev.example:3000/cb",
+            "http://secure.example/cb",
+        ] {
+            assert!(!relay.redirect_allowed(bad, ALL), "{bad}");
+        }
+        // The https origin keeps matching with or without the flag.
+        assert!(relay.redirect_allowed("https://secure.example/cb", OFF));
+        assert!(relay.redirect_allowed("https://secure.example/cb", HTTP_ORIGINS));
+
+        assert!(cors(&relay, "http://dev.example:3000", HTTP_ORIGINS));
+        assert!(!cors(&relay, "http://dev.example:3000", OFF));
+        assert!(!cors(&relay, "http://dev.example:3000", LOCALHOST));
+        assert!(!cors(&relay, "https://dev.example:3000", ALL));
+        assert!(!cors(&relay, "http://dev.example:3001", ALL));
+        assert!(!cors(&relay, "http://secure.example", ALL));
+        assert!(cors(&relay, "https://secure.example", OFF));
+
+        // `origin` keeps rejecting http; only `http_origin` builds one.
+        assert!(RedirectMatcher::origin("http://dev.example:3000").is_err());
     }
 }

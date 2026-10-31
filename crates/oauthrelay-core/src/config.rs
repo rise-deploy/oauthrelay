@@ -248,10 +248,12 @@ pub struct ScopePolicy {
 pub enum RedirectPolicyEntry {
     /// Match one complete redirect URI exactly.
     Uri(UriRedirectPolicy),
-    /// Match every path and query at one HTTPS origin.
+    /// Match every path and query at one HTTPS origin (HTTP when the service allows HTTP origins).
     Origin(OriginRedirectPolicy),
     /// Match one loopback path and query on any runtime port.
     Loopback(LoopbackRedirectPolicy),
+    /// Match every path and query on a loopback host on any runtime port.
+    LoopbackOrigin(LoopbackOriginRedirectPolicy),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -264,9 +266,10 @@ pub struct UriRedirectPolicy {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-/// HTTPS origin matcher.
+/// Origin matcher.
 pub struct OriginRedirectPolicy {
     /// HTTPS scheme, host, and optional port; every path and query at the origin is allowed.
+    /// HTTP origins require the service's allow-HTTP-origins development option.
     origin: String,
 }
 
@@ -276,6 +279,15 @@ pub struct OriginRedirectPolicy {
 pub struct LoopbackRedirectPolicy {
     /// HTTP URI on 127.0.0.1 or ::1 without a port; path and query match exactly.
     loopback: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Variable-port, variable-path loopback matcher.
+pub struct LoopbackOriginRedirectPolicy {
+    /// `http://127.0.0.1` or `http://[::1]` without a port or path; every port, path, and query is allowed.
+    #[serde(rename = "loopbackOrigin")]
+    loopback_origin: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -556,9 +568,15 @@ pub async fn compile_resources(
             .map(|(index, policy)| {
                 let matcher = match policy {
                     RedirectPolicyEntry::Uri(policy) => RedirectMatcher::uri(policy.uri),
-                    RedirectPolicyEntry::Origin(policy) => RedirectMatcher::origin(&policy.origin),
+                    RedirectPolicyEntry::Origin(policy) => RedirectMatcher::origin(&policy.origin)
+                        .or_else(|error| {
+                            RedirectMatcher::http_origin(&policy.origin).map_err(|_| error)
+                        }),
                     RedirectPolicyEntry::Loopback(policy) => {
                         RedirectMatcher::loopback(&policy.loopback)
+                    }
+                    RedirectPolicyEntry::LoopbackOrigin(policy) => {
+                        RedirectMatcher::loopback_origin(&policy.loopback_origin)
                     }
                 };
                 matcher
@@ -1054,6 +1072,94 @@ mod tests {
             }));
         let error = compile_resources(resources, &secrets).await.unwrap_err();
         assert!(format!("{error:#}").contains("must not contain duplicates"));
+    }
+
+    #[tokio::test]
+    async fn compiles_loopback_origin_and_http_origin_matchers() {
+        let entries: Vec<RedirectPolicyEntry> = serde_json::from_str(
+            r#"[
+                {"loopbackOrigin":"http://127.0.0.1"},
+                {"loopbackOrigin":"http://[::1]"},
+                {"origin":"http://dev.example:3000"}
+            ]"#,
+        )
+        .unwrap();
+        assert!(matches!(entries[0], RedirectPolicyEntry::LoopbackOrigin(_)));
+        assert!(matches!(entries[2], RedirectPolicyEntry::Origin(_)));
+        for invalid in [
+            r#"[{"loopbackOrigin":"http://127.0.0.1","loopback":"http://127.0.0.1/cb"}]"#,
+            r#"[{"loopbackOrigin":"http://127.0.0.1","origin":"https://app.example"}]"#,
+            r#"[{"loopback_origin":"http://127.0.0.1"}]"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Vec<RedirectPolicyEntry>>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let with_policy = |policy: Vec<RedirectPolicyEntry>| {
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "inline".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!();
+            };
+            relay.spec.redirect_policy = policy;
+            resources
+        };
+        let snapshot = compile_resources(with_policy(entries), &secrets)
+            .await
+            .unwrap();
+        let relay = snapshot.relays.values().next().unwrap();
+        assert!(relay.redirect_allowed(
+            "http://127.0.0.1:5173/any/path?x=1",
+            crate::RedirectOptions::default()
+        ));
+        // An http origin compiles, and the serving configuration decides whether it may be used.
+        let error = relay
+            .validate_for(crate::RedirectOptions::default())
+            .unwrap_err();
+        assert!(error.contains("OAUTHRELAY_ALLOW_HTTP_ORIGINS"), "{error}");
+        assert!(relay
+            .validate_for(crate::RedirectOptions {
+                allow_http_origins: true,
+                ..Default::default()
+            })
+            .is_ok());
+
+        for (policy, expected) in [
+            (
+                r#"{"loopbackOrigin":"http://127.0.0.1/callback"}"#,
+                "must be http://127.0.0.1 or http://[::1]",
+            ),
+            (
+                r#"{"loopbackOrigin":"http://127.0.0.1:8080"}"#,
+                "must be http://127.0.0.1 or http://[::1]",
+            ),
+            (
+                r#"{"loopbackOrigin":"http://localhost"}"#,
+                "must be http://127.0.0.1 or http://[::1]",
+            ),
+            (
+                r#"{"origin":"http://dev.example/callback"}"#,
+                "must contain only scheme, host, and optional port",
+            ),
+            (
+                r#"{"origin":"ftp://dev.example"}"#,
+                "must be an http(s) origin",
+            ),
+        ] {
+            let entry: RedirectPolicyEntry = serde_json::from_str(policy).unwrap();
+            let error = compile_resources(with_policy(vec![entry]), &secrets)
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("spec.redirectPolicy[0]"), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

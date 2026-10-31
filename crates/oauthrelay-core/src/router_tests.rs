@@ -458,6 +458,7 @@ async fn setup_signed_policy(
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
+            allow_http_origins: false,
         },
         KeyStrategy::SingleSegment,
     );
@@ -627,6 +628,7 @@ async fn setup_with_upstream_auth(
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
+            allow_http_origins: false,
         },
         strategy,
     );
@@ -686,6 +688,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
+            allow_http_origins: false,
         },
         KeyStrategy::SingleSegment,
     );
@@ -2709,6 +2712,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
+            allow_http_origins: false,
         }),
         keys: KeyStrategy::SingleSegment,
         cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2828,6 +2832,7 @@ fn assertion_test_state() -> AppState {
             )
             .unwrap(),
             allow_localhost_loopback: false,
+            allow_http_origins: false,
         }),
         keys: KeyStrategy::SingleSegment,
         cache: Arc::default(),
@@ -4222,6 +4227,7 @@ async fn rotating_relay_without_a_store_fails_with_a_server_error() {
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
             allow_localhost_loopback: false,
+            allow_http_origins: false,
         },
         KeyStrategy::SingleSegment,
     );
@@ -4352,4 +4358,150 @@ async fn rotating_mode_never_forwards_handle_prefixed_tokens_unopened() {
     }
     assert!(fixture.upstream_refreshes().is_empty());
     fixture.task.abort();
+}
+
+fn development_redirect_app(allow_localhost_loopback: bool, allow_http_origins: bool) -> Router {
+    let key = ResourceKey::new("dev").unwrap();
+    let upstream = Arc::new(Upstream {
+        key: key.clone(),
+        issuer_url: Url::parse("https://issuer.example").unwrap(),
+        authorization_endpoint: Some(Url::parse("https://issuer.example/authorize").unwrap()),
+        token_endpoint: Some(Url::parse("https://issuer.example/token").unwrap()),
+        jwks_uri: None,
+        client_id: "upstream-client".into(),
+        client_secret: SecretString::new("upstream-secret"),
+        token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
+    });
+    let relay = Arc::new(Relay {
+        key: key.clone(),
+        upstream: key.clone(),
+        client_auth: ClientAuth::Public,
+        scopes: vec!["openid".into()],
+        allowed_scopes: None,
+        required_id_token_claims: HashMap::new(),
+        id_token_policy: None,
+        refresh_tokens: Default::default(),
+        redirect_policy: vec![
+            RedirectMatcher::loopback_origin("http://127.0.0.1").unwrap(),
+            RedirectMatcher::http_origin("http://dev.example:3000").unwrap(),
+        ],
+    });
+    let mut resources = ProviderSnapshot::default();
+    resources.upstreams.insert(key.clone(), upstream);
+    resources.relays.insert(key, relay);
+    router(
+        Arc::new(resources),
+        RelayConfig {
+            public_url: Url::parse("https://relay.example/").unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
+            store: None,
+            http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
+            allow_localhost_loopback,
+            allow_http_origins,
+        },
+        KeyStrategy::SingleSegment,
+    )
+}
+
+async fn development_authorize(app: &Router, redirect_uri: &str) -> StatusCode {
+    let challenge = pkce_challenge("development-redirect-test-verifier-with-enough-characters");
+    let redirect: String = url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect();
+    app.clone()
+        .oneshot(
+            Request::get(format!(
+                "/relay/dev/authorize?redirect_uri={redirect}&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn development_preflight(app: &Router, origin: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::options("/relay/dev/token")
+                .header(header::ORIGIN, origin)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn http_origin_matchers_fail_the_relay_unless_allowed() {
+    let app = development_redirect_app(true, false);
+    // The relay fails validation as a whole rather than silently ignoring the http origin.
+    for redirect in [
+        "http://dev.example:3000/cb",
+        "http://127.0.0.1:5173/any/path",
+    ] {
+        assert_eq!(
+            development_authorize(&app, redirect).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{redirect}"
+        );
+    }
+    assert_eq!(
+        development_preflight(&app, "http://dev.example:3000").await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let app = development_redirect_app(false, true);
+    for redirect in [
+        "http://dev.example:3000/cb?x=1",
+        "http://127.0.0.1:5173/any/path?y=2",
+        "http://[::1]:5173/cb",
+    ] {
+        let expected = if redirect.contains("[::1]") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::FOUND
+        };
+        assert_eq!(
+            development_authorize(&app, redirect).await,
+            expected,
+            "{redirect}"
+        );
+    }
+    for redirect in [
+        "https://dev.example:3000/cb",
+        "http://dev.example:3001/cb",
+        "http://app.localhost:5173/cb",
+        "http://127.0.0.1:5173/cb#fragment",
+        "http:/127.0.0.1:5173/cb",
+    ] {
+        assert_eq!(
+            development_authorize(&app, redirect).await,
+            StatusCode::BAD_REQUEST,
+            "{redirect}"
+        );
+    }
+    assert_eq!(
+        development_preflight(&app, "http://dev.example:3000").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        development_preflight(&app, "http://127.0.0.1:5173").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        development_preflight(&app, "http://app.localhost:5173").await,
+        StatusCode::FORBIDDEN
+    );
+
+    let app = development_redirect_app(true, true);
+    assert_eq!(
+        development_authorize(&app, "http://app.localhost:5173/cb").await,
+        StatusCode::FOUND
+    );
+    assert_eq!(
+        development_preflight(&app, "http://app.localhost:5173").await,
+        StatusCode::NO_CONTENT
+    );
 }
