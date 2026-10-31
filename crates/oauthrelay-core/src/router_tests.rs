@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     refresh_handle::{open_handle, seal_handle},
     rotation::Rotator,
+    seal::FlakySealer,
     ClientAuth, DefaultLayout, KeyStrategy, MemoryStore, ProviderSnapshot, RedirectMatcher,
     RefreshTokenMode, RefreshTokens, SecretString, TokenEndpointAuthMethod, Upstream,
     XChaChaSealer, DEFAULT_GRACE_PERIOD_SECONDS, DEFAULT_MAX_LIFETIME_SECONDS,
@@ -569,6 +570,34 @@ async fn setup_with_upstream_auth(
     tokio::task::JoinHandle<()>,
     MockCapture,
 ) {
+    let sealer = Arc::new(XChaChaSealer::new(&[7_u8; 32], None).unwrap());
+    let (app, task, capture) = setup_with_sealer(
+        key,
+        auth,
+        strategy,
+        allowed_scopes,
+        endpoint_configuration,
+        refresh_tokens,
+        store,
+        token_endpoint_auth_method,
+        sealer.clone(),
+    )
+    .await;
+    (app, sealer, task, capture)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn setup_with_sealer(
+    key: &str,
+    auth: ClientAuth,
+    strategy: Arc<dyn PathLayout>,
+    allowed_scopes: Option<Vec<String>>,
+    endpoint_configuration: EndpointConfiguration,
+    refresh_tokens: RefreshTokens,
+    store: Arc<dyn TransientStore>,
+    token_endpoint_auth_method: TokenEndpointAuthMethod,
+    sealer: Arc<dyn Sealer>,
+) -> (Router, tokio::task::JoinHandle<()>, MockCapture) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let base = Url::parse(&format!("http://{address}/")).unwrap();
@@ -621,12 +650,11 @@ async fn setup_with_upstream_auth(
     let mut resources = ProviderSnapshot::default();
     resources.upstreams.insert(key.clone(), upstream);
     resources.relays.insert(key, relay);
-    let sealer = Arc::new(XChaChaSealer::new(&[7_u8; 32], None).unwrap());
     let app = router(
         Arc::new(resources),
         RelayConfig {
             public_url: Url::parse("https://relay.example/").unwrap(),
-            sealer: sealer.clone(),
+            sealer,
             store: Some(store),
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
@@ -634,7 +662,7 @@ async fn setup_with_upstream_auth(
         },
         strategy,
     );
-    (app, sealer, task, capture)
+    (app, task, capture)
 }
 
 async fn response_body(response: Response) -> Vec<u8> {
@@ -929,6 +957,7 @@ async fn sealed_mode_replaces_the_refresh_token_on_the_code_grant() {
             &ResourceKey::new("google").unwrap(),
             handle
         )
+        .await
         .unwrap()
         .upstream_token,
         "refresh"
@@ -945,7 +974,9 @@ async fn sealed_mode_replaces_the_refresh_token_on_the_code_grant() {
 async fn sealed_refresh_round_trips_through_the_upstream() {
     let (app, sealer, task, capture) = setup_sealed(ClientAuth::Public).await;
     let key = ResourceKey::new("google").unwrap();
-    let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1).unwrap();
+    let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
+        .await
+        .unwrap();
 
     let response = post_token(&app, "google", &refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -966,6 +997,7 @@ async fn sealed_refresh_round_trips_through_the_upstream() {
     let new_handle = value["refresh_token"].as_str().unwrap();
     assert_eq!(
         open_handle(sealer.as_ref(), &key, new_handle)
+            .await
             .unwrap()
             .upstream_token,
         "rotated"
@@ -996,6 +1028,7 @@ async fn sealed_refresh_without_an_upstream_refresh_token_returns_none() {
         "refresh",
         1,
     )
+    .await
     .unwrap();
     let response = post_token(&app, "google", &refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -1029,13 +1062,16 @@ async fn sealed_code_grant_without_an_upstream_refresh_token_is_unchanged() {
 async fn sealed_mode_rejects_raw_foreign_and_tampered_refresh_tokens() {
     let (app, sealer, task, capture) = setup_sealed(ClientAuth::Public).await;
     let key = ResourceKey::new("google").unwrap();
-    let valid = seal_handle(sealer.as_ref(), &key, "refresh", 1).unwrap();
+    let valid = seal_handle(sealer.as_ref(), &key, "refresh", 1)
+        .await
+        .unwrap();
     let foreign = seal_handle(
         sealer.as_ref(),
         &ResourceKey::new("other-relay").unwrap(),
         "refresh",
         1,
     )
+    .await
     .unwrap();
     let other_install = seal_handle(
         &XChaChaSealer::new(&[99_u8; 32], None).unwrap(),
@@ -1043,6 +1079,7 @@ async fn sealed_mode_rejects_raw_foreign_and_tampered_refresh_tokens() {
         "refresh",
         1,
     )
+    .await
     .unwrap();
     let mut tampered = valid.clone().into_bytes();
     *tampered.last_mut().unwrap() ^= 1;
@@ -1081,6 +1118,7 @@ async fn sealed_mode_applies_to_confidential_relays_and_checks_client_auth_first
         "rotating",
         1,
     )
+    .await
     .unwrap();
     let form = |secret: &str| {
         format!(
@@ -1432,6 +1470,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
     };
     let code = sealer
         .seal(&postcard::to_stdvec(&expired).unwrap(), b"google")
+        .await
         .unwrap();
     let form = serde_urlencoded::to_string([
         ("grant_type", "authorization_code"),
@@ -1458,6 +1497,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
     };
     let state = sealer
         .seal(&postcard::to_stdvec(&expired_flow).unwrap(), b"google")
+        .await
         .unwrap();
     let callback = app
         .clone()
@@ -1485,6 +1525,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
     };
     let state = sealer
         .seal(&postcard::to_stdvec(&disallowed_flow).unwrap(), b"google")
+        .await
         .unwrap();
     let callback = app
         .clone()
@@ -3510,6 +3551,7 @@ async fn upstream_requests_ask_for_json() {
         "refresh",
         1,
     )
+    .await
     .unwrap();
     post_token(&app, "google", &refresh_form(&handle)).await;
     let accept = capture.accept.lock().unwrap().clone();
@@ -3596,7 +3638,9 @@ async fn client_secret_basic_authenticates_sealed_refresh() {
     )
     .await;
     let key = ResourceKey::new("google").unwrap();
-    let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1).unwrap();
+    let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
+        .await
+        .unwrap();
     let response = post_token(&app, "google", &refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_basic_upstream_requests(&capture, 1);
@@ -4174,6 +4218,7 @@ async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
         "plain-json",
         1,
     )
+    .await
     .unwrap();
     let response = post_token(&app, "google", &refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -4197,6 +4242,7 @@ async fn sealed_mode_fails_closed_on_a_form_encoded_success_body() {
         "form-encoded",
         1,
     )
+    .await
     .unwrap();
     let response = post_token(&app, "google", &refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -4278,15 +4324,25 @@ async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_fai
     )
     .await;
     let key = ResourceKey::new("google").unwrap();
-    let handle = |token: &str| seal_handle(sealer.as_ref(), &key, token, 1).unwrap();
+    let handle = async |token: &str| seal_handle(sealer.as_ref(), &key, token, 1).await.unwrap();
 
-    let response = post_token(&app, "google", &refresh_form(&handle("broken-upstream"))).await;
+    let response = post_token(
+        &app,
+        "google",
+        &refresh_form(&handle("broken-upstream").await),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         response_body(response).await,
         br#"{"error":"server_error"}"#
     );
-    let response = post_token(&app, "google", &refresh_form(&handle("revoked-upstream"))).await;
+    let response = post_token(
+        &app,
+        "google",
+        &refresh_form(&handle("revoked-upstream").await),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         response_body(response).await,
@@ -4296,7 +4352,7 @@ async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_fai
     // With the upstream gone the failure is a 502 server_error, not a hang or a raw error.
     task.abort();
     let _ = task.await;
-    let response = post_token(&app, "google", &refresh_form(&handle("rotating"))).await;
+    let response = post_token(&app, "google", &refresh_form(&handle("rotating").await)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
     assert_eq!(body["error"], "server_error");
@@ -4536,6 +4592,7 @@ async fn rotating_mode_migrates_sealed_handles_and_rejects_raw_tokens() {
         "rotating",
         unix_now(),
     )
+    .await
     .unwrap();
     let (status, body) = fixture.refresh(&sealed).await;
     assert_eq!(status, StatusCode::OK);
@@ -4552,6 +4609,7 @@ async fn rotating_mode_migrates_sealed_handles_and_rejects_raw_tokens() {
         "rotating",
         unix_now() - DEFAULT_MAX_LIFETIME_SECONDS,
     )
+    .await
     .unwrap();
     let (status, body) = fixture.refresh(&expired).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -5093,4 +5151,245 @@ async fn callback_rechecks_redirect_options_after_authorize() {
         "{localhost_redirect}"
     );
     assert!(response.headers().get(header::LOCATION).is_none());
+}
+
+/// A relay whose sealer can be switched off, as a remote key service going down would.
+async fn setup_flaky(
+    refresh_tokens: RefreshTokens,
+) -> (
+    Router,
+    Arc<FlakySealer>,
+    Arc<MemoryStore>,
+    tokio::task::JoinHandle<()>,
+    MockCapture,
+) {
+    let sealer = Arc::new(FlakySealer::new(&[7_u8; 32]));
+    let store = Arc::new(MemoryStore::default());
+    let (app, task, capture) = setup_with_sealer(
+        "google",
+        ClientAuth::Public,
+        default_layout(KeyStrategy::SingleSegment),
+        None,
+        EndpointConfiguration::Discovered,
+        refresh_tokens,
+        store.clone(),
+        TokenEndpointAuthMethod::ClientSecretPost,
+        sealer.clone(),
+    )
+    .await;
+    (app, sealer, store, task, capture)
+}
+
+async fn assert_sealer_unavailable(response: Response) {
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_body(response).await;
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["error"], "server_error", "{value}");
+    // Nothing from the upstream's token response leaks.
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        !text.contains("access") && !text.contains("refresh"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_sealer_fails_the_authorize_and_callback_legs_with_503() {
+    let (app, sealer, _, task, _) = setup_flaky(Default::default()).await;
+    let challenge = pkce_challenge(SEALED_VERIFIER);
+    let authorize = || {
+        app.clone().oneshot(
+            Request::get(format!(
+                "/relay/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+    };
+    sealer.set_seal_down(true);
+    assert_eq!(
+        authorize().await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // The callback cannot open its state while the sealer is down; a forged state is still 400.
+    sealer.set_seal_down(false);
+    let upstream_location = authorize().await.unwrap().headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let state = Url::parse(&upstream_location)
+        .unwrap()
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let callback = |state: &str| {
+        app.clone().oneshot(
+            Request::get(format!(
+                "/upstream/google/callback?code=upstream-code&state={state}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+    };
+    sealer.set_unseal_down(true);
+    assert_eq!(
+        callback(&state).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    sealer.set_unseal_down(false);
+    assert_eq!(
+        callback("forged").await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_unavailable_sealer_leaves_a_sealed_mode_code_redeemable() {
+    let (app, sealer, _, task, _) = setup_flaky(SEALED).await;
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
+    let form = code_grant_form(&code, SEALED_VERIFIER);
+
+    // The code cannot be opened.
+    sealer.set_unseal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_unseal_down(false);
+
+    // The code opens but the refresh handle cannot be sealed: the upstream token is not
+    // returned, and the code was not consumed.
+    sealer.set_seal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_seal_down(false);
+
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = String::from_utf8(response_body(response).await).unwrap();
+    assert!(!body.contains(r#""refresh""#), "{body}");
+    assert!(body.contains("rrt1."), "{body}");
+
+    // Now it is used.
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_unavailable_sealer_consumes_a_rotating_mode_code_once_the_family_is_written() {
+    let (app, sealer, _, task, _) = setup_flaky(rotating(ROTATING_GRACE_SECONDS)).await;
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
+    let form = code_grant_form(&code, SEALED_VERIFIER);
+
+    // The code cannot be opened, so it is not consumed.
+    sealer.set_unseal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_unseal_down(false);
+
+    // The family cannot be sealed. The replay marker is written first, because issuing the
+    // family writes to the store, so the code is spent and the client signs in again.
+    sealer.set_seal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_seal_down(false);
+
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    assert_eq!(value["error"], "invalid_grant");
+    assert_eq!(value["error_description"], "code was already used");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_seal_failure_at_the_callback_returns_a_bare_503_and_no_code() {
+    let (app, sealer, _, task, _) = setup_flaky(Default::default()).await;
+    let challenge = pkce_challenge(SEALED_VERIFIER);
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/relay/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=app-state&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::FOUND);
+    let upstream_location = authorize.headers()[header::LOCATION].to_str().unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let upstream = client.get(upstream_location).send().await.unwrap();
+    let callback = Url::parse(upstream.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let local_callback = format!("{}?{}", callback.path(), callback.query().unwrap());
+
+    // The state opens and the upstream code exchange succeeds; sealing the code envelope fails.
+    sealer.set_seal_down(true);
+    let response = app
+        .clone()
+        .oneshot(Request::get(&local_callback).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().get(header::LOCATION).is_none());
+    assert!(response_body(response).await.is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_unavailable_sealer_fails_a_sealed_refresh_with_503_and_keeps_the_handle_valid() {
+    let (app, sealer, _, task, capture) = setup_flaky(SEALED).await;
+    let key = ResourceKey::new("google").unwrap();
+    let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
+        .await
+        .unwrap();
+    let form = refresh_form(&handle);
+
+    // The handle cannot be opened: not invalid_grant, and the upstream is not contacted.
+    sealer.set_unseal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    assert!(capture.token.lock().unwrap().is_empty());
+    sealer.set_unseal_down(false);
+
+    // The handle opens but the upstream's new refresh token cannot be sealed: it is not returned.
+    sealer.set_seal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_seal_down(false);
+
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A bad handle is still an invalid_grant while the sealer is up.
+    let response = post_token(&app, "google", &refresh_form("rrt1.garbage")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_unavailable_sealer_fails_a_rotating_refresh_with_503_and_keeps_the_family() {
+    let (app, sealer, store, task, capture) = setup_flaky(rotating(ROTATING_GRACE_SECONDS)).await;
+    let handle = Rotator::new(
+        store.clone(),
+        sealer.clone(),
+        ResourceKey::new("google").unwrap(),
+        &rotating(ROTATING_GRACE_SECONDS),
+    )
+    .issue("rotating-upstream")
+    .await
+    .unwrap();
+    let form = refresh_form(&handle);
+
+    sealer.set_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    assert!(capture.token.lock().unwrap().is_empty());
+    sealer.set_down(false);
+
+    // The family is neither revoked nor discarded: the same handle refreshes once the sealer
+    // is back.
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    task.abort();
 }
