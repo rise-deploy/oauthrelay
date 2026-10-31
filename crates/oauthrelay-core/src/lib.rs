@@ -19,7 +19,7 @@
 //! };
 //! let layout = Arc::new(DefaultLayout::new(KeyStrategy::TwoSegment));
 //! let app = router(Arc::new(resources), config, layout);
-//! let _host = axum::Router::new().nest("/", app);
+//! let _host = axum::Router::new().merge(app);
 //! ```
 
 mod config;

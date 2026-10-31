@@ -2514,6 +2514,133 @@ async fn custom_layout_serves_the_flow_discovery_and_jwks_at_its_own_paths() {
     task.abort();
 }
 
+/// Like `ProjectExtensionLayout`, but `path` returns a leading slash.
+struct LeadingSlashLayout;
+
+impl PathLayout for LeadingSlashLayout {
+    fn parse(&self, path: &str) -> Option<(Endpoint, ResourceKey)> {
+        ProjectExtensionLayout.parse(path)
+    }
+
+    fn path(&self, endpoint: Endpoint, key: &ResourceKey) -> String {
+        format!("/{}", ProjectExtensionLayout.path(endpoint, key))
+    }
+}
+
+#[tokio::test]
+async fn custom_layout_urls_are_appended_to_a_public_url_with_a_path() {
+    let key = ResourceKey::new("proj/ext").unwrap();
+    let upstream = Arc::new(Upstream {
+        key: key.clone(),
+        issuer_url: Url::parse("https://issuer.example").unwrap(),
+        authorization_endpoint: Some(Url::parse("https://issuer.example/authorize").unwrap()),
+        token_endpoint: Some(Url::parse("https://issuer.example/token").unwrap()),
+        jwks_uri: Some(Url::parse("https://issuer.example/jwks").unwrap()),
+        client_id: "upstream-client".into(),
+        client_secret: SecretString::new("upstream-secret"),
+        token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
+    });
+    let relay = Arc::new(Relay {
+        key: key.clone(),
+        upstream: key.clone(),
+        client_auth: ClientAuth::Public,
+        scopes: vec!["openid".into()],
+        allowed_scopes: None,
+        required_id_token_claims: HashMap::new(),
+        id_token_policy: None,
+        refresh_tokens: Default::default(),
+        redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
+    });
+    let mut resources = ProviderSnapshot::default();
+    resources.upstreams.insert(key.clone(), upstream);
+    resources.relays.insert(key, relay);
+    let app = router(
+        Arc::new(resources),
+        RelayConfig {
+            public_url: Url::parse("https://relay.example/base").unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
+            store: None,
+            http: reqwest::Client::new(),
+            client_assertion_http: Default::default(),
+            allow_localhost_loopback: false,
+        },
+        Arc::new(LeadingSlashLayout),
+    );
+    let discovery = app
+        .clone()
+        .oneshot(
+            Request::get("/base/proj/ext/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(discovery.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(&response_body(discovery).await).unwrap();
+    assert_eq!(
+        value["authorization_endpoint"],
+        "https://relay.example/base/proj/ext/authorize"
+    );
+    assert_eq!(
+        value["token_endpoint"],
+        "https://relay.example/base/proj/ext/token"
+    );
+    let challenge = pkce_challenge("leading-slash-layout-verifier-with-enough-characters");
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/base/proj/ext/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::FOUND);
+    let location = Url::parse(authorize.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let redirect_uri = location
+        .query_pairs()
+        .find(|(name, _)| name == "redirect_uri")
+        .unwrap()
+        .1
+        .into_owned();
+    assert_eq!(redirect_uri, "https://relay.example/base/proj/ext/callback");
+    // The prefix is part of the route: the same paths without it are not served.
+    let unprefixed = app
+        .oneshot(
+            Request::get("/proj/ext/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unprefixed.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn layouts_receive_the_raw_path_so_encoded_spellings_are_not_served() {
+    let (app, _, task) = setup(
+        "proj/ext",
+        ClientAuth::Public,
+        default_layout(KeyStrategy::TwoSegment),
+    )
+    .await;
+    // Control: the canonical spelling is routed to the relay.
+    let canonical = post_token_at(&app, "/relay/proj/ext/token", "").await;
+    assert_ne!(canonical.status(), StatusCode::NOT_FOUND);
+    for path in [
+        "/relay/proj%2Fext/token",
+        "/relay/proj/%2E%2E/token",
+        "/relay/proj/%65xt/token",
+        "/relay/proj/ext/%74oken",
+    ] {
+        let response = post_token_at(&app, path, "").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    task.abort();
+}
+
 #[tokio::test]
 async fn custom_layout_sets_the_private_key_jwt_default_audience() {
     let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
@@ -2952,6 +3079,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
             allow_localhost_loopback: false,
         }),
         layout: default_layout(KeyStrategy::SingleSegment),
+        route_prefix: String::new(),
         cache: Arc::new(Mutex::new(HashMap::new())),
         assertion_cache: Arc::default(),
     };
@@ -3071,6 +3199,7 @@ fn assertion_test_state() -> AppState {
             allow_localhost_loopback: false,
         }),
         layout: default_layout(KeyStrategy::SingleSegment),
+        route_prefix: String::new(),
         cache: Arc::default(),
         assertion_cache: Arc::default(),
     }

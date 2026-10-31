@@ -7,7 +7,7 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::State,
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
@@ -76,6 +76,8 @@ struct AppState {
     resolver: Arc<dyn ResourceResolver>,
     cfg: Arc<RelayConfig>,
     layout: Arc<dyn PathLayout>,
+    /// The path of `public_url` without a trailing slash; every request path starts with it.
+    route_prefix: String,
     cache: Arc<Mutex<HashMap<String, CachedJson>>>,
     assertion_cache: Arc<ClientAssertionCache>,
 }
@@ -166,23 +168,31 @@ pub fn router(
     cfg: RelayConfig,
     layout: Arc<dyn PathLayout>,
 ) -> Router {
-    let route = public_route_pattern(&cfg.public_url);
+    let route_prefix = public_route_prefix(&cfg.public_url);
+    let route = format!("{route_prefix}/{{*path}}");
     let state = AppState {
         resolver,
         cfg: Arc::new(cfg),
         layout,
+        route_prefix,
         cache: Arc::new(Mutex::new(HashMap::new())),
         assertion_cache: Arc::default(),
     };
     Router::new().route(&route, any(dispatch)).with_state(state)
 }
 
-async fn dispatch(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    request: Request<Body>,
-) -> Response {
-    let Some((endpoint, key)) = state.layout.parse(&path) else {
+async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Response {
+    // The layout sees the path as sent: percent-escapes are not decoded, so every spelling of a
+    // URL other than the canonical one fails to parse instead of aliasing it.
+    let Some(path) = request
+        .uri()
+        .path()
+        .strip_prefix(state.route_prefix.as_str())
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some((endpoint, key)) = state.layout.parse(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if matches!(endpoint, Endpoint::Callback) {
@@ -1977,8 +1987,8 @@ fn endpoint_url(state: &AppState, endpoint: Endpoint, key: &ResourceKey) -> Url 
     url
 }
 
-fn public_route_pattern(public_url: &Url) -> String {
-    format!("{}/{{*path}}", public_url.path().trim_end_matches('/'))
+fn public_route_prefix(public_url: &Url) -> String {
+    public_url.path().trim_end_matches('/').to_owned()
 }
 
 fn discovery_url(issuer: &Url) -> Url {

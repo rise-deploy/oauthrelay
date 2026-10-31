@@ -41,15 +41,18 @@ impl Endpoint {
 /// `parse`: `parse(&path(endpoint, key))` returns `(endpoint, key)`.
 ///
 /// A callback shares the key space of its upstream. A layout may serve it under the same key as the
-/// relay (for hosts where relay and upstream share a key) or under a separate namespace.
+/// relay, but that only lines up when the relay key equals its upstream key; otherwise the callback
+/// lands under the upstream's key.
 pub trait PathLayout: Send + Sync + 'static {
-    /// Interprets a request path below `public_url`, as received (percent-decoded, without a
-    /// leading slash; trailing slashes are left for the layout to accept or reject). Returns
-    /// `None` for paths the layout does not serve, which the router answers with `404`.
+    /// Interprets a request path below `public_url`. The path is the raw request path with the
+    /// `public_url` path and exactly one following `/` removed: percent-escapes are not decoded
+    /// (so `%2F` and `%2E%2E` arrive verbatim), and trailing, repeated and empty segments are
+    /// passed through as-is. The layout accepts or rejects them. Returns `None` for paths the
+    /// layout does not serve, which the router answers with `404`.
     fn parse(&self, path: &str) -> Option<(Endpoint, ResourceKey)>;
 
     /// The path below `public_url`, without a leading slash, at which `endpoint` is served for
-    /// `key`. For [`Endpoint::Callback`] the key is the upstream key; for the others, the relay key.
+    /// `key`, already percent-encoded where its characters require it. For [`Endpoint::Callback`] the key is the upstream key; for the others, the relay key.
     fn path(&self, endpoint: Endpoint, key: &ResourceKey) -> String;
 }
 
@@ -90,6 +93,7 @@ pub struct DefaultLayout {
 }
 
 impl DefaultLayout {
+    /// The built-in layout, with relay and upstream keys parsed according to `keys`.
     pub fn new(keys: KeyStrategy) -> Self {
         Self { keys }
     }
@@ -207,6 +211,8 @@ mod tests {
         assert!(single.parse("upstream/google/token").is_none());
         assert!(single.parse("relay//token").is_none());
         assert!(single.parse("").is_none());
+        assert!(single.parse("relay/a%2Fb/token").is_none());
+        assert!(single.parse("relay/%2E%2E/token").is_none());
         let two = DefaultLayout::new(KeyStrategy::TwoSegment);
         assert!(two
             .parse("relay/project/ext/.well-known/openid-configuration")
