@@ -622,6 +622,9 @@ Rust embedders configure trust-fetch TLS roots through
 `ClientAssertionHttpClient::new(reqwest::ClientBuilder)` and supply the result as
 `RelayConfig.client_assertion_http`. Its constructor enforces the redirect policy and deadline.
 The `RelayConfig.http` client controls upstream traffic independently.
+Both clients are `reqwest` 0.13 types, so an embedder must use the same major version. The
+standalone service builds its clients with the bundled Mozilla root certificates rather than the
+host's store; an embedder's builder chooses its own roots.
 
 ```yaml
 clientAuthentication:

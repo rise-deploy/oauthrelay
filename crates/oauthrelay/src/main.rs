@@ -150,9 +150,9 @@ async fn main() -> anyhow::Result<()> {
             public_url,
             sealer,
             store: Some(store),
-            http: reqwest::Client::builder().build()?,
+            http: http_client_builder().build()?,
             client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
-                reqwest::Client::builder(),
+                http_client_builder(),
             )?,
             redirect: redirect_options,
         },
@@ -239,6 +239,15 @@ struct StoreEnv<'a> {
     kubernetes_resource: Option<&'a str>,
     kubernetes_namespace: Option<&'a str>,
     kubernetes_sweep: Option<&'a str>,
+}
+
+/// An HTTP client builder trusting the bundled Mozilla roots rather than the host's store, so the
+/// service trusts the same authorities on every platform.
+fn http_client_builder() -> reqwest::ClientBuilder {
+    let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|root| reqwest::Certificate::from_der(root.as_ref()).ok());
+    reqwest::Client::builder().tls_certs_only(roots)
 }
 
 fn parse_store_config(env: StoreEnv<'_>) -> anyhow::Result<StoreConfig> {
@@ -804,6 +813,15 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_clients_build_with_every_bundled_root() {
+        assert!(webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .all(|root| reqwest::Certificate::from_der(root.as_ref()).is_ok()));
+        http_client_builder().build().unwrap();
+    }
+
     #[cfg(feature = "lambda")]
     use async_trait::async_trait;
     #[cfg(feature = "lambda")]
