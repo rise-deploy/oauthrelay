@@ -114,8 +114,14 @@ unvalidated redirect URI is never reflected into a response.
 - S256 PKCE only.
 - Flow-state TTL is 10 minutes.
 - Authorization-code TTL is 5 minutes.
-- Redirect policy uses explicit exact-URI, HTTPS-origin, or variable-port IP-loopback matchers.
-- `localhost` aliases an IP-loopback matcher only when service compatibility is enabled.
+- Redirect policy uses explicit exact-URI, HTTPS-origin, variable-port IP-loopback (exact path),
+  or variable-port, variable-path IP-loopback-origin matchers.
+- `localhost` and `*.localhost` alias an IP-loopback matcher only when service compatibility is
+  enabled.
+- An `http://` origin matcher matches only when the HTTP-origins development option is enabled;
+  otherwise the relay fails validation. Embedders set both options on `RelayConfig`
+  (`allow_localhost_loopback`, `allow_http_origins`); the router checks each resolved relay with
+  `Relay::validate_for`, while `Relay::validate` checks structure only.
 - Client-secret comparisons are constant-time.
 - A relying party authenticates to a password-style relay (`UpstreamClient`, `ClientSecret`) by
   exactly one method: form fields `client_id` and `client_secret`, or `Authorization: Basic` with

@@ -1930,6 +1930,9 @@ spec:
                           - loopback
                       - not:
                           required:
+                          - loopbackOrigin
+                      - not:
+                          required:
                           - origin
                       properties:
                         uri: {}
@@ -1942,6 +1945,9 @@ spec:
                           - loopback
                       - not:
                           required:
+                          - loopbackOrigin
+                      - not:
+                          required:
                           - uri
                       properties:
                         origin: {}
@@ -1949,6 +1955,9 @@ spec:
                       - origin
                   - allOf:
                     - allOf:
+                      - not:
+                          required:
+                          - loopbackOrigin
                       - not:
                           required:
                           - origin
@@ -1959,15 +1968,33 @@ spec:
                         loopback: {}
                       required:
                       - loopback
+                  - allOf:
+                    - allOf:
+                      - not:
+                          required:
+                          - loopback
+                      - not:
+                          required:
+                          - origin
+                      - not:
+                          required:
+                          - uri
+                      properties:
+                        loopbackOrigin: {}
+                      required:
+                      - loopbackOrigin
                   description: One explicit application redirect matcher.
                   properties:
                     loopback:
                       description: HTTP URI on 127.0.0.1 or ::1 without a port; path and query match exactly.
                       type: string
+                    loopbackOrigin:
+                      description: "`http://127.0.0.1` or `http://[::1]` without a port or path; every port, path, and query is allowed."
+                      type: string
                     origin:
-                      description: >-
-                        HTTPS scheme, host, and optional port; every path and query at the origin is
-                        allowed.
+                      description: |-
+                        HTTPS scheme, host, and optional port; every path and query at the origin is allowed.
+                        HTTP origins require the service's allow-HTTP-origins development option.
                       type: string
                     uri:
                       description: Complete HTTPS URI, or an exact HTTP URI on an IP-literal loopback host.

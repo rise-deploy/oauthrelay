@@ -121,6 +121,7 @@ redirectPolicy:
   - uri: https://app.example.com/oauth/callback?channel=stable
   - origin: https://preview.example.com
   - loopback: http://127.0.0.1/oauth/callback
+  - loopbackOrigin: http://[::1]
 ```
 
 `uri` compares the complete decoded value exactly, including path, query order, encoding, port,
@@ -129,20 +130,36 @@ Static query parameters participate in matching; oauthrelay appends generated au
 and application state only after the URI passes policy.
 
 `origin` requires HTTPS and matches scheme, host, and effective port. Every path and query at that
-origin is accepted, which suits preview environments whose callback paths vary.
+origin is accepted, which suits preview environments whose callback paths vary. An `http://` origin
+is accepted only by a service started with the off-by-default `OAUTHRELAY_ALLOW_HTTP_ORIGINS`
+development option. Without it, a relay carrying an `http://` origin is invalid: the service refuses
+to start with it, and a relay that gains one through a later provider refresh fails every request
+with a logged error naming the option, rather than silently rejecting the redirect.
 
 `loopback` requires HTTP on `127.0.0.1` or `::1` without a configured port. Its path and query
 match exactly while the application may select any runtime port. Use `uri` when a loopback port is
-fixed. `localhost` is not a loopback IP literal; the off-by-default
-`OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` service option treats it as an alias for a matching IP-literal
-loopback entry.
+fixed.
+
+`loopbackOrigin` names a loopback host alone, `http://127.0.0.1` or `http://[::1]`, and accepts
+every port, path, and query on it. It suits local development servers that choose their callback
+path at runtime; prefer `loopback` when the path is known.
+
+`localhost` is not a loopback IP literal. The off-by-default `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK`
+service option lets a `loopback` or `loopbackOrigin` entry also match `localhost` and its
+subdomains such as `app.localhost` (RFC 6761), which browsers resolve to loopback. Names are
+compared without regard to case; empty labels, trailing dots, and names that merely contain
+`localhost`, such as `localhost.example.com`, never match. Other resolvers may send such names to
+DNS, so enable the option only where every client is a browser or resolves them locally.
+
+Loopback and HTTP-origin redirects must spell scheme, host, and port canonically: forms such as
+`http:/127.0.0.1/cb`, `http://127.1/cb`, percent-encoded hosts, or zero-padded ports are rejected.
 
 User information, fragments, wildcards, prefix matching, empty policies, duplicate entries,
 backslashes, and entries containing more than one matcher are rejected.
 
 The token endpoint derives CORS permission without broadening redirects. A `uri` entry permits its
-origin, an `origin` entry permits that origin, and a `loopback` entry permits its IP host on any
-port. The authorization-code token request must still repeat the exact redirect URI stored for the
+origin, an `origin` entry permits that origin, and a `loopback` or `loopbackOrigin` entry permits
+its IP host on any port, plus `localhost` names when the localhost option is on. The authorization-code token request must still repeat the exact redirect URI stored for the
 flow.
 
 `requiredIdTokenClaims` applies to successful authorization-code exchanges. oauthrelay verifies
