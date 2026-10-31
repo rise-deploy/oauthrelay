@@ -37,7 +37,8 @@ jsonwebtoken = "9"
 lambda_http = "0.17"
 postcard = { version = "1", features = ["use-std"] }
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -52,6 +53,7 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2", features = ["serde"] }
+webpki-roots = "1"
 
 [profile.release]
 codegen-units = 1

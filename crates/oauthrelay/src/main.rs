@@ -146,16 +146,15 @@ async fn main() -> anyhow::Result<()> {
 
     let relay_router = router(
         registry.clone(),
-        RelayConfig {
-            public_url,
-            sealer,
-            store: Some(store),
-            http: reqwest::Client::builder().build()?,
-            client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
-                reqwest::Client::builder(),
-            )?,
-            redirect: redirect_options,
-        },
+        RelayConfig::new(public_url, sealer)
+            .with_store(store)
+            .with_http(oauthrelay_core::UpstreamHttpClient::new(
+                oauthrelay_core::default_client_builder(),
+            )?)
+            .with_client_assertion_http(oauthrelay_core::ClientAssertionHttpClient::new(
+                oauthrelay_core::default_client_builder(),
+            )?)
+            .with_redirect(redirect_options),
         Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),
     );
     let ready = Arc::new(AtomicBool::new(true));
@@ -804,6 +803,15 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_service_http_clients_build() {
+        oauthrelay_core::UpstreamHttpClient::new(oauthrelay_core::default_client_builder())
+            .unwrap();
+        oauthrelay_core::ClientAssertionHttpClient::new(oauthrelay_core::default_client_builder())
+            .unwrap();
+    }
+
     #[cfg(feature = "lambda")]
     use async_trait::async_trait;
     #[cfg(feature = "lambda")]

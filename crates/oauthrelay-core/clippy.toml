@@ -1,0 +1,6 @@
+# Every outbound request goes through `outbound::send_checked`, which asks the `OutboundPolicy`
+# about the URL it then sends to.
+disallowed-methods = [
+    { path = "reqwest::RequestBuilder::send", reason = "send through `outbound::send_checked`, which applies the outbound policy" },
+    { path = "reqwest::Client::execute", reason = "send through `outbound::send_checked`, which applies the outbound policy" },
+]

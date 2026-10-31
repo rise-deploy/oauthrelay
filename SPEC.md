@@ -105,8 +105,8 @@ For public base URL `B`, relay key `R`, and upstream key `U`:
 | `GET {B}/upstream/{U}/callback` | Unseals upstream-bound state, resolves the originating relay, exchanges the upstream code, and returns to the relay's validated application redirect. |
 | `POST {B}/relay/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged (a `sealed` or `rotating` relay replaces only `refresh_token`). |
 | `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. A `sealed` relay first opens the presented handle; a `rotating` relay claims it in the transient store and answers with a successor handle. |
-| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and members describing upstream identity and ID tokens, rewrites authorization and token endpoints to the relay, replaces the response types and modes, grant types, PKCE methods, request-object support, scopes (with `scopes.allowed`), and token endpoint authentication methods with what the relay accepts, and removes upstream endpoints and features the relay does not provide to its clients (every unrecognized `*_endpoint`; revocation and introspection outside `passthrough` mode). |
-| `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
+| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata (`jwks_uri` is omitted when the upstream has no JWKS) and members describing upstream identity and ID tokens, rewrites authorization and token endpoints to the relay, replaces the response types and modes, grant types, PKCE methods, request-object support, scopes (with `scopes.allowed`), and token endpoint authentication methods with what the relay accepts, and removes upstream endpoints and features the relay does not provide to its clients (every unrecognized `*_endpoint`; revocation and introspection outside `passthrough` mode). |
+| `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS; answers 404 when the upstream has none. |
 | `GET /healthz` | Standalone runtime liveness. |
 | `GET /readyz` | Ready after every configured provider supplies its first snapshot. |
 
@@ -135,7 +135,7 @@ unvalidated redirect URI is never reflected into a response.
   enabled.
 - An `http://` origin matcher matches only when the HTTP-origins development option is enabled;
   otherwise the relay fails validation. Embedders set both options through
-  `RelayConfig.redirect` (`RedirectOptions`, built with `..Default::default()`); the router checks
+  `RelayConfig.redirect` (`RedirectOptions`, built with `..Default::default()`, or `RelayConfig::with_redirect`); the router checks
   each resolved relay with `Relay::validate_for`, while `Relay::validate` checks structure only.
 - Client-secret comparisons are constant-time.
 - A relying party authenticates to a password-style relay (`UpstreamClient`, `ClientSecret`) by
@@ -257,6 +257,33 @@ unvalidated redirect URI is never reflected into a response.
   (`rrt1.` in `sealed`; `rrt1.` and `rrt2.` in `rotating`) is opened as described above; any other
   handle is `invalid_grant`. A handle is not an upstream token, so forwarding one only leaks it.
 - Discovery and JWKS responses are cached for bounded TTLs.
+- Outbound requests: every request sent with `RelayConfig.http` (`UpstreamHttpClient`) or
+  `client_assertion_http` (discovery, JWKS, code exchange, refresh, client-assertion metadata and
+  keys) goes through one function that first offers it to `RelayConfig.outbound`
+  (`OutboundPolicy::check(&OutboundRequest { url, purpose, relay, upstream })`; `None` allows all)
+  and then sends that same request. A clippy `disallowed_methods` rule keeps other sends out of
+  `oauthrelay-core`. The clients never follow redirects, and a redirect or a response from another
+  URL is rejected, so a 3xx from a discovery, JWKS, token, or refresh endpoint is a 502 and is
+  never passed to the client. A denial sends nothing and is "unavailable", never "absent": it sets
+  no absence marker and is not cached, discovery and `/jwks` answer 502, redemption answers 502
+  `server_error` and leaves the code unconsumed, token and refresh answer 502, and a client
+  assertion is `invalid_client`. Denials are not remembered. Cached metadata and keys (keyed by
+  purpose and URL) are not re-checked, so a stricter policy applies to them after the cache TTL.
+  The policy sees URLs: it allow-lists scheme, host and port and checks IP-literal hosts itself;
+  address ranges for host names belong in a `reqwest::dns::Resolve` on both clients (proxies bypass
+  it), never in a DNS lookup inside the policy.
+- Endpoint resolution: `authorization_endpoint` and `token_endpoint` are required, from configuration
+  or else from the upstream discovery document (502 when it cannot be fetched). `jwks_uri` is
+  optional: configured, else taken from the discovery document, else absent. The upstream
+  definitely has no JWKS when discovery answers 404 or 410, answers 2xx with something that is not
+  a JSON object, or is a valid document without `jwks_uri`: relay discovery then omits `jwks_uri`,
+  `/jwks` answers 404, and the absence is not re-checked for 30 seconds. A transport error, a
+  timeout (10 seconds per discovery or JWKS fetch), or any other status is "cannot be asked", not
+  "no JWKS": discovery and `/jwks` answer 502 and the next request asks again. Only JSON objects
+  are cached. Configuring both required endpoints and `jwks_uri` never requests discovery.
+  ID-token validation (`requiredIdTokenClaims`, `idTokenPolicy`, and the `azp` and `at_hash`
+  checks) needs the JWKS and fails closed with 502 `server_error`, leaving the code unconsumed,
+  when there is none or it cannot be fetched.
 
 ## Transient store
 
