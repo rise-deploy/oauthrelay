@@ -5,12 +5,12 @@ use crate::{
         HandleError, SubstitutionError,
     },
     rotation::{IssueError, RefreshOutcome, Rotator, UpstreamFailure, UpstreamRefresher},
-    ClientAuth, ClientJwks, RefreshTokenMode, Relay, ResourceKey, ResourceResolver, SealError,
-    Sealer, TokenEndpointAuthMethod, TransientStore, Upstream,
+    ClientAuth, ClientJwks, Endpoint, PathLayout, RefreshTokenMode, Relay, ResourceKey,
+    ResourceResolver, SealError, Sealer, TokenEndpointAuthMethod, TransientStore, Upstream,
 };
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::State,
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
@@ -75,19 +75,12 @@ pub struct RelayConfig {
 }
 
 #[derive(Clone)]
-pub enum KeyStrategy {
-    SingleSegment,
-    TwoSegment,
-    Custom(Arc<KeyMapper>),
-}
-
-pub type KeyMapper = dyn Fn(&[&str]) -> Option<ResourceKey> + Send + Sync;
-
-#[derive(Clone)]
 struct AppState {
     resolver: Arc<dyn ResourceResolver>,
     cfg: Arc<RelayConfig>,
-    keys: KeyStrategy,
+    layout: Arc<dyn PathLayout>,
+    /// The path of `public_url` without a trailing slash; every request path starts with it.
+    route_prefix: String,
     cache: Arc<Mutex<HashMap<String, CachedJson>>>,
     assertion_cache: Arc<ClientAssertionCache>,
 }
@@ -177,33 +170,37 @@ struct TokenRequest {
     pairs: Vec<(String, String)>,
 }
 
-#[derive(Clone, Copy)]
-enum Endpoint {
-    Authorize,
-    Callback,
-    Token,
-    Discovery,
-    Jwks,
-}
-
-pub fn router(resolver: Arc<dyn ResourceResolver>, cfg: RelayConfig, keys: KeyStrategy) -> Router {
-    let route = public_route_pattern(&cfg.public_url);
+/// Serves the relay endpoints below `cfg.public_url`, at the paths `layout` assigns them.
+pub fn router(
+    resolver: Arc<dyn ResourceResolver>,
+    cfg: RelayConfig,
+    layout: Arc<dyn PathLayout>,
+) -> Router {
+    let route_prefix = public_route_prefix(&cfg.public_url);
+    let route = format!("{route_prefix}/{{*path}}");
     let state = AppState {
         resolver,
         cfg: Arc::new(cfg),
-        keys,
+        layout,
+        route_prefix,
         cache: Arc::new(Mutex::new(HashMap::new())),
         assertion_cache: Arc::default(),
     };
     Router::new().route(&route, any(dispatch)).with_state(state)
 }
 
-async fn dispatch(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    request: Request<Body>,
-) -> Response {
-    let Some((key, endpoint)) = parse_path(&path, &state.keys) else {
+async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Response {
+    // The layout sees the path as sent: percent-escapes are not decoded, so every spelling of a
+    // URL other than the canonical one fails to parse instead of aliasing it.
+    let Some(path) = request
+        .uri()
+        .path()
+        .strip_prefix(state.route_prefix.as_str())
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some((endpoint, key)) = state.layout.parse(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if matches!(endpoint, Endpoint::Callback) {
@@ -289,40 +286,6 @@ async fn dispatch(
         (Endpoint::Jwks, Method::GET) => jwks(&state, &upstream).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
-}
-
-fn parse_path(path: &str, strategy: &KeyStrategy) -> Option<(ResourceKey, Endpoint)> {
-    let segments: Vec<_> = path.trim_matches('/').split('/').collect();
-    let (namespace, namespaced) = segments.split_first()?;
-    let (key_parts, endpoint) = match *namespace {
-        "upstream" if namespaced.last() == Some(&"callback") => (
-            &namespaced[..namespaced.len().checked_sub(1)?],
-            Endpoint::Callback,
-        ),
-        "relay" if namespaced.ends_with(&[".well-known", "openid-configuration"]) => (
-            &namespaced[..namespaced.len().checked_sub(2)?],
-            Endpoint::Discovery,
-        ),
-        "relay" => {
-            let endpoint = match *namespaced.last()? {
-                "authorize" => Endpoint::Authorize,
-                "token" => Endpoint::Token,
-                "jwks" => Endpoint::Jwks,
-                _ => return None,
-            };
-            (&namespaced[..namespaced.len().checked_sub(1)?], endpoint)
-        }
-        _ => return None,
-    };
-    let key = match strategy {
-        KeyStrategy::SingleSegment if key_parts.len() == 1 => ResourceKey::new(key_parts[0]).ok(),
-        KeyStrategy::TwoSegment if key_parts.len() == 2 => {
-            ResourceKey::new(format!("{}/{}", key_parts[0], key_parts[1])).ok()
-        }
-        KeyStrategy::Custom(map) => map(key_parts),
-        _ => None,
-    }?;
-    Some((key, endpoint))
 }
 
 fn query_pairs(uri: &Uri) -> Vec<(String, String)> {
@@ -546,7 +509,7 @@ async fn authorize(
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
-    let callback = callback_url(&state.cfg.public_url, &upstream.key);
+    let callback = endpoint_url(state, Endpoint::Callback, &upstream.key);
     let mut authorization_endpoint = endpoints.authorization_endpoint;
     {
         let mut params = authorization_endpoint.query_pairs_mut();
@@ -597,7 +560,7 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
-    let callback = callback_url(&state.cfg.public_url, &upstream.key);
+    let callback = endpoint_url(state, Endpoint::Callback, &upstream.key);
     let upstream_form = vec![
         ("grant_type".to_owned(), "authorization_code".to_owned()),
         ("code".to_owned(), code),
@@ -1513,7 +1476,7 @@ async fn authenticate(
             let assertion = form.client_assertion.as_deref().ok_or_else(invalid)?;
             let audience = audience
                 .clone()
-                .unwrap_or_else(|| token_url(&state.cfg.public_url, &relay.key).to_string());
+                .unwrap_or_else(|| endpoint_url(state, Endpoint::Token, &relay.key).to_string());
             verify_private_key_jwt(
                 state,
                 &audience,
@@ -1676,7 +1639,6 @@ async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Resp
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
-    let base = relay_base_url(&state.cfg.public_url, &relay.key);
     let issuer = doc
         .get("issuer")
         .and_then(Value::as_str)
@@ -1690,8 +1652,10 @@ async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Resp
             }
         });
     doc["issuer"] = Value::String(issuer);
-    doc["authorization_endpoint"] = Value::String(base.join("authorize").unwrap().to_string());
-    doc["token_endpoint"] = Value::String(base.join("token").unwrap().to_string());
+    doc["authorization_endpoint"] =
+        Value::String(endpoint_url(state, Endpoint::Authorize, &relay.key).to_string());
+    doc["token_endpoint"] =
+        Value::String(endpoint_url(state, Endpoint::Token, &relay.key).to_string());
     if let Some(jwks_uri) = endpoints.jwks_uri {
         doc["jwks_uri"] = Value::String(jwks_uri.to_string());
     } else if let Some(object) = doc.as_object_mut() {
@@ -2070,36 +2034,22 @@ async fn unseal_postcard<T: for<'de> Deserialize<'de>>(
     postcard::from_bytes(&bytes).map_err(|_| UnsealError::Invalid)
 }
 
-fn relay_base_url(public_url: &Url, key: &ResourceKey) -> Url {
+/// The public URL of `endpoint` for `key`: `public_url` with the layout's path appended.
+fn endpoint_url(state: &AppState, endpoint: Endpoint, key: &ResourceKey) -> Url {
+    let public_url = &state.cfg.public_url;
     let mut url = public_url.clone();
     url.set_path(&format!(
-        "{}/relay/{}/",
+        "{}/{}",
         public_url.path().trim_end_matches('/'),
-        key
+        state.layout.path(endpoint, key).trim_start_matches('/')
     ));
     url.set_query(None);
     url.set_fragment(None);
     url
 }
 
-fn callback_url(public_url: &Url, key: &ResourceKey) -> Url {
-    let mut url = public_url.clone();
-    url.set_path(&format!(
-        "{}/upstream/{}/callback",
-        public_url.path().trim_end_matches('/'),
-        key
-    ));
-    url.set_query(None);
-    url.set_fragment(None);
-    url
-}
-
-fn public_route_pattern(public_url: &Url) -> String {
-    format!("{}/{{*path}}", public_url.path().trim_end_matches('/'))
-}
-
-fn token_url(public_url: &Url, key: &ResourceKey) -> Url {
-    relay_base_url(public_url, key).join("token").unwrap()
+fn public_route_prefix(public_url: &Url) -> String {
+    public_url.path().trim_end_matches('/').to_owned()
 }
 
 fn discovery_url(issuer: &Url) -> Url {
@@ -2168,19 +2118,6 @@ mod tests {
             pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
-    }
-
-    #[test]
-    fn path_strategies_are_exact() {
-        assert!(parse_path("relay/google/token", &KeyStrategy::SingleSegment).is_some());
-        assert!(parse_path(
-            "relay/project/ext/.well-known/openid-configuration",
-            &KeyStrategy::TwoSegment
-        )
-        .is_some());
-        assert!(parse_path("relay/project/ext/token", &KeyStrategy::SingleSegment).is_none());
-        assert!(parse_path("upstream/google/callback", &KeyStrategy::SingleSegment).is_some());
-        assert!(parse_path("relay/google/callback", &KeyStrategy::SingleSegment).is_none());
     }
 
     #[test]

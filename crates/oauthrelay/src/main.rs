@@ -10,8 +10,8 @@ use axum::{
 use axum::{http::StatusCode, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use oauthrelay_core::{
-    resource_schema, router, ConfigProvider, KeyStrategy, MemoryStore, ProviderSnapshot, Registry,
-    RelayConfig, TransientStore, XChaChaSealer,
+    resource_schema, router, ConfigProvider, DefaultLayout, KeyStrategy, MemoryStore,
+    ProviderSnapshot, Registry, RelayConfig, TransientStore, XChaChaSealer,
 };
 #[cfg(feature = "aws")]
 use oauthrelay_core::{SecretResolver, SecretSource, SecretString};
@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
             )?,
             allow_localhost_loopback: bool_env("OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK", false)?,
         },
-        KeyStrategy::SingleSegment,
+        Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),
     );
     let ready = Arc::new(AtomicBool::new(true));
     let app = Router::new()
