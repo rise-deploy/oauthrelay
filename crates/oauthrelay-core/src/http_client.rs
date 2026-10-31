@@ -6,7 +6,7 @@ use std::sync::Arc;
 /// (`webpki-roots`, including its name constraints) instead of the host's certificate store.
 ///
 /// The client therefore works the same on every platform, including container images without a
-/// system CA bundle, where a client built from the platform verifier fails. HTTP/1.1 only. Add
+/// system CA bundle, which the platform verifier relies on. HTTP/1.1 only. Add
 /// timeouts, proxies, or other settings to the returned builder as needed; do not replace its TLS
 /// configuration.
 pub fn default_client_builder() -> reqwest::ClientBuilder {

@@ -632,7 +632,7 @@ Both clients are `reqwest` 0.13 types, so an embedder must use the same major ve
 `oauthrelay_core::default_client_builder()` returns a builder that trusts the bundled Mozilla root
 certificates (`webpki-roots`) instead of the host's store, so it also works in container images
 without a system CA bundle. The standalone service and `ClientAssertionHttpClient::default()` use
-it. A `reqwest::Client::new()` uses the platform verifier, which fails to build in such images.
+it. A `reqwest::Client::new()` uses the platform verifier, which relies on the host's store.
 
 ```yaml
 clientAuthentication:
