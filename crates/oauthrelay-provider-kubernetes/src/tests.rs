@@ -16,7 +16,7 @@ fn upstream(secret: Value) -> Value {
 fn relay() -> Value {
     json!({"apiVersion":"oauthrelay.dev/v1alpha1", "kind":"Relay",
         "metadata":{"name":"app", "namespace":"team", "resourceVersion":"1"},
-        "spec":{"upstreamRef":{"name":"issuer"}, "clientAuthentication":{"type":"Public"},
+        "spec":{"upstreamRef":{"name":"issuer"}, "refreshTokens":{"mode":"rotating"}, "clientAuthentication":{"type":"Public"},
         "redirectPolicy":[{"uri":"https://app.example/cb"}]}})
 }
 fn secret(value: &str) -> Value {

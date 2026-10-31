@@ -64,7 +64,7 @@ Each run has a unique `oauthrelay-e2e-<run-id>` namespace. The script creates:
 
 - a temporary private ECR repository containing the selected single-architecture image;
 - a Secrets Manager secret for the Google client secret;
-- one SSM `Upstream` and one public `Relay` resource;
+- one SSM `Upstream` and one `Public` `Relay` resource with rotating refresh tokens;
 - a least-privilege Lambda execution role;
 - a Lambda function and unauthenticated Function URL; and
 - the function's CloudWatch log group when Lambda emits logs.

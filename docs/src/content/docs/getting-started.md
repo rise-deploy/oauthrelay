@@ -56,6 +56,8 @@ spec:
   scopes:
     default: [openid, email, profile]
     allowed: [openid, email, profile]
+  refreshTokens:
+    mode: rotating
   clientAuthentication:
     type: Public
   redirectPolicy:
@@ -66,7 +68,10 @@ If the issuer publishes standard OIDC discovery metadata, omit the complete `spe
 block. oauthrelay then resolves the authorization, token, and JWKS endpoints from
 `{issuerUrl}/.well-known/openid-configuration`.
 
-`Public` relays require the application to use S256 PKCE. Server-side relying parties can instead
+`Public` relays require the application to use S256 PKCE and require `refreshTokens.mode: rotating`,
+which makes every refresh token single use and revokes the sign-in when a used one is replayed; see
+[Rotating refresh tokens](/oauthrelay/configuration/#rotating-refresh-tokens). The default in-process
+store suits a single instance. Server-side relying parties can instead
 use `UpstreamClient`, a relay-specific `ClientSecret`, or `PrivateKeyJwt`; see
 [Client authentication](/oauthrelay/configuration/#client-authentication).
 Every authorization request must send the exact configured `redirect_uri`.

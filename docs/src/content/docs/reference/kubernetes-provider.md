@@ -73,6 +73,8 @@ metadata:
 spec:
   upstreamRef:
     name: issuer
+  refreshTokens:
+    mode: rotating
   clientAuthentication:
     type: Public
   redirectPolicy:

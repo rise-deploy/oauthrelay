@@ -75,7 +75,9 @@ transient store (see protocol invariants).
 
 - `UpstreamClient`: the downstream request presents the referenced upstream's client ID and
   secret.
-- `Public`: no client credential; S256 PKCE is mandatory.
+- `Public`: no client credential; S256 PKCE is mandatory, and `refresh_tokens.mode` must be
+  `Rotating`, because a public client's refresh tokens must be sender-constrained or rotated (RFC
+  9700 section 4.14.2) and the relay does not sender-constrain them. Validation rejects any other mode.
 - `ClientSecret`: a relay-specific client ID and secret are compared in constant time.
 - `PrivateKeyJwt`: a signed client assertion is verified against inline JWKS, a JWKS URL, or configured issuer discovery. `issuer` and `subject` are exact claim constraints, each defaulting to `clientId`; `client_id` must still match `clientId`. `audience` is an optional non-empty exact audience constraint, defaulting to the relay token endpoint URL; the JWT must contain it as a string or array element. Expiration is required, and optional `iat`/`nbf` timestamps are checked with 60 seconds of skew. Configured workload subjects may differ from the OAuth client ID. Tokens are reusable until expiry; verification does not call Kubernetes TokenReview.
 

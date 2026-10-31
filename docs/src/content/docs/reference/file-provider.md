@@ -45,6 +45,8 @@ spec:
     name: example
   scopes:
     default: [openid, email]
+  refreshTokens:
+    mode: rotating
   clientAuthentication:
     type: Public
   redirectPolicy:

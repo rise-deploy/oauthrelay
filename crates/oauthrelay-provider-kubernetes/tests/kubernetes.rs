@@ -34,7 +34,13 @@ async fn snapshot(
     .expect("provider snapshot converges")
 }
 fn relay_spec(auth: Value) -> Value {
-    json!({"upstreamRef":{"name":"issuer"},"clientAuthentication":auth,"redirectPolicy":[{"uri":"https://app.example/cb"}]})
+    let public = auth["type"] == "Public";
+    let mut spec = json!({"upstreamRef":{"name":"issuer"},"clientAuthentication":auth,"redirectPolicy":[{"uri":"https://app.example/cb"}]});
+    // A Public relay is only valid with rotating refresh tokens.
+    if public {
+        spec["refreshTokens"] = json!({"mode":"rotating"});
+    }
+    spec
 }
 fn relay(name: &str, auth: Value) -> Value {
     json!({"apiVersion":"oauthrelay.dev/v1alpha1","kind":"Relay","metadata":{"name":name,"namespace":"oauthrelay"},"spec":relay_spec(auth)})

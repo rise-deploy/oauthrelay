@@ -83,6 +83,7 @@ export function resourceDocuments(secretArn, clientId) {
           default: ['openid', 'email', 'profile'],
           allowed: ['openid', 'email', 'profile'],
         },
+        refreshTokens: { mode: 'rotating' },
         clientAuthentication: { type: 'Public' },
         redirectPolicy: [{ loopback: 'http://127.0.0.1/oauth/callback' }],
       },

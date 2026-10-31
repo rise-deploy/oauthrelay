@@ -1976,9 +1976,9 @@ spec:
                 minItems: 1
                 type: array
               refreshTokens:
-                description: >-
-                  How upstream refresh tokens are handed to relying parties. Defaults to
-                  `passthrough`.
+                description: |-
+                  How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`; a
+                  `Public` relay must use `rotating`.
                 properties:
                   gracePeriodSeconds:
                     description: |-

@@ -357,6 +357,19 @@ impl Relay {
             policy.validate()?;
         }
         self.refresh_tokens.validate()?;
+        // RFC 9700 section 4.14.2: a public client's refresh tokens must be sender-constrained or
+        // rotated, and the relay does not sender-constrain them.
+        if matches!(self.client_auth, ClientAuth::Public)
+            && self.refresh_tokens.mode != RefreshTokenMode::Rotating
+        {
+            return Err(
+                "clientAuthentication.type: Public requires refreshTokens.mode: rotating, \
+                because a public client's refresh tokens must be rotated; set refreshTokens.mode \
+                to rotating, or authenticate the relying party with ClientSecret, UpstreamClient \
+                or PrivateKeyJwt"
+                    .into(),
+            );
+        }
         let mut configured_scopes = HashSet::new();
         for scope in &self.scopes {
             if !valid_scope_token(scope) {
@@ -576,7 +589,10 @@ mod tests {
             allowed_scopes: None,
             required_id_token_claims: HashMap::new(),
             id_token_policy: None,
-            refresh_tokens: RefreshTokens::default(),
+            refresh_tokens: RefreshTokens {
+                mode: RefreshTokenMode::Rotating,
+                ..RefreshTokens::default()
+            },
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb?channel=stable&next=%2Fhome")
                     .unwrap(),
@@ -625,6 +641,43 @@ mod tests {
             assert!(!relay.redirect_allowed(bad, true), "{bad}");
         }
         assert!(relay.validate().is_ok());
+    }
+
+    #[test]
+    fn public_relays_require_rotating_refresh_tokens() {
+        let relay = |client_auth, mode| Relay {
+            key: ResourceKey::new("spa").unwrap(),
+            upstream: ResourceKey::new("google").unwrap(),
+            client_auth,
+            scopes: vec![],
+            allowed_scopes: None,
+            required_id_token_claims: HashMap::new(),
+            id_token_policy: None,
+            refresh_tokens: RefreshTokens {
+                mode,
+                ..RefreshTokens::default()
+            },
+            redirect_policy: vec![RedirectMatcher::uri("https://app.example/cb").unwrap()],
+        };
+        for mode in [RefreshTokenMode::Passthrough, RefreshTokenMode::Sealed] {
+            let error = relay(ClientAuth::Public, mode).validate().unwrap_err();
+            assert!(
+                error.contains("Public requires refreshTokens.mode: rotating"),
+                "{error}"
+            );
+            for confidential in [
+                ClientAuth::UpstreamClient,
+                ClientAuth::ClientSecret {
+                    client_id: "application".into(),
+                    client_secret: SecretString::new("secret"),
+                },
+            ] {
+                relay(confidential, mode).validate().unwrap();
+            }
+        }
+        relay(ClientAuth::Public, RefreshTokenMode::Rotating)
+            .validate()
+            .unwrap();
     }
 
     #[test]
