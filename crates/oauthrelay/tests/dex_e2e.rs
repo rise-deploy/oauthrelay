@@ -109,6 +109,8 @@ spec:
   scopes:
     default: [openid, email, profile, offline_access]
     allowed: [openid, email, profile, offline_access]
+  refreshTokens:
+    mode: rotating
   clientAuthentication:
     type: Public
   redirectPolicy:

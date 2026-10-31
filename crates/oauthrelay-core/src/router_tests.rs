@@ -61,6 +61,38 @@ async fn mock_discovery(State(state): State<MockIdpState>) -> Json<Value> {
         "authorization_endpoint": state.base.join("authorize").unwrap(),
         "token_endpoint": state.base.join("token").unwrap(),
         "jwks_uri": state.base.join("jwks").unwrap(),
+        "userinfo_endpoint": state.base.join("userinfo").unwrap(),
+        "end_session_endpoint": state.base.join("logout").unwrap(),
+        "revocation_endpoint": state.base.join("revoke").unwrap(),
+        "revocation_endpoint_auth_methods_supported": ["client_secret_post"],
+        "introspection_endpoint": state.base.join("introspect").unwrap(),
+        "introspection_signing_alg_values_supported": ["RS256"],
+        "backchannel_authentication_endpoint": state.base.join("ciba").unwrap(),
+        "vendor_session_endpoint": state.base.join("vendor/session").unwrap(),
+        "http_logout_supported": true,
+        "frontchannel_logout_supported": true,
+        "device_authorization_endpoint": state.base.join("device").unwrap(),
+        "pushed_authorization_request_endpoint": state.base.join("par").unwrap(),
+        "require_pushed_authorization_requests": false,
+        "registration_endpoint": state.base.join("register").unwrap(),
+        "mtls_endpoint_aliases": {"token_endpoint": state.base.join("mtls/token").unwrap()},
+        "signed_metadata": "eyJhbGciOiJSUzI1NiJ9.e30.c2ln",
+        "response_types_supported": ["code", "id_token", "code id_token"],
+        "response_modes_supported": ["query", "fragment", "form_post"],
+        "grant_types_supported": [
+            "authorization_code",
+            "refresh_token",
+            "implicit",
+            "urn:ietf:params:oauth:grant-type:device_code"
+        ],
+        "code_challenge_methods_supported": ["plain", "S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt"],
+        "token_endpoint_auth_signing_alg_values_supported": ["HS256", "RS256"],
+        "request_parameter_supported": true,
+        "scopes_supported": ["openid", "email", "profile", "offline_access"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "claims_supported": ["sub", "email"],
         "custom_field": "preserved"
     }))
 }
@@ -444,7 +476,7 @@ async fn setup_signed_policy(
         allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
         required_id_token_claims,
         id_token_policy,
-        refresh_tokens: Default::default(),
+        refresh_tokens: default_refresh_tokens(&client_auth),
         redirect_policy: vec![RedirectMatcher::uri(redirect_uri).unwrap()],
     });
     let mut resources = ProviderSnapshot::default();
@@ -491,15 +523,24 @@ async fn setup_with_capture(
     tokio::task::JoinHandle<()>,
     MockCapture,
 ) {
+    let refresh_tokens = default_refresh_tokens(&auth);
     setup_with_refresh_tokens(
         key,
         auth,
         strategy,
         allowed_scopes,
         endpoint_configuration,
-        RefreshTokens::default(),
+        refresh_tokens,
     )
     .await
+}
+
+/// The default refresh-token handling, except for `Public` relays, which must rotate.
+fn default_refresh_tokens(auth: &ClientAuth) -> RefreshTokens {
+    match auth {
+        ClientAuth::Public => rotating(DEFAULT_GRACE_PERIOD_SECONDS),
+        _ => RefreshTokens::default(),
+    }
 }
 
 async fn setup_with_refresh_tokens(
@@ -697,7 +738,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             Arc::new(Relay {
                 key,
                 upstream: upstream_key.clone(),
-                client_auth: ClientAuth::Public,
+                client_auth: ClientAuth::UpstreamClient,
                 scopes: vec!["openid".into()],
                 allowed_scopes: None,
                 required_id_token_claims: HashMap::new(),
@@ -930,13 +971,31 @@ fn refresh_form(refresh_token: &str) -> String {
     .unwrap()
 }
 
+/// Body credentials of an `UpstreamClient` relay. Tests of the `passthrough` and `sealed` modes use
+/// one, since a `Public` relay must use `rotating`.
+const UPSTREAM_CLIENT_CREDENTIALS: &str =
+    "&client_id=upstream-client&client_secret=upstream-secret";
+
+fn confidential_code_grant_form(code: &str, verifier: &str) -> String {
+    code_grant_form(code, verifier) + UPSTREAM_CLIENT_CREDENTIALS
+}
+
+fn confidential_refresh_form(refresh_token: &str) -> String {
+    refresh_form(refresh_token) + UPSTREAM_CLIENT_CREDENTIALS
+}
+
 const SEALED_VERIFIER: &str = "a-public-verifier-with-enough-entropy-123456789";
 
 #[tokio::test]
 async fn sealed_mode_replaces_the_refresh_token_on_the_code_grant() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::Public).await;
+    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
     let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
-    let response = post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
+    let response = post_token(
+        &app,
+        "google",
+        &confidential_code_grant_form(&code, SEALED_VERIFIER),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(
         response.headers()[header::CONTENT_TYPE],
@@ -972,13 +1031,13 @@ async fn sealed_mode_replaces_the_refresh_token_on_the_code_grant() {
 
 #[tokio::test]
 async fn sealed_refresh_round_trips_through_the_upstream() {
-    let (app, sealer, task, capture) = setup_sealed(ClientAuth::Public).await;
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
     let key = ResourceKey::new("google").unwrap();
     let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
         .await
         .unwrap();
 
-    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()[header::CONTENT_TYPE],
@@ -1014,14 +1073,14 @@ async fn sealed_refresh_round_trips_through_the_upstream() {
     assert!(!upstream_form.iter().any(|(_, value)| value == &handle));
 
     // The new handle keeps working.
-    let again = post_token(&app, "google", &refresh_form(new_handle)).await;
+    let again = post_token(&app, "google", &confidential_refresh_form(new_handle)).await;
     assert_eq!(again.status(), StatusCode::ACCEPTED);
     task.abort();
 }
 
 #[tokio::test]
 async fn sealed_refresh_without_an_upstream_refresh_token_returns_none() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::Public).await;
+    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
     let handle = seal_handle(
         sealer.as_ref(),
         &ResourceKey::new("google").unwrap(),
@@ -1030,7 +1089,7 @@ async fn sealed_refresh_without_an_upstream_refresh_token_returns_none() {
     )
     .await
     .unwrap();
-    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(
         response_body(response).await,
@@ -1041,7 +1100,7 @@ async fn sealed_refresh_without_an_upstream_refresh_token_returns_none() {
 
 #[tokio::test]
 async fn sealed_code_grant_without_an_upstream_refresh_token_is_unchanged() {
-    let (app, _, task, _) = setup_sealed(ClientAuth::Public).await;
+    let (app, _, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
     let code = authorization_code_with(
         &app,
         "google",
@@ -1049,7 +1108,12 @@ async fn sealed_code_grant_without_an_upstream_refresh_token_is_unchanged() {
         "&login_hint=no-refresh",
     )
     .await;
-    let response = post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
+    let response = post_token(
+        &app,
+        "google",
+        &confidential_code_grant_form(&code, SEALED_VERIFIER),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
@@ -1060,7 +1124,7 @@ async fn sealed_code_grant_without_an_upstream_refresh_token_is_unchanged() {
 
 #[tokio::test]
 async fn sealed_mode_rejects_raw_foreign_and_tampered_refresh_tokens() {
-    let (app, sealer, task, capture) = setup_sealed(ClientAuth::Public).await;
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
     let key = ResourceKey::new("google").unwrap();
     let valid = seal_handle(sealer.as_ref(), &key, "refresh", 1)
         .await
@@ -1091,7 +1155,7 @@ async fn sealed_mode_rejects_raw_foreign_and_tampered_refresh_tokens() {
         valid["rrt1.".len()..].to_owned(),
         String::new(),
     ] {
-        let response = post_token(&app, "google", &refresh_form(&presented)).await;
+        let response = post_token(&app, "google", &confidential_refresh_form(&presented)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{presented}");
         let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
         assert_eq!(body["error"], "invalid_grant", "{presented}");
@@ -1100,7 +1164,7 @@ async fn sealed_mode_rejects_raw_foreign_and_tampered_refresh_tokens() {
         capture.token.lock().unwrap().is_empty(),
         "rejected refresh tokens must not reach the upstream"
     );
-    let ok = post_token(&app, "google", &refresh_form(&valid)).await;
+    let ok = post_token(&app, "google", &confidential_refresh_form(&valid)).await;
     assert_eq!(ok.status(), StatusCode::ACCEPTED);
     task.abort();
 }
@@ -1144,7 +1208,7 @@ async fn sealed_mode_applies_to_confidential_relays_and_checks_client_auth_first
 async fn passthrough_mode_returns_the_upstream_refresh_token_unchanged() {
     let (app, _, task, _) = setup_with_refresh_tokens(
         "google",
-        ClientAuth::Public,
+        ClientAuth::UpstreamClient,
         default_layout(KeyStrategy::SingleSegment),
         None,
         EndpointConfiguration::Discovered,
@@ -1153,13 +1217,18 @@ async fn passthrough_mode_returns_the_upstream_refresh_token_unchanged() {
     .await;
     assert_eq!(RefreshTokens::default().mode, RefreshTokenMode::Passthrough);
     let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
-    let response = post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
+    let response = post_token(
+        &app,
+        "google",
+        &confidential_code_grant_form(&code, SEALED_VERIFIER),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(
         response_body(response).await,
         br#"{"access_token":"access","refresh_token":"refresh","token_type":"Bearer"}"#
     );
-    let response = post_token(&app, "google", &refresh_form("rotating")).await;
+    let response = post_token(&app, "google", &confidential_refresh_form("rotating")).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
@@ -1263,7 +1332,7 @@ async fn code_replay_is_rejected_by_a_store_that_resolves_writes_by_value() {
         default_layout(KeyStrategy::SingleSegment),
         None,
         EndpointConfiguration::Discovered,
-        RefreshTokens::default(),
+        rotating(DEFAULT_GRACE_PERIOD_SECONDS),
         Arc::new(ValueResolvingStore::default()),
     )
     .await;
@@ -1295,7 +1364,7 @@ async fn store_failure_is_retryable_and_leaves_the_code_unconsumed() {
         default_layout(KeyStrategy::SingleSegment),
         None,
         EndpointConfiguration::Discovered,
-        RefreshTokens::default(),
+        rotating(DEFAULT_GRACE_PERIOD_SECONDS),
         Arc::new(FlakyStore {
             inner: MemoryStore::default(),
             failures: AtomicUsize::new(1),
@@ -1440,6 +1509,149 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
         StatusCode::UNAUTHORIZED
     );
     task.abort();
+}
+
+/// Client credentials for one client-auth mode, as form pairs.
+fn pkce_downgrade_credentials(auth: &ClientAuth, private: &RsaPrivateKey) -> Vec<(String, String)> {
+    let pairs = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    };
+    match auth {
+        ClientAuth::Public => vec![],
+        ClientAuth::UpstreamClient => pairs(&[
+            ("client_id", "upstream-client"),
+            ("client_secret", "upstream-secret"),
+        ]),
+        ClientAuth::ClientSecret { .. } => pairs(&[
+            ("client_id", "application"),
+            ("client_secret", "application-secret"),
+        ]),
+        ClientAuth::PrivateKeyJwt { .. } => {
+            let claims = json!({
+                "iss": "jwt-application",
+                "sub": "jwt-application",
+                "aud": "https://relay.example/relay/downgrade/token",
+                "exp": unix_now() + 60,
+                "iat": unix_now(),
+            });
+            let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+            let assertion = encode(
+                &Header::new(Algorithm::RS256),
+                &claims,
+                &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+            )
+            .unwrap();
+            pairs(&[
+                ("client_id", "jwt-application"),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", &assertion),
+            ])
+        }
+    }
+}
+
+#[tokio::test]
+async fn code_verifier_without_a_code_challenge_is_rejected_for_every_client_auth_mode() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let jwks = json!({
+        "keys": [{
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())
+        }]
+    });
+    let verifier = "a-downgrade-verifier-with-more-than-forty-three-characters";
+    for auth in [
+        ClientAuth::Public,
+        ClientAuth::UpstreamClient,
+        ClientAuth::ClientSecret {
+            client_id: "application".into(),
+            client_secret: SecretString::new("application-secret"),
+        },
+        ClientAuth::PrivateKeyJwt {
+            require_single_use: false,
+            client_id: "jwt-application".into(),
+            issuer: None,
+            subject: None,
+            audience: None,
+            jwks: Some(ClientJwks::Inline(jwks.clone())),
+        },
+    ] {
+        let public = matches!(auth, ClientAuth::Public);
+        let (app, sealer, task) = setup(
+            "downgrade",
+            auth.clone(),
+            default_layout(KeyStrategy::SingleSegment),
+        )
+        .await;
+        let code = if public {
+            // A public relay never issues a code without a challenge, so seal one directly.
+            let envelope = CodeEnvelope {
+                relay_key: "downgrade".into(),
+                envelope_id: [3; 16],
+                issued_at: unix_now(),
+                redirect_uri: "https://app.example/callback".into(),
+                client_code_challenge: None,
+                id_token_nonce: None,
+                upstream_response: StoredResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: br#"{"access_token":"access","token_type":"Bearer"}"#.to_vec(),
+                },
+            };
+            sealer
+                .seal(&postcard::to_stdvec(&envelope).unwrap(), b"downgrade")
+                .await
+                .unwrap()
+        } else {
+            authorization_code(&app, "downgrade", None).await
+        };
+        let form = |with_verifier: bool| {
+            let mut pairs = vec![
+                ("grant_type".to_owned(), "authorization_code".to_owned()),
+                ("code".to_owned(), code.clone()),
+                (
+                    "redirect_uri".to_owned(),
+                    "https://app.example/callback".to_owned(),
+                ),
+            ];
+            if with_verifier {
+                pairs.push(("code_verifier".to_owned(), verifier.to_owned()));
+            }
+            pairs.extend(pkce_downgrade_credentials(&auth, &private));
+            serde_urlencoded::to_string(pairs).unwrap()
+        };
+
+        let response = post_token(&app, "downgrade", &form(true)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{auth:?}");
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body["error"], "invalid_grant", "{auth:?}");
+        assert_eq!(
+            body["error_description"],
+            "code_verifier was sent but the authorization request had no code_challenge",
+            "{auth:?}"
+        );
+
+        // The rejection does not consume the code: without the verifier, a confidential client
+        // redeems it, and a public client still fails for the missing challenge.
+        let response = post_token(&app, "downgrade", &form(false)).await;
+        if public {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+            assert_eq!(body["error_description"], "PKCE challenge is missing");
+        } else {
+            assert_eq!(response.status(), StatusCode::CREATED, "{auth:?}");
+        }
+        task.abort();
+    }
 }
 
 #[tokio::test]
@@ -2011,10 +2223,10 @@ async fn string_like_policy_applies_only_to_initial_admission() {
         ("code_verifier", verifier.as_str()),
     ])
     .unwrap();
-    assert_eq!(
-        post_token(&app, "profile", &form).await.status(),
-        StatusCode::OK
-    );
+    let admitted = post_token(&app, "profile", &form).await;
+    assert_eq!(admitted.status(), StatusCode::OK);
+    let admitted: Value = serde_json::from_slice(&response_body(admitted).await).unwrap();
+    let handle = admitted["refresh_token"].as_str().unwrap().to_owned();
     fixture
         .claim_overrides
         .lock()
@@ -2036,7 +2248,7 @@ async fn string_like_policy_applies_only_to_initial_admission() {
     let refresh = post_token(
         &app,
         "profile",
-        "grant_type=refresh_token&refresh_token=fixture-refresh-token",
+        &format!("grant_type=refresh_token&refresh_token={handle}"),
     )
     .await;
     assert_eq!(refresh.status(), StatusCode::OK);
@@ -2217,19 +2429,23 @@ async fn run_signed_relay_profile(profile: RelayProfile) {
         }
         assert_eq!(claims["iss"], "https://accounts.google.com");
         assert_eq!(claims["hd"], "example.com");
+        // A public relay rotates: the client holds a handle, never the upstream refresh token.
+        let handle = body["refresh_token"].as_str().unwrap();
+        assert!(handle.starts_with("rrt2."), "{handle}");
         let refresh = post_token(
             &app,
             "profile",
-            "grant_type=refresh_token&refresh_token=fixture-refresh-token&scope=openid%20email&resource=google-resource",
+            &format!("grant_type=refresh_token&refresh_token={handle}&scope=openid%20email&resource=google-resource"),
         )
         .await;
         let refreshed: Value = serde_json::from_slice(&response_body(refresh).await).unwrap();
         assert_eq!(refreshed["access_token"], "fixture-refreshed-access-token");
-        assert!(refreshed.get("refresh_token").is_none());
+        let successor = refreshed["refresh_token"].as_str().unwrap();
+        assert!(successor.starts_with("rrt2.") && successor != handle);
         let invalid_scope = post_token(
             &app,
             "profile",
-            "grant_type=refresh_token&refresh_token=fixture-refresh-token&scope=admin",
+            &format!("grant_type=refresh_token&refresh_token={successor}&scope=admin"),
         )
         .await;
         assert_eq!(invalid_scope.status(), StatusCode::BAD_REQUEST);
@@ -2376,6 +2592,251 @@ async fn discovery_supplies_jwks_when_other_endpoints_are_explicit() {
         json!({ "keys": [] })
     );
     task.abort();
+}
+
+async fn relay_discovery(app: &Router, key: &str) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/relay/{key}/.well-known/openid-configuration"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&response_body(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn discovery_describes_what_the_relay_accepts_for_every_client_auth_mode() {
+    let jwt = ClientAuth::PrivateKeyJwt {
+        require_single_use: false,
+        client_id: "jwt-application".into(),
+        issuer: None,
+        subject: None,
+        audience: None,
+        jwks: Some(ClientJwks::Inline(json!({"keys": [{"kty": "oct"}]}))),
+    };
+    let secret = ClientAuth::ClientSecret {
+        client_id: "application".into(),
+        client_secret: SecretString::new("application-secret"),
+    };
+    let password_methods = json!(["client_secret_basic", "client_secret_post"]);
+    for (auth, methods) in [
+        (ClientAuth::Public, json!(["none"])),
+        (ClientAuth::UpstreamClient, password_methods.clone()),
+        (secret, password_methods),
+        (jwt, json!(["private_key_jwt"])),
+    ] {
+        let (app, _, task) = setup(
+            "google",
+            auth.clone(),
+            default_layout(KeyStrategy::SingleSegment),
+        )
+        .await;
+        let value = relay_discovery(&app, "google").await;
+        assert_eq!(value["token_endpoint_auth_methods_supported"], methods);
+        if matches!(auth, ClientAuth::PrivateKeyJwt { .. }) {
+            assert_eq!(
+                value["token_endpoint_auth_signing_alg_values_supported"],
+                json!([
+                    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"
+                ])
+            );
+        } else {
+            assert!(
+                value
+                    .get("token_endpoint_auth_signing_alg_values_supported")
+                    .is_none(),
+                "{auth:?}"
+            );
+        }
+        assert_eq!(value["code_challenge_methods_supported"], json!(["S256"]));
+        assert_eq!(value["response_types_supported"], json!(["code"]));
+        assert_eq!(value["response_modes_supported"], json!(["query"]));
+        assert_eq!(
+            value["grant_types_supported"],
+            json!(["authorization_code", "refresh_token"])
+        );
+        assert_eq!(value["request_parameter_supported"], false);
+        assert_eq!(value["request_uri_parameter_supported"], false);
+        for removed in [
+            "device_authorization_endpoint",
+            "pushed_authorization_request_endpoint",
+            "require_pushed_authorization_requests",
+            "registration_endpoint",
+            "backchannel_authentication_endpoint",
+            "vendor_session_endpoint",
+            "mtls_endpoint_aliases",
+            "http_logout_supported",
+            "frontchannel_logout_supported",
+            "signed_metadata",
+        ] {
+            assert!(value.get(removed).is_none(), "{auth:?} {removed}");
+        }
+        // Members that describe the upstream identity and its unchanged tokens remain.
+        let issuer = value["issuer"].as_str().unwrap();
+        assert_eq!(value["userinfo_endpoint"], format!("{issuer}userinfo"));
+        assert_eq!(value["end_session_endpoint"], format!("{issuer}logout"));
+        assert_eq!(value["subject_types_supported"], json!(["public"]));
+        assert_eq!(
+            value["id_token_signing_alg_values_supported"],
+            json!(["RS256"])
+        );
+        assert_eq!(value["claims_supported"], json!(["sub", "email"]));
+        assert_eq!(
+            value["scopes_supported"],
+            json!(["openid", "email", "profile", "offline_access"])
+        );
+        assert_eq!(value["custom_field"], "preserved");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn discovery_keeps_upstream_revocation_only_where_clients_hold_upstream_tokens() {
+    let secret = ClientAuth::ClientSecret {
+        client_id: "application".into(),
+        client_secret: SecretString::new("application-secret"),
+    };
+    for (auth, mode, kept) in [
+        (
+            ClientAuth::UpstreamClient,
+            RefreshTokenMode::Passthrough,
+            true,
+        ),
+        (ClientAuth::UpstreamClient, RefreshTokenMode::Sealed, false),
+        (
+            ClientAuth::UpstreamClient,
+            RefreshTokenMode::Rotating,
+            false,
+        ),
+        (secret.clone(), RefreshTokenMode::Passthrough, true),
+        (secret, RefreshTokenMode::Sealed, false),
+        (ClientAuth::Public, RefreshTokenMode::Rotating, false),
+    ] {
+        let (app, _, task, _) = setup_with_refresh_tokens(
+            "google",
+            auth.clone(),
+            default_layout(KeyStrategy::SingleSegment),
+            None,
+            EndpointConfiguration::Discovered,
+            RefreshTokens {
+                mode,
+                ..RefreshTokens::default()
+            },
+        )
+        .await;
+        let value = relay_discovery(&app, "google").await;
+        for member in [
+            "revocation_endpoint",
+            "revocation_endpoint_auth_methods_supported",
+            "introspection_endpoint",
+            "introspection_signing_alg_values_supported",
+        ] {
+            assert_eq!(
+                value.get(member).is_some(),
+                kept,
+                "{auth:?} {mode:?} {member}"
+            );
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn discovery_advertises_the_relay_scope_allow_list() {
+    let (app, _, task, _) = setup_with_capture(
+        "google",
+        ClientAuth::UpstreamClient,
+        default_layout(KeyStrategy::SingleSegment),
+        Some(vec!["openid".into(), "email".into()]),
+        EndpointConfiguration::Discovered,
+    )
+    .await;
+    let value = relay_discovery(&app, "google").await;
+    assert_eq!(value["scopes_supported"], json!(["openid", "email"]));
+    task.abort();
+}
+
+#[test]
+fn discovery_refresh_grant_follows_an_upstream_list_and_authorization_code_is_always_advertised() {
+    let relay = Relay {
+        key: ResourceKey::new("google").unwrap(),
+        upstream: ResourceKey::new("google").unwrap(),
+        client_auth: ClientAuth::UpstreamClient,
+        scopes: vec![],
+        allowed_scopes: None,
+        required_id_token_claims: HashMap::new(),
+        id_token_policy: None,
+        refresh_tokens: RefreshTokens::default(),
+        redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
+    };
+    let mut without_refresh = json!({"grant_types_supported": ["authorization_code", "implicit"]});
+    describe_relay(without_refresh.as_object_mut().unwrap(), &relay);
+    assert_eq!(
+        without_refresh["grant_types_supported"],
+        json!(["authorization_code"])
+    );
+    let mut refresh_only = json!({"grant_types_supported": ["refresh_token"]});
+    describe_relay(refresh_only.as_object_mut().unwrap(), &relay);
+    assert_eq!(
+        refresh_only["grant_types_supported"],
+        json!(["authorization_code", "refresh_token"])
+    );
+    // An absent list (explicitly configured endpoints, or a provider such as Entra ID that omits
+    // the member) keeps the refresh grant.
+    let mut empty = json!({});
+    describe_relay(empty.as_object_mut().unwrap(), &relay);
+    assert_eq!(
+        empty["grant_types_supported"],
+        json!(["authorization_code", "refresh_token"])
+    );
+    assert!(empty.get("scopes_supported").is_none());
+}
+
+#[test]
+fn discovery_drops_unknown_upstream_endpoints_but_keeps_other_unknown_members() {
+    let relay = Relay {
+        key: ResourceKey::new("google").unwrap(),
+        upstream: ResourceKey::new("google").unwrap(),
+        client_auth: ClientAuth::UpstreamClient,
+        scopes: vec![],
+        allowed_scopes: None,
+        required_id_token_claims: HashMap::new(),
+        id_token_policy: None,
+        refresh_tokens: RefreshTokens::default(),
+        redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
+    };
+    let mut doc = json!({
+        "authorization_endpoint": "https://relay.example/relay/google/authorize",
+        "token_endpoint": "https://relay.example/relay/google/token",
+        "userinfo_endpoint": "https://issuer.example/userinfo",
+        "end_session_endpoint": "https://issuer.example/logout",
+        "revocation_endpoint": "https://issuer.example/revoke",
+        "introspection_endpoint": "https://issuer.example/introspect",
+        "kerberos_endpoint": "https://issuer.example/kerberos",
+        "device_authorization_endpoint": "https://issuer.example/device",
+        "tenant_region_scope": "EU",
+        "endpoint_hint": "kept: the name does not end in _endpoint"
+    });
+    describe_relay(doc.as_object_mut().unwrap(), &relay);
+    for kept in [
+        "authorization_endpoint",
+        "token_endpoint",
+        "userinfo_endpoint",
+        "end_session_endpoint",
+        "revocation_endpoint",
+        "introspection_endpoint",
+        "tenant_region_scope",
+        "endpoint_hint",
+    ] {
+        assert!(doc.get(kept).is_some(), "{kept}");
+    }
+    for removed in ["kerberos_endpoint", "device_authorization_endpoint"] {
+        assert!(doc.get(removed).is_none(), "{removed}");
+    }
 }
 
 #[tokio::test]
@@ -2584,7 +3045,7 @@ async fn custom_layout_urls_are_appended_to_a_public_url_with_a_path() {
     let relay = Arc::new(Relay {
         key: key.clone(),
         upstream: key.clone(),
-        client_auth: ClientAuth::Public,
+        client_auth: ClientAuth::UpstreamClient,
         scopes: vec!["openid".into()],
         allowed_scopes: None,
         required_id_token_claims: HashMap::new(),
@@ -3542,9 +4003,14 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
 
 #[tokio::test]
 async fn upstream_requests_ask_for_json() {
-    let (app, sealer, task, capture) = setup_sealed(ClientAuth::Public).await;
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
     let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
-    post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
+    post_token(
+        &app,
+        "google",
+        &confidential_code_grant_form(&code, SEALED_VERIFIER),
+    )
+    .await;
     let handle = seal_handle(
         sealer.as_ref(),
         &ResourceKey::new("google").unwrap(),
@@ -3553,7 +4019,7 @@ async fn upstream_requests_ask_for_json() {
     )
     .await
     .unwrap();
-    post_token(&app, "google", &refresh_form(&handle)).await;
+    post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     let accept = capture.accept.lock().unwrap().clone();
     assert_eq!(accept.len(), 2, "one code exchange and one refresh");
     assert!(accept
@@ -3628,7 +4094,7 @@ async fn client_secret_basic_authenticates_the_code_exchange_and_passthrough_ref
 async fn client_secret_basic_authenticates_sealed_refresh() {
     let (app, sealer, task, capture) = setup_with_upstream_auth(
         "google",
-        ClientAuth::Public,
+        ClientAuth::UpstreamClient,
         default_layout(KeyStrategy::SingleSegment),
         None,
         EndpointConfiguration::Discovered,
@@ -3641,7 +4107,7 @@ async fn client_secret_basic_authenticates_sealed_refresh() {
     let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
         .await
         .unwrap();
-    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_basic_upstream_requests(&capture, 1);
     let forms = capture.token.lock().unwrap().clone();
@@ -4055,6 +4521,13 @@ async fn basic_credentials_round_trip_reserved_and_non_ascii_characters() {
     task.abort();
 }
 
+/// The request passed client authentication at a `Public` relay. Such a relay rotates, so the raw
+/// refresh token these requests carry is then refused as a grant rather than as a client.
+async fn assert_public_client_authenticated(response: Response) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(response).await, "invalid_grant");
+}
+
 #[tokio::test]
 async fn public_relay_rejects_a_basic_authorization_header() {
     let (app, _, task) = setup(
@@ -4080,7 +4553,7 @@ async fn public_relay_rejects_a_basic_authorization_header() {
     }
     // Other schemes are not client credentials and are ignored, as the relay never reads them.
     let response = post_token_with_authorization(&app, "google", &[b"Bearer token"], refresh).await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_public_client_authenticated(response).await;
     task.abort();
 }
 
@@ -4096,11 +4569,11 @@ async fn public_relay_treats_a_basic_header_with_an_empty_secret_as_identificati
     let basic = basic_header("public-application", "");
     let response =
         post_token_with_authorization(&app, "google", &[basic.as_bytes()], refresh).await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_public_client_authenticated(response).await;
     // A repeated body `client_id` is allowed; a different one conflicts.
     let same = format!("{refresh}&client_id=public-application");
     let response = post_token_with_authorization(&app, "google", &[basic.as_bytes()], &same).await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_public_client_authenticated(response).await;
     let other = format!("{refresh}&client_id=another-client");
     let response = post_token_with_authorization(&app, "google", &[basic.as_bytes()], &other).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -4211,7 +4684,7 @@ fn basic_credentials_parse_strictly() {
 
 #[tokio::test]
 async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::Public).await;
+    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
     let handle = seal_handle(
         sealer.as_ref(),
         &ResourceKey::new("google").unwrap(),
@@ -4220,7 +4693,7 @@ async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
     )
     .await
     .unwrap();
-    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
     let body = String::from_utf8(response_body(response).await).unwrap();
@@ -4235,7 +4708,7 @@ async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
 
 #[tokio::test]
 async fn sealed_mode_fails_closed_on_a_form_encoded_success_body() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::Public).await;
+    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
     let handle = seal_handle(
         sealer.as_ref(),
         &ResourceKey::new("google").unwrap(),
@@ -4244,7 +4717,7 @@ async fn sealed_mode_fails_closed_on_a_form_encoded_success_body() {
     )
     .await
     .unwrap();
-    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = String::from_utf8(response_body(response).await).unwrap();
     assert!(!body.contains("raw-secret"), "{body}");
@@ -4258,7 +4731,12 @@ async fn sealed_mode_fails_closed_on_a_form_encoded_success_body() {
         "&login_hint=form-body",
     )
     .await;
-    let response = post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
+    let response = post_token(
+        &app,
+        "google",
+        &confidential_code_grant_form(&code, SEALED_VERIFIER),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = String::from_utf8(response_body(response).await).unwrap();
     assert!(!body.contains("raw-secret"), "{body}");
@@ -4269,11 +4747,11 @@ async fn sealed_mode_fails_closed_on_a_form_encoded_success_body() {
 async fn passthrough_mode_returns_a_form_encoded_body_unchanged() {
     let (app, _, task) = setup(
         "google",
-        ClientAuth::Public,
+        ClientAuth::UpstreamClient,
         default_layout(KeyStrategy::SingleSegment),
     )
     .await;
-    let response = post_token(&app, "google", &refresh_form("form-encoded")).await;
+    let response = post_token(&app, "google", &confidential_refresh_form("form-encoded")).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
@@ -4286,16 +4764,16 @@ async fn passthrough_mode_returns_a_form_encoded_body_unchanged() {
 async fn handle_prefixed_tokens_are_never_forwarded_in_any_mode() {
     let (passthrough, _, task1, capture1) = setup_with_capture(
         "google",
-        ClientAuth::Public,
+        ClientAuth::UpstreamClient,
         default_layout(KeyStrategy::SingleSegment),
         None,
         EndpointConfiguration::Discovered,
     )
     .await;
-    let (sealed, _, task2, capture2) = setup_sealed(ClientAuth::Public).await;
+    let (sealed, _, task2, capture2) = setup_sealed(ClientAuth::UpstreamClient).await;
     for (app, capture) in [(&passthrough, &capture1), (&sealed, &capture2)] {
         for presented in ["rrt1.anything", "rrt2.anything", "rrt7.anything"] {
-            let response = post_token(app, "google", &refresh_form(presented)).await;
+            let response = post_token(app, "google", &confidential_refresh_form(presented)).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{presented}");
             let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
             assert_eq!(body["error"], "invalid_grant", "{presented}");
@@ -4306,7 +4784,12 @@ async fn handle_prefixed_tokens_are_never_forwarded_in_any_mode() {
         );
     }
     // A raw token that merely resembles the prefix is an ordinary upstream token.
-    let response = post_token(&passthrough, "google", &refresh_form("rrt-not-a-handle")).await;
+    let response = post_token(
+        &passthrough,
+        "google",
+        &confidential_refresh_form("rrt-not-a-handle"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     task1.abort();
     task2.abort();
@@ -4316,7 +4799,7 @@ async fn handle_prefixed_tokens_are_never_forwarded_in_any_mode() {
 async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_failures() {
     let (app, sealer, task, _) = setup_with_refresh_tokens(
         "google",
-        ClientAuth::Public,
+        ClientAuth::UpstreamClient,
         default_layout(KeyStrategy::SingleSegment),
         None,
         EndpointConfiguration::Explicit,
@@ -4329,7 +4812,7 @@ async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_fai
     let response = post_token(
         &app,
         "google",
-        &refresh_form(&handle("broken-upstream").await),
+        &confidential_refresh_form(&handle("broken-upstream").await),
     )
     .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -4340,7 +4823,7 @@ async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_fai
     let response = post_token(
         &app,
         "google",
-        &refresh_form(&handle("revoked-upstream").await),
+        &confidential_refresh_form(&handle("revoked-upstream").await),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -4352,7 +4835,12 @@ async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_fai
     // With the upstream gone the failure is a 502 server_error, not a hang or a raw error.
     task.abort();
     let _ = task.await;
-    let response = post_token(&app, "google", &refresh_form(&handle("rotating").await)).await;
+    let response = post_token(
+        &app,
+        "google",
+        &confidential_refresh_form(&handle("rotating").await),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
     assert_eq!(body["error"], "server_error");
@@ -4627,9 +5115,9 @@ async fn rotating_mode_migrates_sealed_handles_and_rejects_raw_tokens() {
 
 #[tokio::test]
 async fn sealed_mode_rejects_rotating_handles() {
-    let (app, _, task, capture) = setup_sealed(ClientAuth::Public).await;
+    let (app, _, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
     let handle = format!("rrt2.{}", URL_SAFE_NO_PAD.encode([5_u8; 32]));
-    let response = post_token(&app, "google", &refresh_form(&handle)).await;
+    let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
     assert_eq!(body["error"], "invalid_grant");
@@ -4821,9 +5309,15 @@ async fn setup_flaky(
 ) {
     let sealer = Arc::new(FlakySealer::new(&[7_u8; 32]));
     let store = Arc::new(MemoryStore::default());
+    // A `Public` relay must rotate; the other modes use an `UpstreamClient` relay.
+    let auth = if refresh_tokens.mode == RefreshTokenMode::Rotating {
+        ClientAuth::Public
+    } else {
+        ClientAuth::UpstreamClient
+    };
     let (app, task, capture) = setup_with_sealer(
         "google",
-        ClientAuth::Public,
+        auth,
         default_layout(KeyStrategy::SingleSegment),
         None,
         EndpointConfiguration::Discovered,
@@ -4907,7 +5401,7 @@ async fn an_unavailable_sealer_fails_the_authorize_and_callback_legs_with_503() 
 async fn an_unavailable_sealer_leaves_a_sealed_mode_code_redeemable() {
     let (app, sealer, _, task, _) = setup_flaky(SEALED).await;
     let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
-    let form = code_grant_form(&code, SEALED_VERIFIER);
+    let form = confidential_code_grant_form(&code, SEALED_VERIFIER);
 
     // The code cannot be opened.
     sealer.set_unseal_down(true);
@@ -5002,7 +5496,7 @@ async fn an_unavailable_sealer_fails_a_sealed_refresh_with_503_and_keeps_the_han
     let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
         .await
         .unwrap();
-    let form = refresh_form(&handle);
+    let form = confidential_refresh_form(&handle);
 
     // The handle cannot be opened: not invalid_grant, and the upstream is not contacted.
     sealer.set_unseal_down(true);
@@ -5019,7 +5513,7 @@ async fn an_unavailable_sealer_fails_a_sealed_refresh_with_503_and_keeps_the_han
     assert_eq!(response.status(), StatusCode::OK);
 
     // A bad handle is still an invalid_grant while the sealer is up.
-    let response = post_token(&app, "google", &refresh_form("rrt1.garbage")).await;
+    let response = post_token(&app, "google", &confidential_refresh_form("rrt1.garbage")).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     task.abort();
 }

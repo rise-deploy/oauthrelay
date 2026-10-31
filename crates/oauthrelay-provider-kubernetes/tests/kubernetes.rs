@@ -34,7 +34,13 @@ async fn snapshot(
     .expect("provider snapshot converges")
 }
 fn relay_spec(auth: Value) -> Value {
-    json!({"upstreamRef":{"name":"issuer"},"clientAuthentication":auth,"redirectPolicy":[{"uri":"https://app.example/cb"}]})
+    let public = auth["type"] == "Public";
+    let mut spec = json!({"upstreamRef":{"name":"issuer"},"clientAuthentication":auth,"redirectPolicy":[{"uri":"https://app.example/cb"}]});
+    // A Public relay is only valid with rotating refresh tokens.
+    if public {
+        spec["refreshTokens"] = json!({"mode":"rotating"});
+    }
+    spec
 }
 fn relay(name: &str, auth: Value) -> Value {
     json!({"apiVersion":"oauthrelay.dev/v1alpha1","kind":"Relay","metadata":{"name":name,"namespace":"oauthrelay"},"spec":relay_spec(auth)})
@@ -272,6 +278,32 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
         assert!(
             matches!(&result, Err(kube::Error::Api(status)) if status.code == 422),
             "API must reject {auth}: {result:?}"
+        );
+    }
+
+    // The CRD's CEL rule rejects a Public relay without rotating refresh tokens at admission.
+    for refresh_tokens in [
+        None,
+        Some(json!({})),
+        Some(json!({"mode":"passthrough"})),
+        Some(json!({"mode":"sealed"})),
+    ] {
+        let mut invalid = relay("public-without-rotation", json!({"type":"Public"}));
+        match &refresh_tokens {
+            Some(value) => invalid["spec"]["refreshTokens"] = value.clone(),
+            None => {
+                invalid["spec"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("refreshTokens");
+            }
+        }
+        let result = dynamic_relays
+            .create(&dry_run, &serde_json::from_value(invalid).unwrap())
+            .await;
+        assert!(
+            matches!(&result, Err(kube::Error::Api(status)) if status.code == 422 && status.message.contains("Public requires refreshTokens.mode: rotating")),
+            "API must reject a Public relay with {refresh_tokens:?}: {result:?}"
         );
     }
 

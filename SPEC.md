@@ -75,7 +75,9 @@ transient store (see protocol invariants).
 
 - `UpstreamClient`: the downstream request presents the referenced upstream's client ID and
   secret.
-- `Public`: no client credential; S256 PKCE is mandatory.
+- `Public`: no client credential; S256 PKCE is mandatory, and `refresh_tokens.mode` must be
+  `Rotating`, because a public client's refresh tokens must be sender-constrained or rotated (RFC
+  9700 section 4.14.2) and the relay does not sender-constrain them. Validation rejects any other mode.
 - `ClientSecret`: a relay-specific client ID and secret are compared in constant time.
 - `PrivateKeyJwt`: a signed client assertion is verified against inline JWKS, a JWKS URL, or configured issuer discovery. `issuer` and `subject` are exact claim constraints, each defaulting to `clientId`; `client_id` must still match `clientId`. `audience` is an optional non-empty exact audience constraint, defaulting to the relay token endpoint URL; the JWT must contain it as a string or array element. Expiration is required, and optional `iat`/`nbf` timestamps are checked with 60 seconds of skew. Configured workload subjects may differ from the OAuth client ID. Tokens are reusable until expiry; verification does not call Kubernetes TokenReview.
 
@@ -96,7 +98,7 @@ For public base URL `B`, relay key `R`, and upstream key `U`:
 | `GET {B}/upstream/{U}/callback` | Unseals upstream-bound state, resolves the originating relay, exchanges the upstream code, and returns to the relay's validated application redirect. |
 | `POST {B}/relay/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged (a `sealed` or `rotating` relay replaces only `refresh_token`). |
 | `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. A `sealed` relay first opens the presented handle; a `rotating` relay claims it in the transient store and answers with a successor handle. |
-| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
+| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and members describing upstream identity and ID tokens, rewrites authorization and token endpoints to the relay, replaces the response types and modes, grant types, PKCE methods, request-object support, scopes (with `scopes.allowed`), and token endpoint authentication methods with what the relay accepts, and removes upstream endpoints and features the relay does not provide to its clients (every unrecognized `*_endpoint`; revocation and introspection outside `passthrough` mode). |
 | `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
 | `GET /healthz` | Standalone runtime liveness. |
 | `GET /readyz` | Ready after every configured provider supplies its first snapshot. |
@@ -115,7 +117,9 @@ unvalidated redirect URI is never reflected into a response.
 ## Protocol invariants
 
 - Authorization code flow only; query response mode only.
-- S256 PKCE only.
+- S256 PKCE only. A token request with `code_verifier` for a code whose authorization request had
+  no `code_challenge` is `invalid_grant` for every client authentication type (RFC 9700 section
+  4.8.2).
 - Flow-state TTL is 10 minutes.
 - Authorization-code TTL is 5 minutes.
 - Redirect policy uses explicit exact-URI, HTTPS-origin, or variable-port IP-loopback matchers.
