@@ -146,6 +146,25 @@ even when the provider returned none; present that one next.
 A relay in this mode with no transient store configured returns 500 `server_error` from the
 authorize endpoint and both grants and logs the cause.
 
+### Sealer unavailable
+
+A library embedder can supply a `Sealer` backed by a remote key service. When it reports
+`SealError::Unavailable`, or does not answer within five seconds during a rotation, the request fails
+without treating the value as invalid:
+
+- The token endpoint (code and refresh grants) returns 503 `server_error` and never returns a token.
+  The authorize and callback endpoints return a bare 503.
+- A refresh handle is usable again once the claim lease (at most 60 seconds) has expired. If the
+  provider rotated its refresh token during the failed attempt, the next refresh may be rejected by
+  the provider.
+- A `sealed`-mode authorization code stays redeemable. A `rotating`-mode code is consumed, because
+  its family is written to the store first; a retry answers `invalid_grant`.
+- Revoking a family still succeeds, so the client gets the usual `invalid_grant` or the provider's
+  error. The revocation marker blocks the family; the stored token it could not erase expires with the
+  family.
+
+A value the sealer reports as invalid keeps its `invalid_grant` (or 400) answer.
+
 ## Transparent metadata
 
 Relay metadata is useful to inspect the routed authorization and token endpoints, but is not a

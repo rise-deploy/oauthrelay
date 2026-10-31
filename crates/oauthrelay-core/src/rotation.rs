@@ -36,10 +36,11 @@
 
 use crate::{
     refresh_handle::{
-        names_refresh_token, open_handle, upstream_refresh_token, with_refresh_token, HANDLE_PREFIX,
+        names_refresh_token, open_handle, upstream_refresh_token, with_refresh_token, HandleError,
+        HANDLE_PREFIX,
     },
     router::StoredResponse,
-    RefreshTokens, ResourceKey, Sealer, StoreError, TransientStore,
+    RefreshTokens, ResourceKey, SealError, Sealer, StoreError, TransientStore,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -88,6 +89,11 @@ pub(crate) struct Timing {
     /// Age after which a claim is presumed abandoned (its holder crashed or was suspended) and
     /// the handle can be claimed again. It must exceed `upstream_timeout`.
     pub claim_lease: Duration,
+    /// How long a single seal or unseal may take before it fails as unavailable. A claim holder
+    /// seals once to take the claim and three times to commit, around the upstream refresh, and
+    /// must finish before the lease ends or another caller takes the claim over and replays the
+    /// upstream token. So `upstream_timeout + 4 * sealer_timeout` must stay below `claim_lease`.
+    pub sealer_timeout: Duration,
 }
 
 impl Default for Timing {
@@ -97,6 +103,7 @@ impl Default for Timing {
             resolve_wait: Duration::from_secs(5),
             upstream_timeout: Duration::from_secs(30),
             claim_lease: Duration::from_secs(60),
+            sealer_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -121,6 +128,8 @@ pub(crate) trait UpstreamRefresher: Send + Sync {
 pub(crate) enum IssueError {
     /// The store failed.
     Store,
+    /// The sealer could not be reached.
+    SealerUnavailable,
     /// A 2xx body that is not a JSON object yet carries a refresh token.
     UnrecognizedBody,
 }
@@ -141,6 +150,8 @@ pub(crate) enum RefreshOutcome {
     UpstreamUnusable,
     /// The store failed. The request fails closed.
     StoreFailed,
+    /// The sealer could not be reached. The request fails closed; the stored state is untouched.
+    SealerUnavailable,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,9 +162,22 @@ enum Fault {
     /// a key that is no longer configured.
     #[error("a stored refresh-token value could not be sealed or opened")]
     Sealing,
+    /// The sealer could not be reached, so nothing is known about the value. Unlike `Sealing`,
+    /// this is never evidence of tampering and never causes a record to be discarded.
+    #[error("the sealer is unavailable")]
+    SealerUnavailable,
     /// A create-only write found a record that a random key cannot have.
     #[error("a refresh-token record that must be new already exists")]
     Conflict,
+}
+
+impl Fault {
+    fn from_seal_error(error: SealError) -> Self {
+        match error {
+            SealError::Unavailable => Self::SealerUnavailable,
+            SealError::InvalidKey | SealError::InvalidEnvelope => Self::Sealing,
+        }
+    }
 }
 
 type Result<T, E = Fault> = std::result::Result<T, E>;
@@ -242,12 +266,16 @@ impl Rotator {
 
     /// Starts a family for the upstream token of a code grant and returns its first handle, or
     /// `Err` when the store failed (the caller must not return the upstream token).
-    pub(crate) async fn issue(&self, upstream_token: &str) -> Result<String, ()> {
+    pub(crate) async fn issue(&self, upstream_token: &str) -> Result<String, IssueError> {
         let handle = new_handle();
         let created = self.create_family(&handle, upstream_token).await;
-        created
-            .map(|()| handle)
-            .map_err(|fault| self.log_fault(&fault))
+        created.map(|()| handle).map_err(|fault| {
+            self.log_fault(&fault);
+            match fault {
+                Fault::SealerUnavailable => IssueError::SealerUnavailable,
+                _ => IssueError::Store,
+            }
+        })
     }
 
     /// Replaces the `refresh_token` of a successful code-grant response with a new family's first
@@ -271,7 +299,7 @@ impl Rotator {
                 Ok(None)
             };
         };
-        let handle = self.issue(&token).await.map_err(|()| IssueError::Store)?;
+        let handle = self.issue(&token).await?;
         with_refresh_token(response.status, &response.body, &handle)
             .map(Some)
             .ok_or(IssueError::UnrecognizedBody)
@@ -296,6 +324,8 @@ impl Rotator {
                 // The record exists but this relay cannot open it (seal key replaced, or the
                 // value was tampered with). Retrying cannot help, so the client signs in again.
                 Fault::Sealing => RefreshOutcome::InvalidGrant,
+                // The key service did not answer; the record may be perfectly good.
+                Fault::SealerUnavailable => RefreshOutcome::SealerUnavailable,
                 Fault::Store(_) | Fault::Conflict => RefreshOutcome::StoreFailed,
             }
         })
@@ -308,8 +338,17 @@ impl Rotator {
         presented: &str,
         upstream: &dyn UpstreamRefresher,
     ) -> Result<RefreshOutcome> {
-        let Ok(opened) = open_handle(self.sealer.as_ref(), &self.relay, presented) else {
-            return Ok(RefreshOutcome::InvalidGrant);
+        let opened = match tokio::time::timeout(
+            self.timing.sealer_timeout,
+            open_handle(self.sealer.as_ref(), &self.relay, presented),
+        )
+        .await
+        {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(HandleError::Invalid)) => return Ok(RefreshOutcome::InvalidGrant),
+            Ok(Err(HandleError::SealerUnavailable)) | Err(_) => {
+                return Err(Fault::SealerUnavailable)
+            }
         };
         // The sealed handle records when it was issued. Past the maximum lifetime it no longer
         // earns a family: the user signs in again.
@@ -432,19 +471,21 @@ impl Rotator {
             return Ok(None);
         };
         let claim_id = random_array::<16>();
-        let bytes = self.seal(
-            RECORD_PURPOSE,
-            handle_key,
-            &Record {
-                family_id: loaded.record.family_id,
-                family_expires_ms: loaded.record.family_expires_ms,
-                state: State::Claimed {
-                    upstream_token: upstream_token.to_owned(),
-                    claim_id,
-                    claimed_ms: now,
+        let bytes = self
+            .seal(
+                RECORD_PURPOSE,
+                handle_key,
+                &Record {
+                    family_id: loaded.record.family_id,
+                    family_expires_ms: loaded.record.family_expires_ms,
+                    state: State::Claimed {
+                        upstream_token: upstream_token.to_owned(),
+                        claim_id,
+                        claimed_ms: now,
+                    },
                 },
-            },
-        )?;
+            )
+            .await?;
         let won = self
             .store
             .compare_and_swap(handle_key, &loaded.bytes, &bytes, ttl)
@@ -598,7 +639,7 @@ impl Rotator {
         let successor_key = self.handle_key(successor_handle);
         let grace_ttl = (self.grace + GRACE_RESPONSE_MARGIN).min(family_ttl);
         let prepared = async {
-            let sealed_response = self.seal(GRACE_PURPOSE, &grace_key, response)?;
+            let sealed_response = self.seal(GRACE_PURPOSE, &grace_key, response).await?;
             if !self
                 .store
                 .put_if_absent(&grace_key, &sealed_response, grace_ttl)
@@ -606,17 +647,19 @@ impl Rotator {
             {
                 return Err(Fault::Conflict);
             }
-            let successor = self.seal(
-                RECORD_PURPOSE,
-                &successor_key,
-                &Record {
-                    family_id: claim.family_id,
-                    family_expires_ms: claim.family_expires_ms,
-                    state: State::Active {
-                        upstream_token: successor_token.to_owned(),
+            let successor = self
+                .seal(
+                    RECORD_PURPOSE,
+                    &successor_key,
+                    &Record {
+                        family_id: claim.family_id,
+                        family_expires_ms: claim.family_expires_ms,
+                        state: State::Active {
+                            upstream_token: successor_token.to_owned(),
+                        },
                     },
-                },
-            )?;
+                )
+                .await?;
             if !self
                 .store
                 .put_if_absent(&successor_key, &successor, family_ttl)
@@ -637,6 +680,7 @@ impl Rotator {
                     },
                 },
             )
+            .await
         }
         .await;
         let rotated = match prepared {
@@ -681,17 +725,19 @@ impl Rotator {
     /// Hands the claim back so the handle can be presented again. Best effort: if it fails the
     /// claim lease expires on its own.
     async fn release(&self, handle_key: &str, claim: &Claim) {
-        let released = self.seal(
-            RECORD_PURPOSE,
-            handle_key,
-            &Record {
-                family_id: claim.family_id,
-                family_expires_ms: claim.family_expires_ms,
-                state: State::Active {
-                    upstream_token: claim.upstream_token.clone(),
+        let released = self
+            .seal(
+                RECORD_PURPOSE,
+                handle_key,
+                &Record {
+                    family_id: claim.family_id,
+                    family_expires_ms: claim.family_expires_ms,
+                    state: State::Active {
+                        upstream_token: claim.upstream_token.clone(),
+                    },
                 },
-            },
-        );
+            )
+            .await;
         let now = (self.clock)();
         let Some(ttl) = ttl_until(claim.family_expires_ms, now) else {
             return;
@@ -764,17 +810,19 @@ impl Rotator {
         let ttl = ttl_until(family_expires_ms, now).ok_or(Fault::Conflict)?;
         let key = self.handle_key(handle);
         let family_id = random_array::<16>();
-        let bytes = self.seal(
-            RECORD_PURPOSE,
-            &key,
-            &Record {
-                family_id,
-                family_expires_ms,
-                state: State::Active {
-                    upstream_token: upstream_token.to_owned(),
+        let bytes = self
+            .seal(
+                RECORD_PURPOSE,
+                &key,
+                &Record {
+                    family_id,
+                    family_expires_ms,
+                    state: State::Active {
+                        upstream_token: upstream_token.to_owned(),
+                    },
                 },
-            },
-        )?;
+            )
+            .await?;
         if !self.store.put_if_absent(&key, &bytes, ttl).await? {
             return Err(Fault::Conflict);
         }
@@ -792,7 +840,7 @@ impl Rotator {
         let Some(entry) = self.store.get(key).await? else {
             return Ok(None);
         };
-        let record = self.open(RECORD_PURPOSE, key, &entry.value)?;
+        let record = self.open(RECORD_PURPOSE, key, &entry.value).await?;
         Ok(Some(Loaded {
             bytes: entry.value,
             record,
@@ -803,7 +851,7 @@ impl Rotator {
         let Some(entry) = self.store.get(key).await? else {
             return Ok(None);
         };
-        Ok(Some(self.open(GRACE_PURPOSE, key, &entry.value)?))
+        Ok(Some(self.open(GRACE_PURPOSE, key, &entry.value).await?))
     }
 
     async fn is_revoked(&self, family_id: &[u8; 16]) -> Result<bool> {
@@ -838,12 +886,30 @@ impl Rotator {
             .await?
             .and_then(|entry| String::from_utf8(entry.value).ok());
         if let Some(head) = head.as_deref() {
-            self.erase_tokens(head).await?;
+            self.erase_tokens_if_sealer_available(head).await?;
         }
         if head.as_deref() != Some(known_key) {
-            self.erase_tokens(known_key).await?;
+            self.erase_tokens_if_sealer_available(known_key).await?;
         }
         Ok(())
+    }
+
+    /// `erase_tokens`, except that an unavailable sealer is logged and tolerated. The revocation
+    /// marker is already written and every refresh checks it, so the family is dead either way;
+    /// the record that was not erased keeps its token only until the family's lifetime ends. The
+    /// caller still answers with `invalid_grant` or the provider's error.
+    async fn erase_tokens_if_sealer_available(&self, start: &str) -> Result<()> {
+        match self.erase_tokens(start).await {
+            Err(Fault::SealerUnavailable) => {
+                tracing::warn!(
+                    target: "oauthrelay::refresh",
+                    relay = %self.relay,
+                    "revoked family's stored token could not be erased because the sealer is unavailable; the revocation marker still blocks it"
+                );
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     /// Follows the chain of rotated records from `start` and deletes the first record that holds
@@ -914,25 +980,34 @@ impl Rotator {
         format!("{purpose}\0{}\0{key}", self.relay).into_bytes()
     }
 
-    fn seal<T: Serialize>(&self, purpose: &str, key: &str, value: &T) -> Result<Vec<u8>> {
+    async fn seal<T: Serialize>(&self, purpose: &str, key: &str, value: &T) -> Result<Vec<u8>> {
         let plaintext = postcard::to_stdvec(value).map_err(|_| Fault::Sealing)?;
-        self.sealer
-            .seal(&plaintext, &self.associated_data(purpose, key))
-            .map(String::into_bytes)
-            .map_err(|_| Fault::Sealing)
+        tokio::time::timeout(
+            self.timing.sealer_timeout,
+            self.sealer
+                .seal(&plaintext, &self.associated_data(purpose, key)),
+        )
+        .await
+        .map_err(|_| Fault::SealerUnavailable)?
+        .map(String::into_bytes)
+        .map_err(Fault::from_seal_error)
     }
 
-    fn open<T: for<'de> Deserialize<'de>>(
+    async fn open<T: for<'de> Deserialize<'de>>(
         &self,
         purpose: &str,
         key: &str,
         bytes: &[u8],
     ) -> Result<T> {
         let envelope = std::str::from_utf8(bytes).map_err(|_| Fault::Sealing)?;
-        let plaintext = self
-            .sealer
-            .unseal(envelope, &self.associated_data(purpose, key))
-            .map_err(|_| Fault::Sealing)?;
+        let plaintext = tokio::time::timeout(
+            self.timing.sealer_timeout,
+            self.sealer
+                .unseal(envelope, &self.associated_data(purpose, key)),
+        )
+        .await
+        .map_err(|_| Fault::SealerUnavailable)?
+        .map_err(Fault::from_seal_error)?;
         postcard::from_bytes(&plaintext).map_err(|_| Fault::Sealing)
     }
 
@@ -993,7 +1068,9 @@ fn is_invalid_grant(response: &StoredResponse) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{refresh_handle::seal_handle, Entry, MemoryStore, XChaChaSealer};
+    use crate::{
+        refresh_handle::seal_handle, seal::FlakySealer, Entry, MemoryStore, XChaChaSealer,
+    };
     use std::{
         collections::VecDeque,
         sync::{
@@ -1140,7 +1217,7 @@ mod tests {
 
     struct Harness {
         store: Arc<SpyStore>,
-        sealer: Arc<XChaChaSealer>,
+        sealer: Arc<FlakySealer>,
         now: Arc<AtomicU64>,
         rotator: Arc<Rotator>,
     }
@@ -1155,6 +1232,7 @@ mod tests {
             resolve_wait: Duration::from_secs(2),
             upstream_timeout: Duration::from_secs(30),
             claim_lease: Duration::from_secs(60),
+            sealer_timeout: Duration::from_secs(2),
         }
     }
 
@@ -1164,7 +1242,7 @@ mod tests {
         }
 
         fn with(store: Arc<SpyStore>, relay: &str, timing: Timing) -> Self {
-            let sealer = Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap());
+            let sealer = Arc::new(FlakySealer::new(&[7; 32]));
             let now = Arc::new(AtomicU64::new(START_MS));
             let rotator = Arc::new(Self::rotator(&store, &sealer, &now, relay, timing));
             Self {
@@ -1177,7 +1255,7 @@ mod tests {
 
         fn rotator(
             store: &Arc<SpyStore>,
-            sealer: &Arc<XChaChaSealer>,
+            sealer: &Arc<FlakySealer>,
             now: &Arc<AtomicU64>,
             relay: &str,
             timing: Timing,
@@ -1649,6 +1727,7 @@ mod tests {
             "up-legacy",
             START_MS / 1000,
         )
+        .await
         .unwrap();
         assert!(legacy.starts_with("rrt1."));
         let handle = successor(harness.refresh(&legacy, &upstream).await);
@@ -1669,6 +1748,7 @@ mod tests {
             "up-x",
             START_MS / 1000,
         )
+        .await
         .unwrap();
         assert_invalid_grant(harness.refresh(&foreign, &upstream).await);
         let failing =
@@ -1857,22 +1937,264 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unavailable_sealer_is_not_tampering() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let first = harness.issue("up-0").await;
+        let legacy = seal_handle(
+            harness.sealer.as_ref(),
+            &key("app"),
+            "up-legacy",
+            START_MS / 1000,
+        )
+        .await
+        .unwrap();
+
+        // Opening is down: the handle is neither rejected nor revoked, and the upstream is not
+        // asked.
+        harness.sealer.set_unseal_down(true);
+        for handle in [&first, &legacy] {
+            let outcome = harness.refresh(handle, &upstream).await;
+            assert!(
+                matches!(outcome, RefreshOutcome::SealerUnavailable),
+                "{outcome:?}"
+            );
+        }
+        assert!(upstream.calls().is_empty());
+        harness.sealer.set_unseal_down(false);
+        let family = harness.load(&first).await.unwrap();
+        assert!(!harness.revoked(&family).await);
+
+        // Sealing is down: the claim cannot be written, so the upstream is not asked.
+        harness.sealer.set_seal_down(true);
+        let outcome = harness.refresh(&first, &upstream).await;
+        assert!(
+            matches!(outcome, RefreshOutcome::SealerUnavailable),
+            "{outcome:?}"
+        );
+        assert!(upstream.calls().is_empty());
+        harness.sealer.set_seal_down(false);
+
+        // Once the sealer is back, the same handle and the legacy handle both still work.
+        assert!(successor(harness.refresh(&first, &upstream).await).starts_with("rrt2."));
+        assert!(successor(harness.refresh(&legacy, &upstream).await).starts_with("rrt2."));
+        assert_eq!(upstream.calls(), ["up-0", "up-legacy"]);
+    }
+
+    #[tokio::test]
+    async fn issuing_with_an_unavailable_sealer_stores_nothing() {
+        let harness = Harness::new();
+        harness.sealer.set_seal_down(true);
+        assert_eq!(
+            harness.rotator.issue("up-0").await,
+            Err(IssueError::SealerUnavailable)
+        );
+        assert!(harness.store.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasing_keeps_records_the_sealer_could_not_open() {
+        let harness = Harness::new();
+        let first = harness.issue("up-0").await;
+        let handle_key = harness.rotator.handle_key(&first);
+
+        harness.sealer.set_unseal_down(true);
+        assert!(matches!(
+            harness.rotator.erase_tokens(&handle_key).await,
+            Err(Fault::SealerUnavailable)
+        ));
+        harness.sealer.set_unseal_down(false);
+        assert!(harness.load(&first).await.is_some());
+
+        // A record that really cannot be opened is discarded.
+        let other_install = XChaChaSealer::new(&[9; 32], None).unwrap();
+        let foreign = other_install
+            .seal(b"not a record", b"unrelated")
+            .await
+            .unwrap();
+        harness
+            .store
+            .inner
+            .put_if_absent(
+                "refresh:handle:foreign",
+                foreign.as_bytes(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        harness
+            .rotator
+            .erase_tokens("refresh:handle:foreign")
+            .await
+            .unwrap();
+        assert!(harness
+            .store
+            .inner
+            .get("refresh:handle:foreign")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_claim_holder_finishes_within_the_lease_even_when_every_seal_times_out_late() {
+        let timing = Timing::default();
+        assert!(
+            timing.upstream_timeout + 4 * timing.sealer_timeout < timing.claim_lease,
+            "{timing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hanging_sealer_is_cut_off_and_reported_unavailable() {
+        let timing = Timing {
+            sealer_timeout: Duration::from_millis(50),
+            ..fast_timing()
+        };
+        let harness = Harness::with(SpyStore::new(), "app", timing);
+        let upstream = FakeUpstream::scripted(vec![]);
+        let first = harness.issue("up-0").await;
+        let legacy = seal_handle(
+            harness.sealer.as_ref(),
+            &key("app"),
+            "up-legacy",
+            START_MS / 1000,
+        )
+        .await
+        .unwrap();
+
+        harness.sealer.set_hang(true);
+        for handle in [&first, &legacy] {
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(5), harness.refresh(handle, &upstream))
+                    .await
+                    .expect("the sealer timeout bounds the request");
+            assert!(
+                matches!(outcome, RefreshOutcome::SealerUnavailable),
+                "{outcome:?}"
+            );
+        }
+        assert!(upstream.calls().is_empty());
+        let issued = tokio::time::timeout(Duration::from_secs(5), harness.rotator.issue("up-1"))
+            .await
+            .expect("the sealer timeout bounds issuing");
+        assert_eq!(issued, Err(IssueError::SealerUnavailable));
+    }
+
+    #[tokio::test]
+    async fn a_seal_failure_inside_commit_leaves_the_claim_to_expire_and_returns_no_token() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let first = harness.issue("up-0").await;
+        let handle_key = harness.rotator.handle_key(&first);
+        let writes_before = harness.store.writes.lock().unwrap().len();
+
+        // The claim and the grace response seal; the successor record does not.
+        harness.sealer.fail_seals_after(2);
+        let outcome = harness.refresh(&first, &upstream).await;
+        assert!(
+            matches!(outcome, RefreshOutcome::SealerUnavailable),
+            "{outcome:?}"
+        );
+        // The upstream was asked, so its token was spent in this attempt.
+        assert_eq!(upstream.calls(), ["up-0"]);
+
+        // Nothing but the claim remains: no grace response, no successor.
+        let writes = harness.store.writes.lock().unwrap().clone();
+        let claim_bytes = writes[writes_before..]
+            .iter()
+            .find(|(key, _)| *key == handle_key)
+            .map(|(_, value)| value.clone())
+            .expect("the claim was written");
+        for (key, _) in &writes[writes_before..] {
+            if *key != handle_key {
+                assert!(
+                    harness.store.inner.get(key).await.unwrap().is_none(),
+                    "{key} should have been removed"
+                );
+            }
+        }
+        let stored = harness.store.inner.get(&handle_key).await.unwrap().unwrap();
+        assert_eq!(stored.value, claim_bytes, "the claimed record is unchanged");
+        harness.sealer.reset_budgets();
+        let loaded = harness.load(&first).await.unwrap();
+        assert!(matches!(loaded.record.state, State::Claimed { .. }));
+
+        // While the claim is fresh the handle is held; once the lease passes it is taken over.
+        harness.advance(Duration::from_secs(61));
+        let second = successor(harness.refresh(&first, &upstream).await);
+        assert!(second.starts_with("rrt2."));
+        assert_eq!(upstream.calls(), ["up-0", "up-0"]);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_sealer_does_not_turn_a_revocation_into_an_error() {
+        let harness = Harness::new();
+        let first = harness.issue("up-0").await;
+        let family = harness.load(&first).await.unwrap();
+        let handle_key = harness.rotator.handle_key(&first);
+
+        // Upstream invalid_grant: the family is revoked and the provider's error comes back even
+        // though the stored token could not be opened to erase it.
+        let rejecting = FakeUpstream::scripted(vec![Ok(StoredResponse {
+            status: 400,
+            content_type: Some("application/json".into()),
+            body: br#"{"error":"invalid_grant"}"#.to_vec(),
+        })]);
+        harness.sealer.fail_unseals_after(1);
+        assert!(matches!(
+            harness.refresh(&first, &rejecting).await,
+            RefreshOutcome::Response(response) if response.status == 400
+        ));
+        harness.sealer.reset_budgets();
+        assert!(harness.revoked(&family).await);
+        assert!(harness
+            .store
+            .inner
+            .get(&handle_key)
+            .await
+            .unwrap()
+            .is_some());
+        assert_invalid_grant(harness.refresh(&first, &rejecting).await);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_sealer_does_not_turn_reuse_detection_into_an_error() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let first = harness.issue("up-0").await;
+        let second = successor(harness.refresh(&first, &upstream).await);
+        let family = harness.load(&first).await.unwrap();
+        harness.advance(Duration::from_secs(GRACE_SECONDS + 1));
+
+        // The record is read once to see that the handle was rotated; the erase that follows
+        // cannot open anything.
+        harness.sealer.fail_unseals_after(1);
+        assert_invalid_grant(harness.refresh(&first, &upstream).await);
+        harness.sealer.reset_budgets();
+        assert!(harness.revoked(&family).await);
+        assert_invalid_grant(harness.refresh(&second, &upstream).await);
+    }
+
+    #[tokio::test]
     async fn sealed_handles_past_the_maximum_lifetime_are_rejected() {
         let harness = Harness::new();
         let upstream = FakeUpstream::scripted(vec![]);
         let issued = START_MS / 1000;
-        let handle = |issued_at: u64| {
-            seal_handle(harness.sealer.as_ref(), &key("app"), "up-legacy", issued_at).unwrap()
+        let handle = async |issued_at: u64| {
+            seal_handle(harness.sealer.as_ref(), &key("app"), "up-legacy", issued_at)
+                .await
+                .unwrap()
         };
         // Just inside the lifetime migrates; at and beyond it does not reach the upstream.
-        let recent = handle(issued - LIFETIME_SECONDS + 1);
+        let recent = handle(issued - LIFETIME_SECONDS + 1).await;
         assert!(matches!(
             harness.refresh(&recent, &upstream).await,
             RefreshOutcome::Response(_)
         ));
-        let expired = handle(issued - LIFETIME_SECONDS);
+        let expired = handle(issued - LIFETIME_SECONDS).await;
         assert_invalid_grant(harness.refresh(&expired, &upstream).await);
-        assert_invalid_grant(harness.refresh(&handle(0), &upstream).await);
+        assert_invalid_grant(harness.refresh(&handle(0).await, &upstream).await);
         assert_eq!(upstream.calls().len(), 1);
     }
 
