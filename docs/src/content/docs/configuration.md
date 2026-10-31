@@ -435,6 +435,12 @@ assertion alone and ignores the `Authorization` header.
 The token endpoint's CORS policy allows only the `Content-Type` request header, so browser relying
 parties cannot send `Authorization: Basic`; they are `Public` clients.
 
+The relay's metadata advertises the accepted methods in `token_endpoint_auth_methods_supported`:
+`client_secret_basic` and `client_secret_post` for `UpstreamClient` and `ClientSecret`, `none` for
+`Public`, and `private_key_jwt`, with the accepted assertion algorithms in
+`token_endpoint_auth_signing_alg_values_supported`, for `PrivateKeyJwt` (see
+[Transparent metadata](/oauthrelay/reference/http-endpoints/#transparent-metadata)).
+
 ### UpstreamClient
 
 The relying party presents the referenced upstream's client ID and secret. This is useful when a

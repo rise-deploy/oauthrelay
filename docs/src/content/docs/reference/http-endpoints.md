@@ -13,7 +13,7 @@ upstream name `U`, oauthrelay serves:
 | `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. A relay with `refreshTokens.mode: sealed` or `rotating` replaces only the `refresh_token` member. |
 | `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. A `sealed` relay opens the presented handle first; a `rotating` relay claims it and returns a successor handle. |
 | `OPTIONS {B}/relay/{R}/token` | Returns CORS headers only for an allowed origin. |
-| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
+| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata, rewrites authorization and token endpoints to the relay, and describes what the relay accepts (see [Transparent metadata](#transparent-metadata)). |
 | `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
 | `GET /healthz` | Reports standalone process liveness. |
 | `GET /readyz` | Reports readiness after initial provider snapshots are available. |
@@ -126,3 +126,29 @@ Relay metadata is useful to inspect the routed authorization and token endpoints
 portable OIDC Discovery contract. The metadata URL is hosted by oauthrelay while `issuer` remains the
 upstream issuer. Configure transparent-relay relying parties with manual endpoints as described in
 [Relay trust model](/oauthrelay/relay-model/).
+
+The document starts from the upstream's discovery metadata (or an empty document when all upstream
+endpoints are configured explicitly) and keeps what still holds for a client of the relay: the
+issuer, `jwks_uri`, `userinfo_endpoint` (it takes the upstream access token, which the relay never
+replaces), `end_session_endpoint`, ID-token, claim, and subject-type members, and members
+oauthrelay does not recognize. Members that describe the relay's own endpoints are replaced:
+
+| Member | Value |
+| --- | --- |
+| `authorization_endpoint`, `token_endpoint` | The relay's endpoints. |
+| `response_types_supported` | `["code"]` |
+| `response_modes_supported` | `["query"]` |
+| `grant_types_supported` | `authorization_code` and `refresh_token`, minus any the upstream's own `grant_types_supported` omits. |
+| `code_challenge_methods_supported` | `["S256"]` |
+| `request_parameter_supported`, `request_uri_parameter_supported` | `false` |
+| `scopes_supported` | The relay's `scopes.allowed` when configured; otherwise the upstream's value. |
+| `token_endpoint_auth_methods_supported` | `UpstreamClient` and `ClientSecret`: `["client_secret_basic", "client_secret_post"]`. `Public`: `["none"]`. `PrivateKeyJwt`: `["private_key_jwt"]`. |
+| `token_endpoint_auth_signing_alg_values_supported` | `PrivateKeyJwt` only: the accepted assertion algorithms, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`, and `EdDSA`. Removed otherwise. |
+
+Members for endpoints and features a client of the relay cannot use are removed: dynamic client
+registration, device authorization, pushed authorization requests, CIBA, mTLS endpoint aliases and
+certificate-bound tokens, DPoP, request objects, JARM, session-management and front- or back-channel
+logout, and `signed_metadata`, whose values would take precedence over the relay's. The upstream
+`revocation_endpoint` and `introspection_endpoint`, with their authentication members, remain only
+for an `UpstreamClient` relay in `passthrough` refresh-token mode, whose clients hold both the
+upstream client credentials and the upstream tokens those endpoints accept.

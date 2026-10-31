@@ -36,6 +36,18 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const ID_TOKEN_CLOCK_SKEW: u64 = 60;
+/// Signature algorithms accepted for `private_key_jwt` client assertions.
+const CLIENT_ASSERTION_ALGORITHMS: [Algorithm; 9] = [
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::EdDSA,
+];
 
 /// HTTP transport for client assertion trust metadata and keys. Redirects are rejected.
 /// The builder permits custom TLS roots without weakening the redirect policy or request deadline.
@@ -1513,18 +1525,7 @@ async fn verify_private_key_jwt(
     require_single_use: bool,
 ) -> Result<(), ()> {
     let header = decode_header(assertion).map_err(|_| ())?;
-    if !matches!(
-        header.alg,
-        Algorithm::RS256
-            | Algorithm::RS384
-            | Algorithm::RS512
-            | Algorithm::PS256
-            | Algorithm::PS384
-            | Algorithm::PS512
-            | Algorithm::ES256
-            | Algorithm::ES384
-            | Algorithm::EdDSA
-    ) {
+    if !CLIENT_ASSERTION_ALGORITHMS.contains(&header.alg) {
         return Err(());
     }
     let remote_url = match source {
@@ -1671,7 +1672,103 @@ async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Resp
     } else if let Some(object) = doc.as_object_mut() {
         object.remove("jwks_uri");
     }
+    if let Some(object) = doc.as_object_mut() {
+        describe_relay(object, relay);
+    }
     Json(doc).into_response()
+}
+
+/// Upstream metadata for endpoints and features a client of the relay cannot use: the relay does
+/// not front these endpoints, does not relay the grants or request forms they belong to, or
+/// (`signed_metadata`) they would override the relay's own values.
+const UPSTREAM_ONLY_METADATA: &[&str] = &[
+    "registration_endpoint",
+    "device_authorization_endpoint",
+    "pushed_authorization_request_endpoint",
+    "require_pushed_authorization_requests",
+    "backchannel_authentication_endpoint",
+    "backchannel_authentication_request_signing_alg_values_supported",
+    "backchannel_token_delivery_modes_supported",
+    "backchannel_user_code_parameter_supported",
+    "mtls_endpoint_aliases",
+    "tls_client_certificate_bound_access_tokens",
+    "dpop_signing_alg_values_supported",
+    "require_request_uri_registration",
+    "require_signed_request_object",
+    "request_object_signing_alg_values_supported",
+    "request_object_encryption_alg_values_supported",
+    "request_object_encryption_enc_values_supported",
+    "authorization_signing_alg_values_supported",
+    "authorization_encryption_alg_values_supported",
+    "authorization_encryption_enc_values_supported",
+    "check_session_iframe",
+    "frontchannel_logout_supported",
+    "frontchannel_logout_session_supported",
+    "backchannel_logout_supported",
+    "backchannel_logout_session_supported",
+    "signed_metadata",
+];
+
+/// Upstream token revocation and introspection. They accept only the upstream's own tokens and
+/// client credentials, so they stay only for an `UpstreamClient` relay in `passthrough` mode,
+/// whose clients hold both.
+const UPSTREAM_TOKEN_MANAGEMENT_METADATA: &[&str] = &[
+    "revocation_endpoint",
+    "revocation_endpoint_auth_methods_supported",
+    "revocation_endpoint_auth_signing_alg_values_supported",
+    "introspection_endpoint",
+    "introspection_endpoint_auth_methods_supported",
+    "introspection_endpoint_auth_signing_alg_values_supported",
+];
+
+/// Replaces upstream metadata that would misdescribe the relay with what the relay's own
+/// authorization and token endpoints accept. Members describing the upstream identity and its ID
+/// tokens, which pass through unchanged, are kept.
+fn describe_relay(doc: &mut serde_json::Map<String, Value>, relay: &Relay) {
+    for name in UPSTREAM_ONLY_METADATA {
+        doc.remove(*name);
+    }
+    if !(matches!(relay.client_auth, ClientAuth::UpstreamClient)
+        && relay.refresh_tokens.mode == RefreshTokenMode::Passthrough)
+    {
+        for name in UPSTREAM_TOKEN_MANAGEMENT_METADATA {
+            doc.remove(*name);
+        }
+    }
+    doc.insert("response_types_supported".into(), json!(["code"]));
+    doc.insert("response_modes_supported".into(), json!(["query"]));
+    // The relay forwards the refresh grant, so it is only as available as the upstream says.
+    let grant_types: Vec<_> = ["authorization_code", "refresh_token"]
+        .into_iter()
+        .filter(|grant| {
+            doc.get("grant_types_supported")
+                .and_then(Value::as_array)
+                .is_none_or(|upstream| upstream.iter().any(|value| value == grant))
+        })
+        .collect();
+    doc.insert("grant_types_supported".into(), json!(grant_types));
+    doc.insert("code_challenge_methods_supported".into(), json!(["S256"]));
+    doc.insert("request_parameter_supported".into(), Value::Bool(false));
+    doc.insert("request_uri_parameter_supported".into(), Value::Bool(false));
+    if let Some(allowed) = &relay.allowed_scopes {
+        doc.insert("scopes_supported".into(), json!(allowed));
+    }
+    let auth_methods = match &relay.client_auth {
+        ClientAuth::UpstreamClient | ClientAuth::ClientSecret { .. } => {
+            json!(["client_secret_basic", "client_secret_post"])
+        }
+        ClientAuth::Public => json!(["none"]),
+        ClientAuth::PrivateKeyJwt { .. } => json!(["private_key_jwt"]),
+    };
+    doc.insert("token_endpoint_auth_methods_supported".into(), auth_methods);
+    if matches!(relay.client_auth, ClientAuth::PrivateKeyJwt { .. }) {
+        doc.insert(
+            "token_endpoint_auth_signing_alg_values_supported".into(),
+            json!(CLIENT_ASSERTION_ALGORITHMS),
+        );
+    } else {
+        doc.remove("token_endpoint_auth_signing_alg_values_supported");
+    }
 }
 
 async fn jwks(state: &AppState, upstream: &Upstream) -> Response {

@@ -60,6 +60,33 @@ async fn mock_discovery(State(state): State<MockIdpState>) -> Json<Value> {
         "authorization_endpoint": state.base.join("authorize").unwrap(),
         "token_endpoint": state.base.join("token").unwrap(),
         "jwks_uri": state.base.join("jwks").unwrap(),
+        "userinfo_endpoint": state.base.join("userinfo").unwrap(),
+        "end_session_endpoint": state.base.join("logout").unwrap(),
+        "revocation_endpoint": state.base.join("revoke").unwrap(),
+        "revocation_endpoint_auth_methods_supported": ["client_secret_post"],
+        "introspection_endpoint": state.base.join("introspect").unwrap(),
+        "device_authorization_endpoint": state.base.join("device").unwrap(),
+        "pushed_authorization_request_endpoint": state.base.join("par").unwrap(),
+        "require_pushed_authorization_requests": false,
+        "registration_endpoint": state.base.join("register").unwrap(),
+        "mtls_endpoint_aliases": {"token_endpoint": state.base.join("mtls/token").unwrap()},
+        "signed_metadata": "eyJhbGciOiJSUzI1NiJ9.e30.c2ln",
+        "response_types_supported": ["code", "id_token", "code id_token"],
+        "response_modes_supported": ["query", "fragment", "form_post"],
+        "grant_types_supported": [
+            "authorization_code",
+            "refresh_token",
+            "implicit",
+            "urn:ietf:params:oauth:grant-type:device_code"
+        ],
+        "code_challenge_methods_supported": ["plain", "S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "private_key_jwt"],
+        "token_endpoint_auth_signing_alg_values_supported": ["HS256", "RS256"],
+        "request_parameter_supported": true,
+        "scopes_supported": ["openid", "email", "profile", "offline_access"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "claims_supported": ["sub", "email"],
         "custom_field": "preserved"
     }))
 }
@@ -2415,6 +2442,193 @@ async fn discovery_supplies_jwks_when_other_endpoints_are_explicit() {
         json!({ "keys": [] })
     );
     task.abort();
+}
+
+async fn relay_discovery(app: &Router, key: &str) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/relay/{key}/.well-known/openid-configuration"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&response_body(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn discovery_describes_what_the_relay_accepts_for_every_client_auth_mode() {
+    let jwt = ClientAuth::PrivateKeyJwt {
+        require_single_use: false,
+        client_id: "jwt-application".into(),
+        issuer: None,
+        subject: None,
+        audience: None,
+        jwks: Some(ClientJwks::Inline(json!({"keys": [{"kty": "oct"}]}))),
+    };
+    let secret = ClientAuth::ClientSecret {
+        client_id: "application".into(),
+        client_secret: SecretString::new("application-secret"),
+    };
+    let password_methods = json!(["client_secret_basic", "client_secret_post"]);
+    for (auth, methods) in [
+        (ClientAuth::Public, json!(["none"])),
+        (ClientAuth::UpstreamClient, password_methods.clone()),
+        (secret, password_methods),
+        (jwt, json!(["private_key_jwt"])),
+    ] {
+        let (app, _, task) = setup("google", auth.clone(), KeyStrategy::SingleSegment).await;
+        let value = relay_discovery(&app, "google").await;
+        assert_eq!(value["token_endpoint_auth_methods_supported"], methods);
+        if matches!(auth, ClientAuth::PrivateKeyJwt { .. }) {
+            assert_eq!(
+                value["token_endpoint_auth_signing_alg_values_supported"],
+                json!([
+                    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"
+                ])
+            );
+        } else {
+            assert!(
+                value
+                    .get("token_endpoint_auth_signing_alg_values_supported")
+                    .is_none(),
+                "{auth:?}"
+            );
+        }
+        assert_eq!(value["code_challenge_methods_supported"], json!(["S256"]));
+        assert_eq!(value["response_types_supported"], json!(["code"]));
+        assert_eq!(value["response_modes_supported"], json!(["query"]));
+        assert_eq!(
+            value["grant_types_supported"],
+            json!(["authorization_code", "refresh_token"])
+        );
+        assert_eq!(value["request_parameter_supported"], false);
+        assert_eq!(value["request_uri_parameter_supported"], false);
+        for removed in [
+            "device_authorization_endpoint",
+            "pushed_authorization_request_endpoint",
+            "require_pushed_authorization_requests",
+            "registration_endpoint",
+            "mtls_endpoint_aliases",
+            "signed_metadata",
+        ] {
+            assert!(value.get(removed).is_none(), "{auth:?} {removed}");
+        }
+        // Members that describe the upstream identity and its unchanged tokens remain.
+        let issuer = value["issuer"].as_str().unwrap();
+        assert_eq!(value["userinfo_endpoint"], format!("{issuer}userinfo"));
+        assert_eq!(value["end_session_endpoint"], format!("{issuer}logout"));
+        assert_eq!(value["subject_types_supported"], json!(["public"]));
+        assert_eq!(
+            value["id_token_signing_alg_values_supported"],
+            json!(["RS256"])
+        );
+        assert_eq!(value["claims_supported"], json!(["sub", "email"]));
+        assert_eq!(
+            value["scopes_supported"],
+            json!(["openid", "email", "profile", "offline_access"])
+        );
+        assert_eq!(value["custom_field"], "preserved");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn discovery_keeps_upstream_revocation_only_where_clients_hold_upstream_tokens() {
+    for (auth, mode, kept) in [
+        (
+            ClientAuth::UpstreamClient,
+            RefreshTokenMode::Passthrough,
+            true,
+        ),
+        (ClientAuth::UpstreamClient, RefreshTokenMode::Sealed, false),
+        (
+            ClientAuth::UpstreamClient,
+            RefreshTokenMode::Rotating,
+            false,
+        ),
+        (
+            ClientAuth::ClientSecret {
+                client_id: "application".into(),
+                client_secret: SecretString::new("application-secret"),
+            },
+            RefreshTokenMode::Passthrough,
+            false,
+        ),
+        (ClientAuth::Public, RefreshTokenMode::Rotating, false),
+    ] {
+        let (app, _, task, _) = setup_with_refresh_tokens(
+            "google",
+            auth.clone(),
+            KeyStrategy::SingleSegment,
+            None,
+            EndpointConfiguration::Discovered,
+            RefreshTokens {
+                mode,
+                ..RefreshTokens::default()
+            },
+        )
+        .await;
+        let value = relay_discovery(&app, "google").await;
+        for member in [
+            "revocation_endpoint",
+            "revocation_endpoint_auth_methods_supported",
+            "introspection_endpoint",
+        ] {
+            assert_eq!(
+                value.get(member).is_some(),
+                kept,
+                "{auth:?} {mode:?} {member}"
+            );
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn discovery_advertises_the_relay_scope_allow_list() {
+    let (app, _, task, _) = setup_with_capture(
+        "google",
+        ClientAuth::UpstreamClient,
+        KeyStrategy::SingleSegment,
+        Some(vec!["openid".into(), "email".into()]),
+        EndpointConfiguration::Discovered,
+    )
+    .await;
+    let value = relay_discovery(&app, "google").await;
+    assert_eq!(value["scopes_supported"], json!(["openid", "email"]));
+    task.abort();
+}
+
+#[test]
+fn discovery_grant_types_follow_an_upstream_list_and_default_to_the_relay_grants() {
+    let relay = Relay {
+        key: ResourceKey::new("google").unwrap(),
+        upstream: ResourceKey::new("google").unwrap(),
+        client_auth: ClientAuth::UpstreamClient,
+        scopes: vec![],
+        allowed_scopes: None,
+        required_id_token_claims: HashMap::new(),
+        id_token_policy: None,
+        refresh_tokens: RefreshTokens::default(),
+        redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
+    };
+    let mut without_refresh = json!({"grant_types_supported": ["authorization_code", "implicit"]});
+    describe_relay(without_refresh.as_object_mut().unwrap(), &relay);
+    assert_eq!(
+        without_refresh["grant_types_supported"],
+        json!(["authorization_code"])
+    );
+    // Explicitly configured endpoints leave no upstream document to consult.
+    let mut empty = json!({});
+    describe_relay(empty.as_object_mut().unwrap(), &relay);
+    assert_eq!(
+        empty["grant_types_supported"],
+        json!(["authorization_code", "refresh_token"])
+    );
+    assert!(empty.get("scopes_supported").is_none());
 }
 
 #[tokio::test]
