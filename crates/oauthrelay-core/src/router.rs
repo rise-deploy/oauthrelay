@@ -1678,15 +1678,11 @@ async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Resp
     Json(doc).into_response()
 }
 
-/// Upstream metadata for endpoints and features a client of the relay cannot use: the relay does
-/// not front these endpoints, does not relay the grants or request forms they belong to, or
-/// (`signed_metadata`) they would override the relay's own values.
+/// Upstream metadata for features a client of the relay cannot use: the relay does not relay the
+/// grants, request forms, or sender constraints they belong to, or (`signed_metadata`) they would
+/// override the relay's own values. Upstream endpoints are handled by [`RELAY_CLIENT_ENDPOINTS`].
 const UPSTREAM_ONLY_METADATA: &[&str] = &[
-    "registration_endpoint",
-    "device_authorization_endpoint",
-    "pushed_authorization_request_endpoint",
     "require_pushed_authorization_requests",
-    "backchannel_authentication_endpoint",
     "backchannel_authentication_request_signing_alg_values_supported",
     "backchannel_token_delivery_modes_supported",
     "backchannel_user_code_parameter_supported",
@@ -1706,12 +1702,26 @@ const UPSTREAM_ONLY_METADATA: &[&str] = &[
     "frontchannel_logout_session_supported",
     "backchannel_logout_supported",
     "backchannel_logout_session_supported",
+    "http_logout_supported",
     "signed_metadata",
 ];
 
-/// Upstream token revocation and introspection. They accept only the upstream's own tokens and
-/// client credentials, so they stay only for an `UpstreamClient` relay in `passthrough` mode,
-/// whose clients hold both.
+/// The `*_endpoint` members a client of the relay can use: the relay's own two, and upstream
+/// endpoints that take what the relay passes through unchanged (the access token, the ID token as
+/// `id_token_hint`). Every other `*_endpoint`, such as registration, device authorization, PAR or
+/// CIBA, belongs to a flow the relay does not provide and is removed.
+const RELAY_CLIENT_ENDPOINTS: &[&str] = &[
+    "authorization_endpoint",
+    "token_endpoint",
+    "userinfo_endpoint",
+    "end_session_endpoint",
+    "revocation_endpoint",
+    "introspection_endpoint",
+];
+
+/// Upstream token revocation and introspection. They accept only upstream tokens, so they stay
+/// only in `passthrough` mode, where the client holds the upstream refresh token rather than a
+/// relay handle.
 const UPSTREAM_TOKEN_MANAGEMENT_METADATA: &[&str] = &[
     "revocation_endpoint",
     "revocation_endpoint_auth_methods_supported",
@@ -1719,34 +1729,41 @@ const UPSTREAM_TOKEN_MANAGEMENT_METADATA: &[&str] = &[
     "introspection_endpoint",
     "introspection_endpoint_auth_methods_supported",
     "introspection_endpoint_auth_signing_alg_values_supported",
+    "introspection_signing_alg_values_supported",
+    "introspection_encryption_alg_values_supported",
+    "introspection_encryption_enc_values_supported",
 ];
 
 /// Replaces upstream metadata that would misdescribe the relay with what the relay's own
 /// authorization and token endpoints accept. Members describing the upstream identity and its ID
-/// tokens, which pass through unchanged, are kept.
+/// tokens, which pass through unchanged, are kept, as are unrecognized members other than
+/// endpoints.
 fn describe_relay(doc: &mut serde_json::Map<String, Value>, relay: &Relay) {
-    for name in UPSTREAM_ONLY_METADATA {
-        doc.remove(*name);
-    }
-    if !(matches!(relay.client_auth, ClientAuth::UpstreamClient)
-        && relay.refresh_tokens.mode == RefreshTokenMode::Passthrough)
-    {
+    doc.retain(|name, _| {
+        !UPSTREAM_ONLY_METADATA.contains(&name.as_str())
+            && (!name.ends_with("_endpoint") || RELAY_CLIENT_ENDPOINTS.contains(&name.as_str()))
+    });
+    if relay.refresh_tokens.mode != RefreshTokenMode::Passthrough {
         for name in UPSTREAM_TOKEN_MANAGEMENT_METADATA {
             doc.remove(*name);
         }
     }
     doc.insert("response_types_supported".into(), json!(["code"]));
     doc.insert("response_modes_supported".into(), json!(["query"]));
-    // The relay forwards the refresh grant, so it is only as available as the upstream says.
-    let grant_types: Vec<_> = ["authorization_code", "refresh_token"]
-        .into_iter()
-        .filter(|grant| {
-            doc.get("grant_types_supported")
-                .and_then(Value::as_array)
-                .is_none_or(|upstream| upstream.iter().any(|value| value == grant))
-        })
-        .collect();
-    doc.insert("grant_types_supported".into(), json!(grant_types));
+    // The relay forwards the refresh grant, so it is advertised unless the upstream lists its
+    // grants without it. An absent list keeps it, although RFC 8414 would read absence as
+    // `authorization_code` and `implicit` only: providers such as Entra ID omit the member yet
+    // issue refresh tokens.
+    let refresh = doc
+        .get("grant_types_supported")
+        .and_then(Value::as_array)
+        .is_none_or(|upstream| upstream.iter().any(|value| value == "refresh_token"));
+    let grant_types = if refresh {
+        json!(["authorization_code", "refresh_token"])
+    } else {
+        json!(["authorization_code"])
+    };
+    doc.insert("grant_types_supported".into(), grant_types);
     doc.insert("code_challenge_methods_supported".into(), json!(["S256"]));
     doc.insert("request_parameter_supported".into(), Value::Bool(false));
     doc.insert("request_uri_parameter_supported".into(), Value::Bool(false));

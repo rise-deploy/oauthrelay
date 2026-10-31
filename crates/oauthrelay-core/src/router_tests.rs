@@ -65,6 +65,11 @@ async fn mock_discovery(State(state): State<MockIdpState>) -> Json<Value> {
         "revocation_endpoint": state.base.join("revoke").unwrap(),
         "revocation_endpoint_auth_methods_supported": ["client_secret_post"],
         "introspection_endpoint": state.base.join("introspect").unwrap(),
+        "introspection_signing_alg_values_supported": ["RS256"],
+        "backchannel_authentication_endpoint": state.base.join("ciba").unwrap(),
+        "vendor_session_endpoint": state.base.join("vendor/session").unwrap(),
+        "http_logout_supported": true,
+        "frontchannel_logout_supported": true,
         "device_authorization_endpoint": state.base.join("device").unwrap(),
         "pushed_authorization_request_endpoint": state.base.join("par").unwrap(),
         "require_pushed_authorization_requests": false,
@@ -2552,7 +2557,11 @@ async fn discovery_describes_what_the_relay_accepts_for_every_client_auth_mode()
             "pushed_authorization_request_endpoint",
             "require_pushed_authorization_requests",
             "registration_endpoint",
+            "backchannel_authentication_endpoint",
+            "vendor_session_endpoint",
             "mtls_endpoint_aliases",
+            "http_logout_supported",
+            "frontchannel_logout_supported",
             "signed_metadata",
         ] {
             assert!(value.get(removed).is_none(), "{auth:?} {removed}");
@@ -2578,6 +2587,10 @@ async fn discovery_describes_what_the_relay_accepts_for_every_client_auth_mode()
 
 #[tokio::test]
 async fn discovery_keeps_upstream_revocation_only_where_clients_hold_upstream_tokens() {
+    let secret = ClientAuth::ClientSecret {
+        client_id: "application".into(),
+        client_secret: SecretString::new("application-secret"),
+    };
     for (auth, mode, kept) in [
         (
             ClientAuth::UpstreamClient,
@@ -2590,14 +2603,8 @@ async fn discovery_keeps_upstream_revocation_only_where_clients_hold_upstream_to
             RefreshTokenMode::Rotating,
             false,
         ),
-        (
-            ClientAuth::ClientSecret {
-                client_id: "application".into(),
-                client_secret: SecretString::new("application-secret"),
-            },
-            RefreshTokenMode::Passthrough,
-            false,
-        ),
+        (secret.clone(), RefreshTokenMode::Passthrough, true),
+        (secret, RefreshTokenMode::Sealed, false),
         (ClientAuth::Public, RefreshTokenMode::Rotating, false),
     ] {
         let (app, _, task, _) = setup_with_refresh_tokens(
@@ -2617,6 +2624,7 @@ async fn discovery_keeps_upstream_revocation_only_where_clients_hold_upstream_to
             "revocation_endpoint",
             "revocation_endpoint_auth_methods_supported",
             "introspection_endpoint",
+            "introspection_signing_alg_values_supported",
         ] {
             assert_eq!(
                 value.get(member).is_some(),
@@ -2644,7 +2652,7 @@ async fn discovery_advertises_the_relay_scope_allow_list() {
 }
 
 #[test]
-fn discovery_grant_types_follow_an_upstream_list_and_default_to_the_relay_grants() {
+fn discovery_refresh_grant_follows_an_upstream_list_and_authorization_code_is_always_advertised() {
     let relay = Relay {
         key: ResourceKey::new("google").unwrap(),
         upstream: ResourceKey::new("google").unwrap(),
@@ -2662,7 +2670,14 @@ fn discovery_grant_types_follow_an_upstream_list_and_default_to_the_relay_grants
         without_refresh["grant_types_supported"],
         json!(["authorization_code"])
     );
-    // Explicitly configured endpoints leave no upstream document to consult.
+    let mut refresh_only = json!({"grant_types_supported": ["refresh_token"]});
+    describe_relay(refresh_only.as_object_mut().unwrap(), &relay);
+    assert_eq!(
+        refresh_only["grant_types_supported"],
+        json!(["authorization_code", "refresh_token"])
+    );
+    // An absent list (explicitly configured endpoints, or a provider such as Entra ID that omits
+    // the member) keeps the refresh grant.
     let mut empty = json!({});
     describe_relay(empty.as_object_mut().unwrap(), &relay);
     assert_eq!(
@@ -2670,6 +2685,49 @@ fn discovery_grant_types_follow_an_upstream_list_and_default_to_the_relay_grants
         json!(["authorization_code", "refresh_token"])
     );
     assert!(empty.get("scopes_supported").is_none());
+}
+
+#[test]
+fn discovery_drops_unknown_upstream_endpoints_but_keeps_other_unknown_members() {
+    let relay = Relay {
+        key: ResourceKey::new("google").unwrap(),
+        upstream: ResourceKey::new("google").unwrap(),
+        client_auth: ClientAuth::UpstreamClient,
+        scopes: vec![],
+        allowed_scopes: None,
+        required_id_token_claims: HashMap::new(),
+        id_token_policy: None,
+        refresh_tokens: RefreshTokens::default(),
+        redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
+    };
+    let mut doc = json!({
+        "authorization_endpoint": "https://relay.example/relay/google/authorize",
+        "token_endpoint": "https://relay.example/relay/google/token",
+        "userinfo_endpoint": "https://issuer.example/userinfo",
+        "end_session_endpoint": "https://issuer.example/logout",
+        "revocation_endpoint": "https://issuer.example/revoke",
+        "introspection_endpoint": "https://issuer.example/introspect",
+        "kerberos_endpoint": "https://issuer.example/kerberos",
+        "device_authorization_endpoint": "https://issuer.example/device",
+        "tenant_region_scope": "EU",
+        "endpoint_hint": "kept: the name does not end in _endpoint"
+    });
+    describe_relay(doc.as_object_mut().unwrap(), &relay);
+    for kept in [
+        "authorization_endpoint",
+        "token_endpoint",
+        "userinfo_endpoint",
+        "end_session_endpoint",
+        "revocation_endpoint",
+        "introspection_endpoint",
+        "tenant_region_scope",
+        "endpoint_hint",
+    ] {
+        assert!(doc.get(kept).is_some(), "{kept}");
+    }
+    for removed in ["kerberos_endpoint", "device_authorization_endpoint"] {
+        assert!(doc.get(removed).is_none(), "{removed}");
+    }
 }
 
 #[tokio::test]
