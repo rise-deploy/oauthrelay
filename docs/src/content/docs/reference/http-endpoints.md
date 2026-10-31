@@ -18,6 +18,34 @@ upstream name `U`, oauthrelay serves:
 | `GET /healthz` | Reports standalone process liveness. |
 | `GET /readyz` | Reports readiness after initial provider snapshots are available. |
 
+## Embedding: custom URL layout
+
+The routes above are the built-in layout (`DefaultLayout`). A Rust host that embeds
+`oauthrelay_core::router` can serve the same endpoints under its own paths by passing an
+`Arc<dyn PathLayout>`:
+
+```rust
+pub trait PathLayout: Send + Sync + 'static {
+    /// Maps a request path below `public_url` (no leading slash) to an endpoint and key.
+    fn parse(&self, path: &str) -> Option<(Endpoint, ResourceKey)>;
+    /// The path below `public_url` (no leading slash) serving `endpoint` for `key`.
+    fn path(&self, endpoint: Endpoint, key: &ResourceKey) -> String;
+}
+```
+
+`Endpoint` is `Authorize`, `Callback`, `Token`, `Discovery`, or `Jwks`. Every endpoint is keyed by
+the relay key except `Callback`, which is keyed by the upstream key. A layout may place the callback
+under the same key as the relay, for example `/oidc/{project}/{extension}/callback`; that only lines
+up when the relay key equals its upstream key, otherwise the callback lands under the upstream's key.
+`parse` receives the raw request path below `public_url` without its leading slash: percent-escapes
+are not decoded, and repeated or empty segments are passed through as-is.
+
+The router renders every URL it hands out through `path`: the upstream `redirect_uri`, the
+`authorization_endpoint` and `token_endpoint` in the discovery document, and the default
+`private_key_jwt` audience. `path` must therefore invert `parse`. `DefaultLayout::new(KeyStrategy)`
+keeps the built-in routes; for `KeyStrategy::Custom` it renders keys verbatim, so the mapper must
+accept the key parts it is given.
+
 ## Authorization endpoint
 
 Only authorization-code flow and query response mode are accepted. oauthrelay owns and replaces
