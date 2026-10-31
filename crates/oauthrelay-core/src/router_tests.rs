@@ -4916,6 +4916,24 @@ async fn assert_handles_follow_the_upstream_identity(refresh_tokens: RefreshToke
     fixture.configure(vec![fixture.upstream.clone(), other], relay);
     fixture.refresh_rejected(&handle, "upstreamRef").await;
 
+    // An Upstream resource with the same issuer, token endpoint override, and client_id is the
+    // same OAuth client at the same provider, so switching to it keeps handles valid whatever
+    // else differs, including its name.
+    fixture.restore();
+    let handle = fixture.sign_in().await;
+    let mut twin = fixture.upstream.clone();
+    twin.key = ResourceKey::new("idp-twin").unwrap();
+    twin.client_secret = SecretString::new("twin-secret");
+    twin.token_endpoint_auth_method = TokenEndpointAuthMethod::ClientSecretBasic;
+    let mut relay = fixture.relay.clone();
+    relay.upstream = twin.key.clone();
+    fixture.configure(vec![fixture.upstream.clone(), twin], relay);
+    let requests = fixture.upstream_requests();
+    fixture
+        .refresh_ok(&handle, "upstreamRef to an identical upstream")
+        .await;
+    assert_eq!(fixture.upstream_requests(), requests + 1);
+
     // A code obtained before the change yields a handle bound to the upstream that issued its
     // refresh token, which the changed relay does not accept.
     fixture.restore();

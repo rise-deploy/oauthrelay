@@ -161,13 +161,17 @@ pub(crate) enum RefreshOutcome {
 enum Fault {
     #[error("{0}")]
     Store(#[from] StoreError),
-    /// A stored value failed to open or encode: tampered, written for another key, sealed with a
-    /// key that is no longer configured, or bound to an earlier relay generation or upstream
-    /// identity.
-    #[error("a stored refresh-token value could not be sealed or opened")]
+    /// A value could not be encoded or sealed. This is a fault of the relay, not of the request.
+    #[error("a refresh-token value could not be sealed")]
     Sealing,
-    /// The sealer could not be reached, so nothing is known about the value. Unlike `Sealing`,
-    /// this is never evidence of tampering and never causes a record to be discarded.
+    /// A stored value does not open: tampered with, written for another key, sealed with a key
+    /// that is no longer configured, or bound to an earlier relay generation or upstream
+    /// identity. Expected after a configuration change; retrying cannot help.
+    #[error("a stored refresh-token value could not be opened")]
+    Unopenable,
+    /// The sealer could not be reached, so nothing is known about the value. Unlike
+    /// `Unopenable`, this is never evidence of tampering and never causes a record to be
+    /// discarded.
     #[error("the sealer is unavailable")]
     SealerUnavailable,
     /// A create-only write found a record that a random key cannot have.
@@ -180,6 +184,13 @@ impl Fault {
         match error {
             SealError::Unavailable => Self::SealerUnavailable,
             SealError::InvalidKey | SealError::InvalidEnvelope => Self::Sealing,
+        }
+    }
+
+    fn from_unseal_error(error: SealError) -> Self {
+        match error {
+            SealError::Unavailable => Self::SealerUnavailable,
+            SealError::InvalidKey | SealError::InvalidEnvelope => Self::Unopenable,
         }
     }
 }
@@ -325,8 +336,11 @@ impl Rotator {
         result.unwrap_or_else(|fault| {
             self.log_fault(&fault);
             match fault {
-                // The record exists but this relay cannot open it (seal key replaced, or the
-                // value was tampered with). Retrying cannot help, so the client signs in again.
+                // The record exists but this relay cannot open it (seal key replaced, binding
+                // changed, or the value was tampered with). Retrying cannot help, so the client
+                // signs in again.
+                Fault::Unopenable => RefreshOutcome::InvalidGrant,
+                // The new state could not be sealed; nothing was committed.
                 Fault::Sealing => RefreshOutcome::InvalidGrant,
                 // The key service did not answer; the record may be perfectly good.
                 Fault::SealerUnavailable => RefreshOutcome::SealerUnavailable,
@@ -926,7 +940,7 @@ impl Rotator {
                 Ok(Some(loaded)) => loaded,
                 Ok(None) => return Ok(()),
                 // A record this relay cannot open is not worth keeping around.
-                Err(Fault::Sealing) => {
+                Err(Fault::Unopenable) => {
                     self.store.delete(&key).await?;
                     return Ok(());
                 }
@@ -1010,7 +1024,7 @@ impl Rotator {
         key: &str,
         bytes: &[u8],
     ) -> Result<T> {
-        let envelope = std::str::from_utf8(bytes).map_err(|_| Fault::Sealing)?;
+        let envelope = std::str::from_utf8(bytes).map_err(|_| Fault::Unopenable)?;
         let plaintext = tokio::time::timeout(
             self.timing.sealer_timeout,
             self.sealer
@@ -1018,15 +1032,15 @@ impl Rotator {
         )
         .await
         .map_err(|_| Fault::SealerUnavailable)?
-        .map_err(Fault::from_seal_error)?;
-        postcard::from_bytes(&plaintext).map_err(|_| Fault::Sealing)
+        .map_err(Fault::from_unseal_error)?;
+        postcard::from_bytes(&plaintext).map_err(|_| Fault::Unopenable)
     }
 
     fn log_fault(&self, fault: &Fault) {
         match fault {
             // Expected after a seal-key retirement or a change of the relay's upstream identity
             // or generation, as well as on tampering: the client signs in again.
-            Fault::Sealing => tracing::warn!(
+            Fault::Unopenable => tracing::warn!(
                 target: "oauthrelay::refresh",
                 relay = %self.relay(),
                 error = %fault,

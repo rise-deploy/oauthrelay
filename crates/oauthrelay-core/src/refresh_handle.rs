@@ -89,15 +89,23 @@ pub(crate) fn fingerprint(relay: &Relay, upstream: &Upstream) -> [u8; 32] {
             }
         }
     }
+    // Exhaustive, so that a new upstream field has to be classified as identity or not.
+    let Upstream {
+        key: _,
+        issuer_url,
+        authorization_endpoint: _,
+        token_endpoint,
+        jwks_uri: _,
+        client_id,
+        client_secret: _,
+        token_endpoint_auth_method: _,
+    } = upstream;
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_DOMAIN);
     field(&mut hasher, relay.generation.as_deref());
-    field(&mut hasher, Some(&issuer_identifier(&upstream.issuer_url)));
-    field(
-        &mut hasher,
-        upstream.token_endpoint.as_ref().map(url::Url::as_str),
-    );
-    field(&mut hasher, Some(&upstream.client_id));
+    field(&mut hasher, Some(&issuer_identifier(issuer_url)));
+    field(&mut hasher, token_endpoint.as_ref().map(url::Url::as_str));
+    field(&mut hasher, Some(client_id));
     hasher.finalize().into()
 }
 
