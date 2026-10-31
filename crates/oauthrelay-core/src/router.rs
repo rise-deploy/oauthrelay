@@ -798,6 +798,26 @@ async fn exchange_sealed_code(
             "ID token validation is unavailable",
         );
     }
+    // Sealing commits nothing, so it runs before the replay marker: a sealer failure leaves the
+    // code redeemable. (Rotating mode writes its family to the store, so it follows the marker.)
+    let sealed_body = if relay.refresh_tokens.mode == RefreshTokenMode::Sealed && validation.is_ok()
+    {
+        let upstream_response = &envelope.upstream_response;
+        match seal_token_response(
+            state.cfg.sealer.as_ref(),
+            &relay.key,
+            upstream_response.status,
+            &upstream_response.body,
+            unix_now(),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return substitution_failed(relay, error),
+        }
+    } else {
+        None
+    };
     if let Some(store) = &state.cfg.store {
         let key = format!(
             "{REPLAY_CODE_PREFIX}{}",
@@ -836,18 +856,8 @@ async fn exchange_sealed_code(
     match relay.refresh_tokens.mode {
         RefreshTokenMode::Passthrough => {}
         RefreshTokenMode::Sealed => {
-            match seal_token_response(
-                state.cfg.sealer.as_ref(),
-                &relay.key,
-                stored.status,
-                &stored.body,
-                unix_now(),
-            )
-            .await
-            {
-                Ok(Some(body)) => stored.body = body,
-                Ok(None) => {}
-                Err(error) => return substitution_failed(relay, error),
+            if let Some(body) = sealed_body {
+                stored.body = body;
             }
         }
         RefreshTokenMode::Rotating => {

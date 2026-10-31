@@ -110,7 +110,6 @@ even when the provider returned none; present that one next.
 | Provider answers `invalid_grant` | The provider's error, and the family is revoked. |
 | Provider answers success without a JSON object body | 502 `server_error`; the handle stays usable. |
 | Transient store unreachable | 503 `server_error`. |
-| An embedder's sealer cannot be reached (`SealError::Unavailable`), while opening or sealing a handle, code, or state | 503 `server_error`; the handle stays usable and nothing is revoked. |
 | `rrt1.` handle from this relay when it was `sealed`, younger than `maxLifetimeSeconds` | Accepted (and accepted again if presented again: sealed handles are stateless); the response carries an `rrt2.` handle in a new family. |
 | `rrt1.` handle older than `maxLifetimeSeconds` | 400 `invalid_grant`. |
 | Provider answers a 2xx body that is not a JSON object but contains `refresh_token` (code or refresh grant) | 502 `server_error`; the token is never returned. |
@@ -118,6 +117,25 @@ even when the provider returned none; present that one next.
 
 A relay in this mode with no transient store configured returns 500 `server_error` from the
 authorize endpoint and both grants and logs the cause.
+
+### Sealer unavailable
+
+A library embedder can supply a `Sealer` backed by a remote key service. When it reports
+`SealError::Unavailable`, or does not answer within five seconds during a rotation, the request fails
+without treating the value as invalid:
+
+- The token endpoint (code and refresh grants) returns 503 `server_error` and never returns a token.
+  The authorize and callback endpoints return a bare 503.
+- A refresh handle is usable again once the claim lease (at most 60 seconds) has expired. If the
+  provider rotated its refresh token during the failed attempt, the next refresh may be rejected by
+  the provider.
+- A `sealed`-mode authorization code stays redeemable. A `rotating`-mode code is consumed, because
+  its family is written to the store first; a retry answers `invalid_grant`.
+- Revoking a family still succeeds, so the client gets the usual `invalid_grant` or the provider's
+  error. The revocation marker blocks the family; the stored token it could not erase expires with the
+  family.
+
+A value the sealer reports as invalid keeps its `invalid_grant` (or 400) answer.
 
 ## Transparent metadata
 

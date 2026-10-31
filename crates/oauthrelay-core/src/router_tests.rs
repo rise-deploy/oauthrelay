@@ -4507,31 +4507,95 @@ async fn an_unavailable_sealer_fails_the_authorize_and_callback_legs_with_503() 
 }
 
 #[tokio::test]
-async fn an_unavailable_sealer_fails_the_code_grant_with_503_not_invalid_grant() {
-    for refresh_tokens in [SEALED, rotating(ROTATING_GRACE_SECONDS)] {
-        let (app, sealer, _, task, _) = setup_flaky(refresh_tokens).await;
-        let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
-        let form = code_grant_form(&code, SEALED_VERIFIER);
+async fn an_unavailable_sealer_leaves_a_sealed_mode_code_redeemable() {
+    let (app, sealer, _, task, _) = setup_flaky(SEALED).await;
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
+    let form = code_grant_form(&code, SEALED_VERIFIER);
 
-        // The code cannot be opened.
-        sealer.set_unseal_down(true);
-        assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
-        sealer.set_unseal_down(false);
+    // The code cannot be opened.
+    sealer.set_unseal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_unseal_down(false);
 
-        // The code opens but the refresh handle cannot be sealed: the upstream token is not
-        // returned.
-        sealer.set_seal_down(true);
-        assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
-        sealer.set_seal_down(false);
+    // The code opens but the refresh handle cannot be sealed: the upstream token is not
+    // returned, and the code was not consumed.
+    sealer.set_seal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_seal_down(false);
 
-        // With the sealer back, a fresh code exchanges normally.
-        let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
-        let response = post_token(&app, "google", &code_grant_form(&code, SEALED_VERIFIER)).await;
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let body = String::from_utf8(response_body(response).await).unwrap();
-        assert!(!body.contains(r#""refresh""#), "{body}");
-        task.abort();
-    }
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = String::from_utf8(response_body(response).await).unwrap();
+    assert!(!body.contains(r#""refresh""#), "{body}");
+    assert!(body.contains("rrt1."), "{body}");
+
+    // Now it is used.
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_unavailable_sealer_consumes_a_rotating_mode_code_once_the_family_is_written() {
+    let (app, sealer, _, task, _) = setup_flaky(rotating(ROTATING_GRACE_SECONDS)).await;
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
+    let form = code_grant_form(&code, SEALED_VERIFIER);
+
+    // The code cannot be opened, so it is not consumed.
+    sealer.set_unseal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_unseal_down(false);
+
+    // The family cannot be sealed. The replay marker is written first, because issuing the
+    // family writes to the store, so the code is spent and the client signs in again.
+    sealer.set_seal_down(true);
+    assert_sealer_unavailable(post_token(&app, "google", &form).await).await;
+    sealer.set_seal_down(false);
+
+    let response = post_token(&app, "google", &form).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    assert_eq!(value["error"], "invalid_grant");
+    assert_eq!(value["error_description"], "code was already used");
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_seal_failure_at_the_callback_returns_a_bare_503_and_no_code() {
+    let (app, sealer, _, task, _) = setup_flaky(Default::default()).await;
+    let challenge = pkce_challenge(SEALED_VERIFIER);
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/relay/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=app-state&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::FOUND);
+    let upstream_location = authorize.headers()[header::LOCATION].to_str().unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let upstream = client.get(upstream_location).send().await.unwrap();
+    let callback = Url::parse(upstream.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let local_callback = format!("{}?{}", callback.path(), callback.query().unwrap());
+
+    // The state opens and the upstream code exchange succeeds; sealing the code envelope fails.
+    sealer.set_seal_down(true);
+    let response = app
+        .clone()
+        .oneshot(Request::get(&local_callback).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().get(header::LOCATION).is_none());
+    assert!(response_body(response).await.is_empty());
+    task.abort();
 }
 
 #[tokio::test]
