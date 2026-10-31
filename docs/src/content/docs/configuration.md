@@ -426,6 +426,10 @@ authentication method, and its authorization and JWKS endpoints. Changing the re
 follows the [switching rules](#rotating-refresh-tokens) above. Restoring the previous upstream
 identity before the handles expire makes them usable again.
 
+None of this applies in `passthrough` mode: the client holds the raw upstream token, so after an
+upstream change the relay forwards a presented token to the newly configured token endpoint. Use
+`sealed` or `rotating` if a relay's upstream may change while users are signed in.
+
 An issuer URL that is a bare origin is compared with and without its trailing slash alike
 (`https://issuer.example` and `https://issuer.example/` are the same identity); any other
 spelling change, including a token endpoint override that only spells the discovered endpoint, is

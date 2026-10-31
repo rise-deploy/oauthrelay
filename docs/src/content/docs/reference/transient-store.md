@@ -46,7 +46,11 @@ prefix.
 The `{hash}` in `refresh:` keys is a SHA-256 over the relay name and the handle or family ID, so the
 store cannot be used to recover a handle. Values are sealed with `OAUTHRELAY_SEAL_KEY` and bound
 to the relay, the purpose, and the key, so the store never holds a plaintext upstream token or
-access token and a value cannot be copied to another key. Changing the seal key without keeping the
+access token and a value cannot be copied to another key. They are also bound to the relay's
+generation and upstream identity: after
+[a change of the relay's upstream](/oauthrelay/configuration/#changing-a-relays-upstream) its
+earlier records no longer open, and those refreshes fail with `invalid_grant` without reaching any
+provider. Changing the seal key without keeping the
 old one as `OAUTHRELAY_SEAL_KEY_PREVIOUS` makes the stored records unreadable: those refreshes fail with
 `invalid_grant` and the users sign in again.
 

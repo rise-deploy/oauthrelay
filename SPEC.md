@@ -151,35 +151,39 @@ unvalidated redirect URI is never reflected into a response.
   `refresh_token` member is replaced by a handle: `rrt1.` followed by an XChaCha20-Poly1305
   envelope of the upstream token and an issued-at time, sealed with associated data
   `refresh:{relay key}\0{binding}`. The prefix versions the format; the associated data binds the
-  handle to its relay, its purpose, and its *handle binding*, so handles are not interchangeable
-  between relays or with flow and code envelopes.
+  handle to its relay, its purpose, and its handle binding (below), so handles are not
+  interchangeable between relays or with flow and code envelopes. Member order, all other
+  members, status, and content type are preserved; only whitespace between members is
+  normalized. Requests to the upstream token endpoint send `Accept: application/json`, and any 2xx
+  body is read as a JSON object whatever its content type. Non-2xx responses and 2xx responses
+  without a non-empty string `refresh_token` pass through unchanged. A response whose handle
+  cannot be sealed is a `server_error`, and so is a 2xx body that is not a JSON object but names a
+  `refresh_token` (for example a form-encoded `refresh_token=` pair): the relay answers 502
+  `server_error` and never returns the raw token. Upstream transport failures are 502
+  `server_error`.
 - The handle binding is a SHA-256 over the domain tag `oauthrelay refresh-token binding v1`
   followed by the length-prefixed relay `generation`, the upstream issuer URL (normalized as for
   ID-token issuer comparison), the upstream token endpoint override, and the upstream
   `client_id`, each absent value encoded distinctly from an empty one. It is computed from the
-  configured values at the refresh grant, so discovered endpoints are not part of it. A change of
-  any input, including an `upstreamRef` to an Upstream that differs in one, makes every earlier
-  `sealed` handle and `rotating` record unopenable: the refresh is `invalid_grant`, no upstream
-  request is made, and nothing in the store changes. No other relay or upstream setting is an
-  input. The sealed authorization code records the binding of the relay and upstream that
-  performed the code exchange, and handles issued at its redemption carry that binding, so they
-  belong to the upstream that issued the refresh token even when the configuration changed in
-  between. Flow state and the code itself are not bound. Member order, all other members, status, and content type are preserved; only
-  whitespace between members is normalized. Requests to the upstream token endpoint send
-  `Accept: application/json`, and any 2xx body is read as a JSON object whatever its content
-  type. Non-2xx responses and 2xx responses without a non-empty string `refresh_token` pass through
-  unchanged. A response whose handle cannot be sealed is a `server_error`, and so is a 2xx body
-  that is not a JSON object but names a `refresh_token` (for example a form-encoded
-  `refresh_token=` pair): the relay answers 502 `server_error` and never returns the raw token.
-  Upstream transport failures are 502 `server_error`.
+  configured values, never from discovered endpoints: at the refresh grant for the handles that
+  grant opens and issues, and at the code exchange for the handles issued when that code is
+  redeemed. The sealed authorization code records the binding of the relay and upstream that
+  performed the exchange, so those handles belong to the upstream that issued the refresh token
+  even when the configuration changed before redemption; flow state and the code itself are not
+  bound. A change of any input, including an `upstreamRef` to an Upstream that differs in one,
+  makes every earlier `sealed` handle and `rotating` record unopenable: the refresh is
+  `invalid_grant`, no upstream request is made, and nothing in the store changes. No other relay
+  or upstream setting is an input. A `passthrough` relay hands out the raw upstream token, so the
+  binding does not apply: after an upstream change it forwards a presented token to the newly
+  configured token endpoint.
 - A `sealed` relay accepts only its own handles at the refresh grant: it opens the handle and
   forwards the upstream token. A raw upstream token, a handle of another relay or installation, a
   handle issued under another handle binding, or a tampered handle is `invalid_grant` and is not
-  forwarded. When the upstream refresh response
-  omits `refresh_token`, so does the relay's, and the client keeps its handle. Handles follow
-  seal-key rotation: they open under the current or previous key. Switching a relay to `sealed`
-  invalidates the refresh tokens it issued earlier; clients must re-authenticate. Switching from
-  `rotating` to `sealed` rejects every `rrt2.` handle with `invalid_grant`.
+  forwarded. When the upstream refresh response omits `refresh_token`, so does the relay's, and
+  the client keeps its handle. Handles follow seal-key rotation: they open under the current or
+  previous key. Switching a relay to `sealed` invalidates the refresh tokens it issued earlier;
+  clients must re-authenticate. Switching from `rotating` to `sealed` rejects every `rrt2.`
+  handle with `invalid_grant`.
 - A `rotating` relay returns single-use handles, `rrt2.` followed by the base64url encoding of 32
   random bytes. A handle is opaque and carries no data; everything it stands for is in the
   transient store. The settings are `gracePeriodSeconds` (1 to 300, default 30) and

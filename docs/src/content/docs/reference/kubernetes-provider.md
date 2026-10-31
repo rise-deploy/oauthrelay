@@ -124,8 +124,9 @@ A `sealed` or `rotating` relay binds its refresh-token handles to the Relay reso
 `metadata.uid`. Deleting a Relay and creating one with the same name gives it a new uid, so the
 new relay rejects its predecessor's handles with `invalid_grant` and their users sign in again.
 Updates to an existing Relay, including `kubectl apply` and `kubectl replace`, keep the uid and
-the handles. A relay that `kubectl delete` and recreates, a GitOps tool that recreates resources,
-or a namespace restored from a backup therefore signs its users out. See
+the handles. Deleting and recreating a Relay with kubectl (`kubectl replace --force` is a delete
+plus a create), a GitOps tool that recreates resources, or a namespace restored from a backup
+therefore signs its users out. See
 [Changing a relay's upstream](/oauthrelay/configuration/#changing-a-relays-upstream) for the
 upstream settings handles are bound to.
 
