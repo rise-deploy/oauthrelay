@@ -1366,6 +1366,144 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
     task.abort();
 }
 
+/// Client credentials for one client-auth mode, as form pairs.
+fn pkce_downgrade_credentials(auth: &ClientAuth, private: &RsaPrivateKey) -> Vec<(String, String)> {
+    let pairs = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    };
+    match auth {
+        ClientAuth::Public => vec![],
+        ClientAuth::UpstreamClient => pairs(&[
+            ("client_id", "upstream-client"),
+            ("client_secret", "upstream-secret"),
+        ]),
+        ClientAuth::ClientSecret { .. } => pairs(&[
+            ("client_id", "application"),
+            ("client_secret", "application-secret"),
+        ]),
+        ClientAuth::PrivateKeyJwt { .. } => {
+            let claims = json!({
+                "iss": "jwt-application",
+                "sub": "jwt-application",
+                "aud": "https://relay.example/relay/downgrade/token",
+                "exp": unix_now() + 60,
+                "iat": unix_now(),
+            });
+            let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+            let assertion = encode(
+                &Header::new(Algorithm::RS256),
+                &claims,
+                &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+            )
+            .unwrap();
+            pairs(&[
+                ("client_id", "jwt-application"),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", &assertion),
+            ])
+        }
+    }
+}
+
+#[tokio::test]
+async fn code_verifier_without_a_code_challenge_is_rejected_for_every_client_auth_mode() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let jwks = json!({
+        "keys": [{
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())
+        }]
+    });
+    let verifier = "a-downgrade-verifier-with-more-than-forty-three-characters";
+    for auth in [
+        ClientAuth::Public,
+        ClientAuth::UpstreamClient,
+        ClientAuth::ClientSecret {
+            client_id: "application".into(),
+            client_secret: SecretString::new("application-secret"),
+        },
+        ClientAuth::PrivateKeyJwt {
+            require_single_use: false,
+            client_id: "jwt-application".into(),
+            issuer: None,
+            subject: None,
+            audience: None,
+            jwks: Some(ClientJwks::Inline(jwks.clone())),
+        },
+    ] {
+        let public = matches!(auth, ClientAuth::Public);
+        let (app, sealer, task) =
+            setup("downgrade", auth.clone(), KeyStrategy::SingleSegment).await;
+        let code = if public {
+            // A public relay never issues a code without a challenge, so seal one directly.
+            let envelope = CodeEnvelope {
+                relay_key: "downgrade".into(),
+                envelope_id: [3; 16],
+                issued_at: unix_now(),
+                redirect_uri: "https://app.example/callback".into(),
+                client_code_challenge: None,
+                id_token_nonce: None,
+                upstream_response: StoredResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: br#"{"access_token":"access","token_type":"Bearer"}"#.to_vec(),
+                },
+            };
+            sealer
+                .seal(&postcard::to_stdvec(&envelope).unwrap(), b"downgrade")
+                .unwrap()
+        } else {
+            authorization_code(&app, "downgrade", None).await
+        };
+        let form = |with_verifier: bool| {
+            let mut pairs = vec![
+                ("grant_type".to_owned(), "authorization_code".to_owned()),
+                ("code".to_owned(), code.clone()),
+                (
+                    "redirect_uri".to_owned(),
+                    "https://app.example/callback".to_owned(),
+                ),
+            ];
+            if with_verifier {
+                pairs.push(("code_verifier".to_owned(), verifier.to_owned()));
+            }
+            pairs.extend(pkce_downgrade_credentials(&auth, &private));
+            serde_urlencoded::to_string(pairs).unwrap()
+        };
+
+        let response = post_token(&app, "downgrade", &form(true)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{auth:?}");
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body["error"], "invalid_grant", "{auth:?}");
+        assert_eq!(
+            body["error_description"],
+            "code_verifier was sent but the authorization request had no code_challenge",
+            "{auth:?}"
+        );
+
+        // The rejection does not consume the code: without the verifier, a confidential client
+        // redeems it, and a public client still fails for the missing challenge.
+        let response = post_token(&app, "downgrade", &form(false)).await;
+        if public {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+            assert_eq!(body["error_description"], "PKCE challenge is missing");
+        } else {
+            assert_eq!(response.status(), StatusCode::CREATED, "{auth:?}");
+        }
+        task.abort();
+    }
+}
+
 #[tokio::test]
 async fn expired_code_and_invalid_redirect_are_rejected() {
     let (app, sealer, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;

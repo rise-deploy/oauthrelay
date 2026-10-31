@@ -52,8 +52,10 @@ return HTTP 400 `invalid_request`. A malformed header or wrong credentials retur
 `invalid_client`, with `WWW-Authenticate: Basic realm="oauthrelay"` when the client used the header.
 See [Client authentication](/oauthrelay/configuration/#client-authentication).
 
-The authorization-code request must use the same redirect URI and, when present, the matching PKCE
-verifier. Successful exchange returns the upstream status, content type, and body bytes unchanged
+The authorization-code request must use the same redirect URI and, when the authorization request
+carried a `code_challenge`, the matching PKCE verifier. A `code_verifier` for a code whose
+authorization request had no `code_challenge` returns HTTP 400 `invalid_grant` for every client
+authentication type, so a PKCE downgrade cannot go unnoticed (RFC 9700 section 4.8.2). Successful exchange returns the upstream status, content type, and body bytes unchanged
 under `no-store`/`no-cache` response headers. The transient store rejects a second use: in the same
 process with the default memory store, deployment-wide with DynamoDB. If the store is unavailable,
 the endpoint returns HTTP 503 `server_error` and leaves the code unconsumed.

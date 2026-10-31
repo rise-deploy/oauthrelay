@@ -758,6 +758,14 @@ async fn exchange_sealed_code(
                 "PKCE verification failed",
             );
         }
+    } else if form.code_verifier.is_some() {
+        // RFC 9700 section 4.8.2: a verifier for a code issued without a challenge is a PKCE
+        // downgrade attempt, whatever the client authentication.
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "code_verifier was sent but the authorization request had no code_challenge",
+        );
     } else if matches!(relay.client_auth, ClientAuth::Public) {
         return oauth_error(
             StatusCode::BAD_REQUEST,

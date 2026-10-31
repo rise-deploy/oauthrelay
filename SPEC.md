@@ -111,7 +111,9 @@ unvalidated redirect URI is never reflected into a response.
 ## Protocol invariants
 
 - Authorization code flow only; query response mode only.
-- S256 PKCE only.
+- S256 PKCE only. A token request with `code_verifier` for a code whose authorization request had
+  no `code_challenge` is `invalid_grant` for every client authentication type (RFC 9700 section
+  4.8.2).
 - Flow-state TTL is 10 minutes.
 - Authorization-code TTL is 5 minutes.
 - Redirect policy uses explicit exact-URI, HTTPS-origin, or variable-port IP-loopback matchers.
