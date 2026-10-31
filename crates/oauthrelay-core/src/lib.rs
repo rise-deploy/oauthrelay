@@ -15,7 +15,7 @@
 //!     store: None,
 //!     http: reqwest::Client::new(),
 //!     client_assertion_http: Default::default(),
-//!     allow_localhost_loopback: false,
+//!     redirect: Default::default(),
 //! };
 //! let layout = Arc::new(DefaultLayout::new(KeyStrategy::TwoSegment));
 //! let app = router(Arc::new(resources), config, layout);

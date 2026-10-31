@@ -11,7 +11,7 @@ use axum::{http::StatusCode, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use oauthrelay_core::{
     resource_schema, router, ConfigProvider, DefaultLayout, KeyStrategy, MemoryStore,
-    ProviderSnapshot, Registry, RelayConfig, TransientStore, XChaChaSealer,
+    ProviderSnapshot, RedirectOptions, Registry, RelayConfig, TransientStore, XChaChaSealer,
 };
 #[cfg(feature = "aws")]
 use oauthrelay_core::{SecretResolver, SecretSource, SecretString};
@@ -134,10 +134,15 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
     let store = configured_store().await?;
+    let redirect_options = RedirectOptions {
+        allow_localhost_loopback: bool_env("OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK", false)?,
+        allow_http_origins: bool_env("OAUTHRELAY_ALLOW_HTTP_ORIGINS", false)?,
+    };
     let registry = Arc::new(Registry::default());
     let mut running = start_providers(providers);
     await_initial_snapshots(&mut running).await?;
     replace_registry(&registry, &running);
+    check_redirect_options(&registry.snapshot(), redirect_options)?;
 
     let relay_router = router(
         registry.clone(),
@@ -149,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
             client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
                 reqwest::Client::builder(),
             )?,
-            allow_localhost_loopback: bool_env("OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK", false)?,
+            redirect: redirect_options,
         },
         Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),
     );
@@ -644,6 +649,22 @@ async fn await_initial_snapshots(providers: &mut [RunningProvider]) -> anyhow::R
     Ok(())
 }
 
+/// Fails startup when a configured relay needs a redirect option this service leaves off. A relay
+/// that later gains such a matcher through a provider refresh fails each request instead.
+fn check_redirect_options(
+    snapshot: &ProviderSnapshot,
+    options: RedirectOptions,
+) -> anyhow::Result<()> {
+    let mut keys: Vec<_> = snapshot.relays.keys().collect();
+    keys.sort();
+    for key in keys {
+        snapshot.relays[key]
+            .validate_for(options)
+            .map_err(|error| anyhow!("Relay/{key}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn replace_registry(registry: &Registry, providers: &[RunningProvider]) {
     let snapshots: Vec<_> = providers
         .iter()
@@ -793,6 +814,57 @@ mod tests {
 
     #[cfg(feature = "lambda")]
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn startup_rejects_http_origins_unless_allowed() {
+        use oauthrelay_core::{
+            ClientAuth, RedirectMatcher, Relay, ResourceKey, SecretString, TokenEndpointAuthMethod,
+            Upstream,
+        };
+        let key = ResourceKey::new("dev").unwrap();
+        let mut snapshot = ProviderSnapshot::default();
+        snapshot.upstreams.insert(
+            key.clone(),
+            Arc::new(Upstream {
+                key: key.clone(),
+                issuer_url: Url::parse("https://issuer.example").unwrap(),
+                authorization_endpoint: None,
+                token_endpoint: None,
+                jwks_uri: None,
+                client_id: "upstream".into(),
+                client_secret: SecretString::new("secret"),
+                token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
+            }),
+        );
+        snapshot.relays.insert(
+            key.clone(),
+            Arc::new(Relay {
+                key: key.clone(),
+                upstream: key,
+                client_auth: ClientAuth::UpstreamClient,
+                scopes: vec![],
+                allowed_scopes: None,
+                required_id_token_claims: std::collections::HashMap::new(),
+                id_token_policy: None,
+                refresh_tokens: Default::default(),
+                redirect_policy: vec![
+                    RedirectMatcher::http_origin("http://dev.example:3000").unwrap()
+                ],
+            }),
+        );
+        let error = check_redirect_options(&snapshot, RedirectOptions::default()).unwrap_err();
+        let error = error.to_string();
+        assert!(error.starts_with("Relay/dev: "), "{error}");
+        assert!(error.contains("OAUTHRELAY_ALLOW_HTTP_ORIGINS"), "{error}");
+        assert!(check_redirect_options(
+            &snapshot,
+            RedirectOptions {
+                allow_http_origins: true,
+                ..Default::default()
+            }
+        )
+        .is_ok());
+    }
 
     #[cfg(feature = "lambda")]
     struct ReloadingProvider {
