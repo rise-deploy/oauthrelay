@@ -129,6 +129,15 @@ pub enum TokenEndpointAuthMethod {
 pub struct Relay {
     pub key: ResourceKey,
     pub upstream: ResourceKey,
+    /// Opaque identity of this incarnation of the relay, bound into every refresh-token handle
+    /// it issues (`sealed` and `rotating`). Set it to a value that changes when the relay is
+    /// deleted and recreated under the same key, such as the creation timestamp or unique id of
+    /// the record that defines it, so a recreated relay does not accept its predecessor's
+    /// handles. Changing it signs out every user holding a handle. `None` binds nothing beyond
+    /// the key; the file and SSM providers leave it unset, and the Kubernetes provider sets the
+    /// Relay resource's `metadata.uid`. Resource documents cannot set it.
+    #[serde(default)]
+    pub generation: Option<String>,
     pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
     pub allowed_scopes: Option<Vec<String>>,
@@ -571,6 +580,7 @@ mod tests {
         let relay = Relay {
             key: ResourceKey::new("google").unwrap(),
             upstream: ResourceKey::new("google").unwrap(),
+            generation: None,
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,
@@ -650,6 +660,7 @@ mod tests {
         let relay = Relay {
             key: ResourceKey::new("google").unwrap(),
             upstream: ResourceKey::new("google").unwrap(),
+            generation: None,
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,

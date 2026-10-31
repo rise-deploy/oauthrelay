@@ -21,8 +21,11 @@
 //! successor, so a stale pointer is repaired by following the chain.
 //!
 //! Record and response values are sealed with the relay's [`Sealer`]. The associated data binds
-//! the relay key, the purpose, and the store key, so the store never holds a plaintext token and a
-//! value cannot be moved to another key or relay.
+//! the purpose, the store key, and the relay's [`HandleBinding`] (relay key, relay generation and
+//! upstream identity), so the store never holds a plaintext token, a value cannot be moved to
+//! another key or relay, and a relay whose upstream identity or generation changed cannot open
+//! what it stored before. Such a record reads as unopenable: the refresh answers `invalid_grant`
+//! without asking any upstream and without touching the family.
 //!
 //! A [`Record`] is `Active` (refreshable), `Claimed` (one caller is refreshing upstream), or
 //! `Rotated` (a successor exists). A rotated record is a tombstone without any token that remains
@@ -36,8 +39,8 @@
 
 use crate::{
     refresh_handle::{
-        names_refresh_token, open_handle, upstream_refresh_token, with_refresh_token, HandleError,
-        HANDLE_PREFIX,
+        names_refresh_token, open_handle, upstream_refresh_token, with_refresh_token,
+        HandleBinding, HandleError, HANDLE_PREFIX,
     },
     router::StoredResponse,
     RefreshTokens, ResourceKey, SealError, Sealer, StoreError, TransientStore,
@@ -152,8 +155,9 @@ pub(crate) enum RefreshOutcome {
 enum Fault {
     #[error("{0}")]
     Store(#[from] StoreError),
-    /// A stored value failed to open or encode: tampered, written for another key, or sealed with
-    /// a key that is no longer configured.
+    /// A stored value failed to open or encode: tampered, written for another key, sealed with a
+    /// key that is no longer configured, or bound to an earlier relay generation or upstream
+    /// identity.
     #[error("a stored refresh-token value could not be sealed or opened")]
     Sealing,
     /// The sealer could not be reached, so nothing is known about the value. Unlike `Sealing`,
@@ -221,7 +225,7 @@ struct Claim {
 pub(crate) struct Rotator {
     store: Arc<dyn TransientStore>,
     sealer: Arc<dyn Sealer>,
-    relay: ResourceKey,
+    binding: HandleBinding,
     grace: Duration,
     max_lifetime: Duration,
     clock: Clock,
@@ -232,13 +236,13 @@ impl Rotator {
     pub(crate) fn new(
         store: Arc<dyn TransientStore>,
         sealer: Arc<dyn Sealer>,
-        relay: ResourceKey,
+        binding: HandleBinding,
         settings: &RefreshTokens,
     ) -> Self {
         Self {
             store,
             sealer,
-            relay,
+            binding,
             grace: Duration::from_secs(settings.grace_period_seconds),
             max_lifetime: Duration::from_secs(settings.max_lifetime_seconds),
             clock: system_clock(),
@@ -326,13 +330,14 @@ impl Rotator {
     }
 
     /// Accepts a `sealed` handle from before the relay switched to `rotating` and starts a new
-    /// family from it. The sealed handle is stateless, so it cannot be claimed or revoked.
+    /// family from it. The sealed handle is stateless, so it cannot be claimed or revoked. It
+    /// opens only under the relay's current binding, like a rotating record.
     async fn refresh_sealed_handle(
         &self,
         presented: &str,
         upstream: &dyn UpstreamRefresher,
     ) -> Result<RefreshOutcome> {
-        let opened = match open_handle(self.sealer.as_ref(), &self.relay, presented).await {
+        let opened = match open_handle(self.sealer.as_ref(), &self.binding, presented).await {
             Ok(opened) => opened,
             Err(HandleError::Invalid) => return Ok(RefreshOutcome::InvalidGrant),
             Err(HandleError::SealerUnavailable) => return Err(Fault::SealerUnavailable),
@@ -362,7 +367,7 @@ impl Rotator {
         self.create_family(&handle, &successor_token).await?;
         tracing::info!(
             target: "oauthrelay::refresh",
-            relay = %self.relay,
+            relay = %self.relay(),
             outcome = "migrated_sealed_handle",
             "sealed refresh token migrated to a rotating family"
         );
@@ -405,7 +410,7 @@ impl Rotator {
                     if now.saturating_sub(*claimed_ms) > lease_ms {
                         tracing::warn!(
                             target: "oauthrelay::refresh",
-                            relay = %self.relay,
+                            relay = %self.relay(),
                             family = %self.family_label(&loaded.record.family_id),
                             "taking over an abandoned refresh claim"
                         );
@@ -430,7 +435,7 @@ impl Rotator {
                     if let Some(response) = self.load_grace_response(&grace_key).await? {
                         tracing::info!(
                             target: "oauthrelay::refresh",
-                            relay = %self.relay,
+                            relay = %self.relay(),
                             family = %self.family_label(&loaded.record.family_id),
                             outcome = "replayed_within_grace",
                             "refresh answered with the recorded successor"
@@ -500,7 +505,7 @@ impl Rotator {
                 self.release(handle_key, &claim).await;
                 tracing::warn!(
                     target: "oauthrelay::refresh",
-                    relay = %self.relay,
+                    relay = %self.relay(),
                     %family,
                     outcome = "upstream_unreachable",
                     "refresh claim released"
@@ -514,7 +519,7 @@ impl Rotator {
                 .await?;
             tracing::warn!(
                 target: "oauthrelay::refresh",
-                relay = %self.relay,
+                relay = %self.relay(),
                 %family,
                 outcome = "upstream_invalid_grant",
                 "family revoked"
@@ -525,7 +530,7 @@ impl Rotator {
             self.release(handle_key, &claim).await;
             tracing::warn!(
                 target: "oauthrelay::refresh",
-                relay = %self.relay,
+                relay = %self.relay(),
                 %family,
                 upstream_status = response.status,
                 outcome = "upstream_error",
@@ -542,7 +547,7 @@ impl Rotator {
             self.release(handle_key, &claim).await;
             tracing::warn!(
                 target: "oauthrelay::refresh",
-                relay = %self.relay,
+                relay = %self.relay(),
                 %family,
                 outcome = "upstream_response_unusable",
                 "refresh claim released"
@@ -568,7 +573,7 @@ impl Rotator {
                     .await;
                 tracing::warn!(
                     target: "oauthrelay::refresh",
-                    relay = %self.relay,
+                    relay = %self.relay(),
                     %family,
                     outcome = "revoked_in_flight",
                     "family was revoked while a refresh was in flight; tokens withheld"
@@ -578,7 +583,7 @@ impl Rotator {
             Ok(Commit::Rotated) => {
                 tracing::info!(
                     target: "oauthrelay::refresh",
-                    relay = %self.relay,
+                    relay = %self.relay(),
                     %family,
                     upstream_rotated,
                     outcome = "rotated",
@@ -593,7 +598,7 @@ impl Rotator {
             Ok(Commit::Lost) => {
                 tracing::warn!(
                     target: "oauthrelay::refresh",
-                    relay = %self.relay,
+                    relay = %self.relay(),
                     %family,
                     outcome = "claim_lost",
                     "refresh claim was taken over before the successor was recorded"
@@ -697,7 +702,7 @@ impl Rotator {
             if !matches!(moved, Ok(true)) {
                 tracing::warn!(
                     target: "oauthrelay::refresh",
-                    relay = %self.relay,
+                    relay = %self.relay(),
                     family = %self.family_label(&claim.family_id),
                     "family head pointer was not advanced"
                 );
@@ -741,7 +746,7 @@ impl Rotator {
         if let Err(fault) = result {
             tracing::warn!(
                 target: "oauthrelay::refresh",
-                relay = %self.relay,
+                relay = %self.relay(),
                 family = %self.family_label(&claim.family_id),
                 error = %fault,
                 "refresh claim could not be released; it expires with its lease"
@@ -754,7 +759,7 @@ impl Rotator {
             if let Err(error) = self.store.delete(key).await {
                 tracing::warn!(
                     target: "oauthrelay::refresh",
-                    relay = %self.relay,
+                    relay = %self.relay(),
                     ?error,
                     "leftover refresh record could not be removed; it expires on its own"
                 );
@@ -768,7 +773,7 @@ impl Rotator {
         tracing::warn!(
             target: "oauthrelay::security",
             event = "refresh_token_reuse",
-            relay = %self.relay,
+            relay = %self.relay(),
             family = %self.family_label(&record.family_id),
             "a rotated refresh token was presented after its grace period; family revoked"
         );
@@ -906,10 +911,14 @@ impl Rotator {
         }
         tracing::error!(
             target: "oauthrelay::refresh",
-            relay = %self.relay,
+            relay = %self.relay(),
             "revoked family still has a token-bearing record beyond the erase hop limit"
         );
         Ok(())
+    }
+
+    fn relay(&self) -> &ResourceKey {
+        self.binding.relay()
     }
 
     fn handle_key(&self, handle: &str) -> String {
@@ -932,7 +941,7 @@ impl Rotator {
 
     fn digest_key(&self, prefix: &str, material: &[&[u8]]) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(self.relay.as_str().as_bytes());
+        hasher.update(self.relay().as_str().as_bytes());
         hasher.update([0]);
         for part in material {
             hasher.update(part);
@@ -946,7 +955,9 @@ impl Rotator {
     }
 
     fn associated_data(&self, purpose: &str, key: &str) -> Vec<u8> {
-        format!("{purpose}\0{}\0{key}", self.relay).into_bytes()
+        let mut data = format!("{purpose}\0{}\0{key}\0", self.binding.relay()).into_bytes();
+        data.extend_from_slice(&self.binding.fingerprint());
+        data
     }
 
     async fn seal<T: Serialize>(&self, purpose: &str, key: &str, value: &T) -> Result<Vec<u8>> {
@@ -974,12 +985,22 @@ impl Rotator {
     }
 
     fn log_fault(&self, fault: &Fault) {
-        tracing::error!(
-            target: "oauthrelay::refresh",
-            relay = %self.relay,
-            error = %fault,
-            "refresh-token state operation failed"
-        );
+        match fault {
+            // Expected after a seal-key retirement or a change of the relay's upstream identity
+            // or generation, as well as on tampering: the client signs in again.
+            Fault::Sealing => tracing::warn!(
+                target: "oauthrelay::refresh",
+                relay = %self.relay(),
+                error = %fault,
+                "refresh-token state is unusable under the relay's current seal keys and binding"
+            ),
+            _ => tracing::error!(
+                target: "oauthrelay::refresh",
+                relay = %self.relay(),
+                error = %fault,
+                "refresh-token state operation failed"
+            ),
+        }
     }
 }
 
@@ -1188,6 +1209,12 @@ mod tests {
         ResourceKey::new(name).unwrap()
     }
 
+    const FINGERPRINT: [u8; 32] = [5; 32];
+
+    fn binding(relay: &str) -> HandleBinding {
+        HandleBinding::with_fingerprint(key(relay), FINGERPRINT)
+    }
+
     fn fast_timing() -> Timing {
         Timing {
             poll_interval: Duration::from_millis(5),
@@ -1205,7 +1232,7 @@ mod tests {
         fn with(store: Arc<SpyStore>, relay: &str, timing: Timing) -> Self {
             let sealer = Arc::new(FlakySealer::new(&[7; 32]));
             let now = Arc::new(AtomicU64::new(START_MS));
-            let rotator = Arc::new(Self::rotator(&store, &sealer, &now, relay, timing));
+            let rotator = Arc::new(Self::rotator(&store, &sealer, &now, binding(relay), timing));
             Self {
                 store,
                 sealer,
@@ -1218,14 +1245,14 @@ mod tests {
             store: &Arc<SpyStore>,
             sealer: &Arc<FlakySealer>,
             now: &Arc<AtomicU64>,
-            relay: &str,
+            binding: HandleBinding,
             timing: Timing,
         ) -> Rotator {
             let clock = now.clone();
             Rotator::new(
                 store.clone(),
                 sealer.clone(),
-                key(relay),
+                binding,
                 &RefreshTokens {
                     mode: crate::RefreshTokenMode::Rotating,
                     grace_period_seconds: GRACE_SECONDS,
@@ -1238,7 +1265,24 @@ mod tests {
 
         /// Another relay sharing this harness's store, sealer, and clock.
         fn other_relay(&self, relay: &str) -> Rotator {
-            Self::rotator(&self.store, &self.sealer, &self.now, relay, fast_timing())
+            Self::rotator(
+                &self.store,
+                &self.sealer,
+                &self.now,
+                binding(relay),
+                fast_timing(),
+            )
+        }
+
+        /// This harness's relay after its upstream identity or generation changed.
+        fn rebound(&self) -> Rotator {
+            Self::rotator(
+                &self.store,
+                &self.sealer,
+                &self.now,
+                HandleBinding::with_fingerprint(key("app"), [6; 32]),
+                fast_timing(),
+            )
         }
 
         fn advance(&self, by: Duration) {
@@ -1684,7 +1728,7 @@ mod tests {
         let upstream = FakeUpstream::scripted(vec![no_rotation("a1")]);
         let legacy = seal_handle(
             harness.sealer.as_ref(),
-            &key("app"),
+            &binding("app"),
             "up-legacy",
             START_MS / 1000,
         )
@@ -1705,7 +1749,7 @@ mod tests {
         // Another relay's sealed handle, and a failed upstream, do not migrate.
         let foreign = seal_handle(
             harness.sealer.as_ref(),
-            &key("other"),
+            &binding("other"),
             "up-x",
             START_MS / 1000,
         )
@@ -1718,6 +1762,74 @@ mod tests {
             harness.refresh(&legacy, &failing).await,
             RefreshOutcome::Response(response) if response.status == 400
         ));
+    }
+
+    #[tokio::test]
+    async fn a_changed_binding_rejects_every_handle_without_asking_upstream_or_revoking() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let first = harness.issue("up-0").await;
+        let second = successor(harness.refresh(&first, &upstream).await);
+        let third = harness.issue("up-other-family").await;
+        let legacy = seal_handle(
+            harness.sealer.as_ref(),
+            &binding("app"),
+            "up-legacy",
+            START_MS / 1000,
+        )
+        .await
+        .unwrap();
+        let family = harness.load(&first).await.unwrap();
+        let writes = harness.store.writes.lock().unwrap().len();
+
+        // The relay's upstream identity (or generation) changed: an active handle, a handle
+        // rotated within its grace period, another family, and a sealed handle all fail without
+        // reaching any upstream.
+        let rebound = harness.rebound();
+        let elsewhere = FakeUpstream::scripted(vec![]);
+        for handle in [&second, &first, &third, &legacy] {
+            assert_invalid_grant(rebound.refresh(handle, elsewhere.as_ref()).await);
+        }
+        // Past the grace period a rotated handle is not mistaken for reuse either.
+        harness.advance(Duration::from_secs(GRACE_SECONDS + 1));
+        assert_invalid_grant(rebound.refresh(&first, elsewhere.as_ref()).await);
+        assert!(elsewhere.calls().is_empty());
+
+        // Nothing was written, revoked, or erased: under the original binding both families
+        // still refresh.
+        assert_eq!(harness.store.writes.lock().unwrap().len(), writes);
+        assert!(!harness.revoked(&family).await);
+        assert!(matches!(
+            harness.refresh(&second, &upstream).await,
+            RefreshOutcome::Response(_)
+        ));
+        assert!(matches!(
+            harness.refresh(&third, &upstream).await,
+            RefreshOutcome::Response(_)
+        ));
+        assert_eq!(upstream.calls(), ["up-0", "up-1", "up-other-family"]);
+    }
+
+    #[tokio::test]
+    async fn sealed_handle_migration_honours_the_binding() {
+        let harness = Harness::new();
+        let upstream = FakeUpstream::scripted(vec![]);
+        let stale = seal_handle(
+            harness.sealer.as_ref(),
+            &HandleBinding::with_fingerprint(key("app"), [6; 32]),
+            "up-legacy",
+            START_MS / 1000,
+        )
+        .await
+        .unwrap();
+        assert_invalid_grant(harness.refresh(&stale, &upstream).await);
+        assert!(upstream.calls().is_empty());
+        // The same handle migrates on the relay whose binding it carries, and the family it
+        // starts is bound like any other.
+        let migrated = successor(harness.rebound().refresh(&stale, upstream.as_ref()).await);
+        assert_eq!(upstream.calls(), ["up-legacy"]);
+        assert_invalid_grant(harness.refresh(&migrated, &upstream).await);
+        assert_eq!(upstream.calls().len(), 1);
     }
 
     #[tokio::test]
@@ -1904,7 +2016,7 @@ mod tests {
         let first = harness.issue("up-0").await;
         let legacy = seal_handle(
             harness.sealer.as_ref(),
-            &key("app"),
+            &binding("app"),
             "up-legacy",
             START_MS / 1000,
         )
@@ -2003,9 +2115,14 @@ mod tests {
         let upstream = FakeUpstream::scripted(vec![]);
         let issued = START_MS / 1000;
         let handle = async |issued_at: u64| {
-            seal_handle(harness.sealer.as_ref(), &key("app"), "up-legacy", issued_at)
-                .await
-                .unwrap()
+            seal_handle(
+                harness.sealer.as_ref(),
+                &binding("app"),
+                "up-legacy",
+                issued_at,
+            )
+            .await
+            .unwrap()
         };
         // Just inside the lifetime migrates; at and beyond it does not reach the upstream.
         let recent = handle(issued - LIFETIME_SECONDS + 1).await;

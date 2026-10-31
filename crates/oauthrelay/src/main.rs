@@ -815,6 +815,7 @@ mod tests {
         let relay = Arc::new(Relay {
             key: key.clone(),
             upstream: key.clone(),
+            generation: None,
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,
