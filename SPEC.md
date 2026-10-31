@@ -257,6 +257,14 @@ unvalidated redirect URI is never reflected into a response.
   (`rrt1.` in `sealed`; `rrt1.` and `rrt2.` in `rotating`) is opened as described above; any other
   handle is `invalid_grant`. A handle is not an upstream token, so forwarding one only leaks it.
 - Discovery and JWKS responses are cached for bounded TTLs.
+- Outbound requests: every request sent with `RelayConfig.http` or `client_assertion_http` (discovery,
+  JWKS, code exchange, refresh, client-assertion metadata and keys) is first offered to
+  `RelayConfig.outbound` (`OutboundPolicy::check(url, OutboundPurpose)`); `None` allows all. A
+  denial sends nothing and is "unavailable", never "absent": it sets no absence marker and is not
+  cached, discovery and `/jwks` answer 502, redemption answers 502 `server_error` and leaves the
+  code unconsumed, token and refresh answer 502, and a client assertion is `invalid_client`. The
+  policy sees only the initial URL; the clients must not follow redirects, which
+  `default_client_builder()` guarantees. Cached metadata and keys are not re-checked.
 - Endpoint resolution: `authorization_endpoint` and `token_endpoint` are required, from configuration
   or else from the upstream discovery document (502 when it cannot be fetched). `jwks_uri` is
   optional: configured, else taken from the discovery document, else absent. The upstream

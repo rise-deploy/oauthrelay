@@ -9,6 +9,11 @@ use std::sync::Arc;
 /// system CA bundle, which the platform verifier relies on. HTTP/1.1 only. Add
 /// timeouts, proxies, or other settings to the returned builder as needed; do not replace its TLS
 /// configuration.
+///
+/// Redirects are not followed. An [`OutboundPolicy`](crate::OutboundPolicy) vets only the URL a
+/// request starts with, so a client that followed redirects could be sent where the policy never
+/// looked, and a redirected token request would replay its credentials elsewhere. A redirect
+/// answer is therefore an unusable response, the same as any other unexpected status.
 pub fn default_client_builder() -> reqwest::ClientBuilder {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -20,7 +25,9 @@ pub fn default_client_builder() -> reqwest::ClientBuilder {
     .with_root_certificates(roots)
     .with_no_client_auth();
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    reqwest::Client::builder().tls_backend_preconfigured(tls)
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .tls_backend_preconfigured(tls)
 }
 
 #[cfg(test)]

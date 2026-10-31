@@ -15,6 +15,7 @@
 //!     store: None,
 //!     http: oauthrelay_core::default_client_builder().build().unwrap(),
 //!     client_assertion_http: Default::default(),
+//!     outbound: None,
 //!     redirect: Default::default(),
 //! };
 //! let layout = Arc::new(DefaultLayout::new(KeyStrategy::TwoSegment));
@@ -28,6 +29,7 @@ mod id_token_policy;
 mod jwks;
 mod layout;
 mod model;
+mod outbound;
 mod refresh_handle;
 mod resolver;
 mod rotation;
@@ -41,6 +43,7 @@ pub use id_token_policy::*;
 pub use jwks::*;
 pub use layout::*;
 pub use model::*;
+pub use outbound::{OutboundDenied, OutboundPolicy, OutboundPurpose};
 pub use resolver::*;
 pub use router::*;
 pub use seal::*;

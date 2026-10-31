@@ -46,6 +46,41 @@ The router renders every URL it hands out through `path`: the upstream `redirect
 keeps the built-in routes; for `KeyStrategy::Custom` it renders keys verbatim, so the mapper must
 accept the key parts it is given.
 
+## Embedding: outbound requests
+
+The relay sends HTTP requests to URLs it did not choose: an issuer's discovery document names its
+own `jwks_uri`, which the relay fetches and serves at `/jwks`, and a `private_key_jwt` client's
+issuer does the same. An embedder whose issuers are not all trusted should vet those URLs.
+`RelayConfig.outbound` takes an `Arc<dyn OutboundPolicy>`; `None` allows everything, as the
+standalone service does.
+
+```rust
+#[async_trait]
+pub trait OutboundPolicy: Send + Sync + 'static {
+    async fn check(&self, url: &Url, purpose: OutboundPurpose) -> Result<(), OutboundDenied>;
+}
+
+#[non_exhaustive]
+pub enum OutboundPurpose {
+    Discovery, Jwks, TokenExchange, Refresh, ClientAssertionMetadata, ClientAssertionJwks,
+}
+```
+
+`check` runs before every request sent with `RelayConfig.http` or
+`RelayConfig.client_assertion_http`, with the URL as the relay holds it, and not again for answers
+served from the metadata and key caches. A denied request is never sent and is unavailable, not
+absent: relay discovery and `/jwks` answer 502 and remember nothing, a code redemption that needs
+the JWKS answers 502 `server_error` and leaves the code unconsumed, token and refresh requests
+answer 502, and a client assertion is rejected as `invalid_client`. Denials are logged at `warn`
+(target `oauthrelay::outbound`) with the purpose and host, never the path or query.
+
+The policy sees only the initial URL, so the clients must not follow redirects, or must enforce
+the policy on every hop. `oauthrelay_core::default_client_builder()` does not follow redirects;
+build `RelayConfig.http` with `redirect::Policy::none()` when using another builder.
+`ClientAssertionHttpClient` never follows them. Resolve host names and reject private, loopback,
+and link-local addresses inside the policy, or in the client's connector, if the network behind
+the relay must stay out of reach.
+
 ## Authorization endpoint
 
 Only authorization-code flow and query response mode are accepted. oauthrelay owns and replaces

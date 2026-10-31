@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
             client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
                 oauthrelay_core::default_client_builder(),
             )?,
+            outbound: None,
             redirect: redirect_options,
         },
         Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),

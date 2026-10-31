@@ -1,13 +1,14 @@
 use crate::{
     model::valid_scope_token,
+    outbound::permit,
     refresh_handle::{
         fingerprint, has_handle_prefix, open_handle, seal_token_response, HandleBinding,
         HandleError, SubstitutionError,
     },
     rotation::{IssueError, RefreshOutcome, Rotator, UpstreamFailure, UpstreamRefresher},
-    ClientAuth, ClientJwks, Endpoint, PathLayout, RedirectOptions, RefreshTokenMode, Relay,
-    ResourceKey, ResourceResolver, SealError, Sealer, TokenEndpointAuthMethod, TransientStore,
-    Upstream,
+    ClientAuth, ClientJwks, Endpoint, OutboundPolicy, OutboundPurpose, PathLayout, RedirectOptions,
+    RefreshTokenMode, Relay, ResourceKey, ResourceResolver, SealError, Sealer,
+    TokenEndpointAuthMethod, TransientStore, Upstream,
 };
 use axum::{
     body::Body,
@@ -97,6 +98,9 @@ pub struct RelayConfig {
     pub store: Option<Arc<dyn TransientStore>>,
     pub http: reqwest::Client,
     pub client_assertion_http: ClientAssertionHttpClient,
+    /// Vets every URL the relay requests through `http` and `client_assertion_http`. `None`
+    /// allows everything. See [`OutboundPolicy`] for what it covers and how denials surface.
+    pub outbound: Option<Arc<dyn OutboundPolicy>>,
     /// Development-time widenings of redirect and CORS matching; all off by default. A resolved
     /// relay that needs a widening left off here fails [`Relay::validate_for`].
     pub redirect: RedirectOptions,
@@ -600,6 +604,15 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
         ("redirect_uri".to_owned(), callback.to_string()),
         ("code_verifier".to_owned(), flow.upstream_pkce_verifier),
     ];
+    if !permit(
+        state.cfg.outbound.as_ref(),
+        &endpoints.token_endpoint,
+        OutboundPurpose::TokenExchange,
+    )
+    .await
+    {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
     let upstream_response =
         match upstream_token_request(state, upstream, endpoints.token_endpoint, upstream_form)
             .send()
@@ -939,7 +952,7 @@ async fn validate_id_token_policy(
         .ok()
         .flatten()
         .ok_or(IdTokenValidationError::Unavailable)?;
-    let value = cached_json(state, &jwks_uri, JWKS_TTL)
+    let value = cached_json(state, &jwks_uri, JWKS_TTL, OutboundPurpose::Jwks)
         .await
         .map_err(|_| IdTokenValidationError::Unavailable)?;
     let set: JwkSet =
@@ -1203,6 +1216,15 @@ async fn send_upstream_refresh(
             _ => (name.clone(), value.clone()),
         })
         .collect();
+    if !permit(
+        state.cfg.outbound.as_ref(),
+        &endpoints.token_endpoint,
+        OutboundPurpose::Refresh,
+    )
+    .await
+    {
+        return Err(UpstreamFailure::Request);
+    }
     upstream_token_request(state, upstream, endpoints.token_endpoint, upstream_form)
         .send()
         .await
@@ -1560,8 +1582,10 @@ async fn verify_private_key_jwt(
             let doc = cached_json_with_client(
                 &state.assertion_cache.metadata,
                 &state.cfg.client_assertion_http.0,
+                state.cfg.outbound.as_ref(),
                 &discovery_url(&url),
                 DISCOVERY_TTL,
+                OutboundPurpose::ClientAssertionMetadata,
             )
             .await
             .map_err(|_| ())?;
@@ -1660,7 +1684,14 @@ async fn verify_private_key_jwt(
 
 async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Response {
     let mut doc = if endpoints_need_discovery(upstream) {
-        match cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await {
+        match cached_json(
+            state,
+            &discovery_url(&upstream.issuer_url),
+            DISCOVERY_TTL,
+            OutboundPurpose::Discovery,
+        )
+        .await
+        {
             Ok(value) => value,
             Err(status) => return status.into_response(),
         }
@@ -1821,7 +1852,7 @@ async fn jwks(state: &AppState, upstream: &Upstream) -> Response {
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),
     };
-    match cached_json(state, &url, JWKS_TTL).await {
+    match cached_json(state, &url, JWKS_TTL, OutboundPurpose::Jwks).await {
         Ok(value) => Json(value).into_response(),
         Err(status) => status.into_response(),
     }
@@ -1842,7 +1873,13 @@ async fn resolve_endpoints(
     if !endpoints_need_discovery(upstream) {
         return resolve_endpoints_from_doc(upstream, &json!({}));
     }
-    let doc = cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await?;
+    let doc = cached_json(
+        state,
+        &discovery_url(&upstream.issuer_url),
+        DISCOVERY_TTL,
+        OutboundPurpose::Discovery,
+    )
+    .await?;
     resolve_endpoints_from_doc(upstream, &doc)
 }
 
@@ -1888,7 +1925,14 @@ async fn optional_discovery(
     {
         return Ok(None);
     }
-    match fetch_json_object(&state.cfg.http, &url).await {
+    match fetch_json_object(
+        &state.cfg.http,
+        state.cfg.outbound.as_ref(),
+        &url,
+        OutboundPurpose::Discovery,
+    )
+    .await
+    {
         Ok(doc) => {
             state.absent_discovery.lock().await.remove(&key);
             state.cache.lock().await.insert(
@@ -1979,6 +2023,16 @@ async fn client_assertion_jwks(
     {
         return current.map(|(_, set)| set.clone()).ok_or(());
     }
+    // A denial is not a failed fetch, so it does not start the retry cooldown.
+    if !permit(
+        state.cfg.outbound.as_ref(),
+        url,
+        OutboundPurpose::ClientAssertionJwks,
+    )
+    .await
+    {
+        return Err(());
+    }
     let forced = current.is_some();
     entry.retry_after = Some(std::time::Instant::now() + JWKS_REFRESH_COOLDOWN);
     let response = state
@@ -2012,7 +2066,16 @@ enum FetchFailure {
 
 /// Fetches a JSON object within [`METADATA_FETCH_TIMEOUT`]. Only objects are returned, so only
 /// objects are ever cached.
-async fn fetch_json_object(http: &reqwest::Client, url: &Url) -> Result<Value, FetchFailure> {
+async fn fetch_json_object(
+    http: &reqwest::Client,
+    outbound: Option<&Arc<dyn OutboundPolicy>>,
+    url: &Url,
+    purpose: OutboundPurpose,
+) -> Result<Value, FetchFailure> {
+    // A denial says nothing about the document, so it is never an absence.
+    if !permit(outbound, url, purpose).await {
+        return Err(FetchFailure::Unavailable);
+    }
     let response = http
         .get(url.clone())
         .timeout(METADATA_FETCH_TIMEOUT)
@@ -2036,15 +2099,30 @@ async fn fetch_json_object(http: &reqwest::Client, url: &Url) -> Result<Value, F
     }
 }
 
-async fn cached_json(state: &AppState, url: &Url, ttl: Duration) -> Result<Value, StatusCode> {
-    cached_json_with_client(&state.cache, &state.cfg.http, url, ttl).await
+async fn cached_json(
+    state: &AppState,
+    url: &Url,
+    ttl: Duration,
+    purpose: OutboundPurpose,
+) -> Result<Value, StatusCode> {
+    cached_json_with_client(
+        &state.cache,
+        &state.cfg.http,
+        state.cfg.outbound.as_ref(),
+        url,
+        ttl,
+        purpose,
+    )
+    .await
 }
 
 async fn cached_json_with_client(
     cache: &Mutex<HashMap<String, CachedJson>>,
     http: &reqwest::Client,
+    outbound: Option<&Arc<dyn OutboundPolicy>>,
     url: &Url,
     ttl: Duration,
+    purpose: OutboundPurpose,
 ) -> Result<Value, StatusCode> {
     let key = url.to_string();
     {
@@ -2055,7 +2133,7 @@ async fn cached_json_with_client(
             }
         }
     }
-    let value = fetch_json_object(http, url)
+    let value = fetch_json_object(http, outbound, url, purpose)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     cache.lock().await.insert(

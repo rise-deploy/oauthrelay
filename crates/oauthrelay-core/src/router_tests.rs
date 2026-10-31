@@ -265,6 +265,21 @@ struct SignedFixtureState {
     discovery: Arc<StdMutex<SignedDiscovery>>,
     /// How many times the discovery endpoint was requested.
     discovery_hits: Arc<AtomicUsize>,
+    /// The path of every request the fixture received.
+    requests: Arc<StdMutex<Vec<String>>>,
+}
+
+async fn record_request(
+    State(state): State<SignedFixtureState>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .push(request.uri().path().to_owned());
+    next.run(request).await
 }
 
 /// What the signed fixture's discovery endpoint serves.
@@ -280,6 +295,8 @@ enum SignedDiscovery {
     NotJson,
     /// A JSON document that is not an object.
     Array,
+    /// A valid document whose `jwks_uri` names the fixture under another host name.
+    ForeignJwks,
 }
 
 /// What the signed fixture's upstream configures explicitly.
@@ -306,7 +323,7 @@ async fn signed_discovery(State(state): State<SignedFixtureState>) -> Response {
         }
         SignedDiscovery::NotJson => return "<html>not discovery</html>".into_response(),
         SignedDiscovery::Array => return Json(json!(["not", "an", "object"])).into_response(),
-        SignedDiscovery::Full | SignedDiscovery::WithoutJwks => {}
+        SignedDiscovery::Full | SignedDiscovery::WithoutJwks | SignedDiscovery::ForeignJwks => {}
     }
     let mut doc = json!({
         "issuer": state.issuer,
@@ -320,6 +337,11 @@ async fn signed_discovery(State(state): State<SignedFixtureState>) -> Response {
     });
     if matches!(mode, SignedDiscovery::WithoutJwks) {
         doc.as_object_mut().unwrap().remove("jwks_uri");
+    }
+    if matches!(mode, SignedDiscovery::ForeignJwks) {
+        let mut foreign = state.base.join("jwks").unwrap();
+        foreign.set_host(Some("localhost")).unwrap();
+        doc["jwks_uri"] = json!(foreign);
     }
     Json(doc).into_response()
 }
@@ -477,6 +499,23 @@ async fn setup_signed_upstream(
     required_id_token_claims: HashMap<String, String>,
     id_token_policy: Option<crate::IdTokenPolicy>,
     jwks_source: SignedJwks,
+) -> SignedProfile {
+    setup_signed_with_outbound(
+        profile,
+        required_id_token_claims,
+        id_token_policy,
+        jwks_source,
+        None,
+    )
+    .await
+}
+
+async fn setup_signed_with_outbound(
+    profile: RelayProfile,
+    required_id_token_claims: HashMap<String, String>,
+    id_token_policy: Option<crate::IdTokenPolicy>,
+    jwks_source: SignedJwks,
+    outbound: Option<Arc<dyn OutboundPolicy>>,
 ) -> (
     Router,
     SignedFixtureState,
@@ -513,6 +552,7 @@ async fn setup_signed_upstream(
         claim_overrides: Arc::new(StdMutex::new(serde_json::Map::new())),
         discovery: Arc::new(StdMutex::new(SignedDiscovery::Full)),
         discovery_hits: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::default(),
     };
     let idp = Router::new()
         .route("/.well-known/openid-configuration", get(signed_discovery))
@@ -520,6 +560,10 @@ async fn setup_signed_upstream(
         .route("/token", post(signed_token))
         .route("/jwks", get(signed_jwks))
         .route("/userinfo", get(signed_userinfo))
+        .layer(axum::middleware::from_fn_with_state(
+            fixture.clone(),
+            record_request,
+        ))
         .with_state(fixture.clone());
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
     let (redirect_uri, client_auth) = match profile {
@@ -568,6 +612,7 @@ async fn setup_signed_upstream(
             store: Some(Arc::new(MemoryStore::default())),
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
+            outbound,
             redirect: Default::default(),
         },
         default_layout(KeyStrategy::SingleSegment),
@@ -801,6 +846,7 @@ async fn setup_with_sealer(
             store: Some(store),
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
+            outbound: None,
             redirect: Default::default(),
         },
         strategy,
@@ -861,6 +907,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             store: None,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
+            outbound: None,
             redirect: Default::default(),
         },
         default_layout(KeyStrategy::SingleSegment),
@@ -2067,7 +2114,9 @@ fn validate_fixture_id_token(
     Ok(claims)
 }
 
-async fn signed_authorization_code(app: &Router, redirect_uri: &str) -> (String, String) {
+/// Runs the authorization request and the upstream callback, returning the relay's callback
+/// response and the PKCE verifier.
+async fn signed_authorization_callback(app: &Router, redirect_uri: &str) -> (Response, String) {
     let verifier = "required-claims-verifier-with-at-least-forty-three-characters".to_owned();
     let mut authorize = Url::parse("https://relay.example/relay/profile/authorize").unwrap();
     authorize
@@ -2114,6 +2163,11 @@ async fn signed_authorization_code(app: &Router, redirect_uri: &str) -> (String,
         )
         .await
         .unwrap();
+    (relay_callback, verifier)
+}
+
+async fn signed_authorization_code(app: &Router, redirect_uri: &str) -> (String, String) {
+    let (relay_callback, verifier) = signed_authorization_callback(app, redirect_uri).await;
     let application =
         Url::parse(relay_callback.headers()[header::LOCATION].to_str().unwrap()).unwrap();
     let code = application
@@ -3071,6 +3125,414 @@ async fn a_remembered_absence_does_not_hide_a_document_the_required_path_fetched
     task.abort();
 }
 
+/// An [`OutboundPolicy`] that records every check and denies what it is told to.
+#[derive(Default)]
+struct RecordingPolicy {
+    calls: StdMutex<Vec<(Url, OutboundPurpose)>>,
+    denied: StdMutex<Vec<OutboundPurpose>>,
+    only_host: StdMutex<Option<String>>,
+}
+
+impl RecordingPolicy {
+    fn deny(&self, purposes: &[OutboundPurpose]) {
+        *self.denied.lock().unwrap() = purposes.to_vec();
+    }
+
+    fn allow_only_host(&self, host: &str) {
+        *self.only_host.lock().unwrap() = Some(host.to_owned());
+    }
+
+    fn calls(&self) -> Vec<(Url, OutboundPurpose)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn purposes(&self) -> Vec<OutboundPurpose> {
+        self.calls()
+            .into_iter()
+            .map(|(_, purpose)| purpose)
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl OutboundPolicy for RecordingPolicy {
+    async fn check(
+        &self,
+        url: &Url,
+        purpose: OutboundPurpose,
+    ) -> Result<(), crate::OutboundDenied> {
+        self.calls.lock().unwrap().push((url.clone(), purpose));
+        let wrong_host = self
+            .only_host
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|host| url.host_str() != Some(host));
+        if wrong_host || self.denied.lock().unwrap().contains(&purpose) {
+            return Err(crate::OutboundDenied::new("denied by the test policy"));
+        }
+        Ok(())
+    }
+}
+
+/// Paths the fixture received that the relay requests, in order. The upstream's authorization
+/// endpoint is visited by the user's browser, not by the relay.
+fn relay_requests(fixture: &SignedFixtureState) -> Vec<String> {
+    fixture
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|path| path.as_str() != "/authorize")
+        .cloned()
+        .collect()
+}
+
+async fn setup_with_policy(
+    required: HashMap<String, String>,
+    jwks: SignedJwks,
+) -> (
+    Router,
+    SignedFixtureState,
+    tokio::task::JoinHandle<()>,
+    String,
+    Arc<RecordingPolicy>,
+) {
+    let policy = Arc::new(RecordingPolicy::default());
+    let (app, fixture, task, redirect_uri, _) = setup_signed_with_outbound(
+        RelayProfile::Cognito,
+        required,
+        None,
+        jwks,
+        Some(policy.clone()),
+    )
+    .await;
+    (app, fixture, task, redirect_uri, policy)
+}
+
+fn fixture_refresh_form() -> &'static str {
+    "grant_type=refresh_token&refresh_token=fixture-refresh-token&client_id=upstream-client&client_secret=upstream-secret"
+}
+
+#[tokio::test]
+async fn an_allowing_policy_sees_every_request_before_it_is_sent() {
+    let (app, fixture, task, redirect_uri, policy) =
+        setup_with_policy(required_email_claim(), SignedJwks::Unconfigured).await;
+
+    // Discovery, the JWKS it names, the code exchange, and a refresh: every kind of request the
+    // relay makes to an upstream.
+    assert!(relay_discovery(&app, "profile").await["jwks_uri"].is_string());
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        redeem_signed_code(&app, &redirect_uri).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_token(&app, "profile", fixture_refresh_form())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        policy.purposes(),
+        [
+            OutboundPurpose::Discovery,
+            OutboundPurpose::Jwks,
+            OutboundPurpose::TokenExchange,
+            OutboundPurpose::Refresh,
+        ]
+    );
+    // Each request that reached the upstream was checked first, for the right URL and purpose.
+    let checked: Vec<_> = policy
+        .calls()
+        .into_iter()
+        .map(|(url, _)| url.path().to_owned())
+        .collect();
+    assert_eq!(relay_requests(&fixture), checked);
+    assert_eq!(
+        checked,
+        [
+            "/.well-known/openid-configuration",
+            "/jwks",
+            "/token",
+            "/token"
+        ]
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_denied_discovery_is_unavailable_not_absent_and_nothing_is_sent() {
+    let (app, fixture, task, _, policy) =
+        setup_with_policy(HashMap::new(), SignedJwks::Unconfigured).await;
+    policy.deny(&[OutboundPurpose::Discovery]);
+    for path in [
+        "/relay/profile/.well-known/openid-configuration",
+        "/relay/profile/jwks",
+    ] {
+        assert_eq!(
+            get_status(&app, path).await,
+            StatusCode::BAD_GATEWAY,
+            "{path}"
+        );
+    }
+    assert!(relay_requests(&fixture).is_empty());
+
+    // A denial leaves no absence marker and no cached document behind: the policy relenting is
+    // enough, without waiting out any cooldown.
+    policy.deny(&[]);
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::OK
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_denied_required_discovery_is_a_502_and_nothing_is_sent() {
+    let (app, fixture, task, redirect_uri, policy) =
+        setup_with_policy(HashMap::new(), SignedJwks::Discovered).await;
+    policy.deny(&[OutboundPurpose::Discovery]);
+    let authorize = format!(
+        "/relay/profile/authorize?redirect_uri={}&state=s&scope=openid",
+        url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect::<String>()
+    );
+    assert_eq!(get_status(&app, &authorize).await, StatusCode::BAD_GATEWAY);
+    assert!(relay_requests(&fixture).is_empty());
+    policy.deny(&[]);
+    assert_eq!(get_status(&app, &authorize).await, StatusCode::FOUND);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_denied_jwks_fails_redemption_closed_and_leaves_the_code_unconsumed() {
+    let (app, fixture, task, redirect_uri, policy) =
+        setup_with_policy(required_email_claim(), SignedJwks::Configured).await;
+    policy.deny(&[OutboundPurpose::Jwks]);
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::BAD_GATEWAY
+    );
+    let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+    for _ in 0..2 {
+        let response = redeem_code(&app, &redirect_uri, &code, &verifier).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body["error"], "server_error");
+        assert!(body.get("access_token").is_none());
+    }
+    assert!(!relay_requests(&fixture).contains(&"/jwks".to_owned()));
+
+    policy.deny(&[]);
+    assert_eq!(
+        redeem_code(&app, &redirect_uri, &code, &verifier)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn denied_token_requests_are_a_502_and_nothing_is_sent() {
+    let (app, fixture, task, redirect_uri, policy) =
+        setup_with_policy(HashMap::new(), SignedJwks::Configured).await;
+    policy.deny(&[OutboundPurpose::TokenExchange]);
+    let (callback, _) = signed_authorization_callback(&app, &redirect_uri).await;
+    assert_eq!(callback.status(), StatusCode::BAD_GATEWAY);
+    assert!(!relay_requests(&fixture).contains(&"/token".to_owned()));
+
+    // Refresh is a separate purpose: it works while the exchange is denied, and the other way
+    // around.
+    policy.deny(&[OutboundPurpose::Refresh]);
+    let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+    assert_eq!(
+        redeem_code(&app, &redirect_uri, &code, &verifier)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let before = relay_requests(&fixture).len();
+    let refresh = post_token(&app, "profile", fixture_refresh_form()).await;
+    assert_eq!(refresh.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(relay_requests(&fixture).len(), before);
+
+    policy.deny(&[]);
+    assert_eq!(
+        post_token(&app, "profile", fixture_refresh_form())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_jwks_uri_from_an_untrusted_discovery_document_is_denied() {
+    // The policy trusts the issuer's host only, as an embedder guarding its network would.
+    let (app, fixture, task, redirect_uri, policy) =
+        setup_with_policy(required_email_claim(), SignedJwks::Unconfigured).await;
+    policy.allow_only_host("127.0.0.1");
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::ForeignJwks;
+
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::BAD_GATEWAY
+    );
+    let response = redeem_signed_code(&app, &redirect_uri).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // The foreign URL was offered to the policy and never requested.
+    assert!(policy.calls().iter().any(|(url, purpose)| {
+        url.host_str() == Some("localhost") && *purpose == OutboundPurpose::Jwks
+    }));
+    assert!(!relay_requests(&fixture).contains(&"/jwks".to_owned()));
+    task.abort();
+
+    // Without a policy the same document is followed, so the denial is the policy's doing.
+    let (app, fixture, task) = setup_signed_without_jwks().await;
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::ForeignJwks;
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::OK
+    );
+    assert!(relay_requests(&fixture).contains(&"/jwks".to_owned()));
+    task.abort();
+}
+
+#[tokio::test]
+async fn client_assertion_fetches_are_checked_and_a_denial_rejects_the_assertion() {
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let jwks = json!({"keys":[{"kty":"RSA",
+        "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+        "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}/cluster", listener.local_addr().unwrap());
+    let doc = json!({"issuer":issuer, "jwks_uri":format!("{issuer}/keys")});
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let recorder = |path: &'static str, body: Value, seen: Arc<StdMutex<Vec<String>>>| {
+        get(move || {
+            let (body, seen) = (body.clone(), seen.clone());
+            async move {
+                seen.lock().unwrap().push(path.to_owned());
+                Json(body)
+            }
+        })
+    };
+    let idp = Router::new()
+        .route(
+            "/cluster/.well-known/openid-configuration",
+            recorder("metadata", doc, seen.clone()),
+        )
+        .route("/cluster/keys", recorder("keys", jwks, seen.clone()));
+    let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let claims = json!({"iss":issuer,"sub":"worker","aud":"relay","exp":unix_now()+3600});
+    let assertion = encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let state_with = |policy: &Arc<RecordingPolicy>| {
+        let mut state = assertion_test_state();
+        Arc::get_mut(&mut state.cfg).unwrap().outbound = Some(policy.clone());
+        state
+    };
+    let verify = |state: AppState, source: Option<ClientJwks>| {
+        let (issuer, assertion) = (issuer.clone(), assertion.clone());
+        async move {
+            verify_private_key_jwt(
+                &state,
+                "relay",
+                &issuer,
+                "worker",
+                source.as_ref(),
+                &assertion,
+                false,
+            )
+            .await
+        }
+    };
+    let keys_source = || {
+        Some(ClientJwks::Url(
+            Url::parse(&format!("{issuer}/keys")).unwrap(),
+        ))
+    };
+
+    // Allowed: both fetches are checked, in order, and both reach the issuer.
+    let policy = Arc::new(RecordingPolicy::default());
+    assert!(verify(state_with(&policy), None).await.is_ok());
+    assert_eq!(
+        policy.purposes(),
+        [
+            OutboundPurpose::ClientAssertionMetadata,
+            OutboundPurpose::ClientAssertionJwks
+        ]
+    );
+    assert_eq!(*seen.lock().unwrap(), ["metadata", "keys"]);
+
+    // A configured JWKS URL needs no metadata.
+    seen.lock().unwrap().clear();
+    let policy = Arc::new(RecordingPolicy::default());
+    assert!(verify(state_with(&policy), keys_source()).await.is_ok());
+    assert_eq!(policy.purposes(), [OutboundPurpose::ClientAssertionJwks]);
+    assert_eq!(*seen.lock().unwrap(), ["keys"]);
+
+    // Denied metadata: rejected, nothing sent.
+    seen.lock().unwrap().clear();
+    let policy = Arc::new(RecordingPolicy::default());
+    policy.deny(&[OutboundPurpose::ClientAssertionMetadata]);
+    assert!(verify(state_with(&policy), None).await.is_err());
+    assert!(seen.lock().unwrap().is_empty());
+
+    // Denied keys: rejected, and the denial does not start the fetch-retry cooldown.
+    let policy = Arc::new(RecordingPolicy::default());
+    policy.deny(&[OutboundPurpose::ClientAssertionJwks]);
+    let state = state_with(&policy);
+    assert!(verify(state.clone(), keys_source()).await.is_err());
+    assert!(seen.lock().unwrap().is_empty());
+    policy.deny(&[]);
+    assert!(verify(state, keys_source()).await.is_ok());
+    assert_eq!(*seen.lock().unwrap(), ["keys"]);
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_default_client_builder_does_not_follow_redirects() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let hits = target_hits.clone();
+    let server = Router::new()
+        .route(
+            "/start",
+            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/target")]) }),
+        )
+        .route(
+            "/target",
+            get(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+    let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let client = crate::default_client_builder().build().unwrap();
+    let response = client
+        .get(format!("http://{address}/start"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
 async fn relay_discovery(app: &Router, key: &str) -> Value {
     let response = app
         .clone()
@@ -3544,6 +4006,7 @@ async fn custom_layout_urls_are_appended_to_a_public_url_with_a_path() {
             store: None,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
+            outbound: None,
             redirect: Default::default(),
         },
         Arc::new(LeadingSlashLayout),
@@ -4058,6 +4521,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
             store,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
+            outbound: None,
             redirect: Default::default(),
         }),
         layout: default_layout(KeyStrategy::SingleSegment),
@@ -4179,6 +4643,7 @@ fn assertion_test_state() -> AppState {
                 reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)),
             )
             .unwrap(),
+            outbound: None,
             redirect: Default::default(),
         }),
         layout: default_layout(KeyStrategy::SingleSegment),
@@ -4270,8 +4735,10 @@ async fn client_assertion_discovery_and_jwks_reject_redirects() {
     assert!(cached_json_with_client(
         &state.assertion_cache.metadata,
         &state.cfg.client_assertion_http.0,
+        None,
         &redirect_discovery,
-        DISCOVERY_TTL
+        DISCOVERY_TTL,
+        OutboundPurpose::ClientAssertionMetadata,
     )
     .await
     .is_err());
@@ -4287,7 +4754,9 @@ async fn client_assertion_discovery_and_jwks_reject_redirects() {
         .await
         .contains_key(redirect_discovery.as_str()));
     let keys_url = Url::parse(&format!("{issuer}/keys")).unwrap();
-    cached_json(&state, &keys_url, JWKS_TTL).await.unwrap();
+    cached_json(&state, &keys_url, JWKS_TTL, OutboundPurpose::Jwks)
+        .await
+        .unwrap();
     assert_eq!(target_hits.load(Ordering::SeqCst), 1);
     assert!(
         verify_private_key_jwt(&state, "relay", &issuer, "worker", None, &assertion, false)
@@ -5632,6 +6101,7 @@ async fn rotating_relay_without_a_store_fails_with_a_server_error() {
             store: None,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
+            outbound: None,
             redirect: Default::default(),
         },
         default_layout(KeyStrategy::SingleSegment),
@@ -5813,6 +6283,7 @@ fn development_redirect_app_with(redirect: RedirectOptions, sealer: Arc<XChaChaS
             store: None,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
+            outbound: None,
             redirect,
         },
         default_layout(KeyStrategy::SingleSegment),
@@ -6414,6 +6885,7 @@ impl ReconfigurableRelay {
                 store: Some(Arc::new(MemoryStore::default())),
                 http: reqwest::Client::new(),
                 client_assertion_http: Default::default(),
+                outbound: None,
                 redirect: Default::default(),
             },
             default_layout(KeyStrategy::SingleSegment),
