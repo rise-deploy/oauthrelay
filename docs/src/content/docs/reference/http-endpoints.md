@@ -14,7 +14,7 @@ upstream name `U`, oauthrelay serves:
 | `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. A `sealed` relay opens the presented handle first; a `rotating` relay claims it and returns a successor handle. |
 | `OPTIONS {B}/relay/{R}/token` | Returns CORS headers only for an allowed origin. |
 | `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata, rewrites authorization and token endpoints to the relay, and describes what the relay accepts (see [Transparent metadata](#transparent-metadata)). |
-| `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
+| `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. Answers 404 when the upstream has none (see [Upstream endpoints](/oauthrelay/configuration/#upstream)). |
 | `GET /healthz` | Reports standalone process liveness. |
 | `GET /readyz` | Reports readiness after initial provider snapshots are available. |
 
@@ -45,6 +45,68 @@ The router renders every URL it hands out through `path`: the upstream `redirect
 `private_key_jwt` audience. `path` must therefore invert `parse`. `DefaultLayout::new(KeyStrategy)`
 keeps the built-in routes; for `KeyStrategy::Custom` it renders keys verbatim, so the mapper must
 accept the key parts it is given.
+
+## Embedding: outbound requests
+
+The relay sends HTTP requests to URLs it did not choose: an issuer's discovery document names its
+own `jwks_uri`, which the relay fetches and serves at `/jwks`, and a `private_key_jwt` client's
+issuer does the same. An embedder whose issuers are not all trusted should vet those URLs.
+`RelayConfig.outbound` takes an `Arc<dyn OutboundPolicy>`; `None` allows everything, as the
+standalone service does.
+
+```rust
+#[async_trait]
+pub trait OutboundPolicy: Send + Sync + 'static {
+    async fn check(&self, request: &OutboundRequest<'_>) -> Result<(), OutboundDenied>;
+}
+
+#[non_exhaustive]
+pub struct OutboundRequest<'a> {
+    pub url: &'a Url,
+    pub purpose: OutboundPurpose,
+    pub relay: Option<&'a ResourceKey>,     // the relay the request is made for, if any
+    pub upstream: Option<&'a ResourceKey>,  // the upstream it is made for, if any
+}
+
+#[non_exhaustive]
+pub enum OutboundPurpose {
+    Discovery, Jwks, TokenExchange, Refresh, ClientAssertionMetadata, ClientAssertionJwks,
+}
+```
+
+`check` runs before every request sent with `RelayConfig.http` or
+`RelayConfig.client_assertion_http`. Every request goes through one function that checks the URL
+and then sends that request, so the URL that was approved is the URL that is requested. The
+clients are `UpstreamHttpClient` and `ClientAssertionHttpClient`, which never follow redirects, and
+the relay rejects any redirect or any response that answers from another URL: a redirect from a
+discovery, JWKS, token, or refresh endpoint is a 502.
+
+A denied request is never sent and is unavailable, not absent: relay discovery and `/jwks` answer
+502 and remember nothing, a code redemption that needs the JWKS answers 502 `server_error` and
+leaves the code unconsumed, token and refresh requests answer 502, and a client assertion is
+rejected as `invalid_client`. The relay does not remember denials, so each request that needs a
+denied URL asks the policy again. Denials are logged at `warn` (target `oauthrelay::outbound`)
+with the purpose and host, never the path or query; keep paths, queries, and secrets out of the
+message of `OutboundDenied::new`, which is logged too.
+
+Metadata and keys are cached per purpose and URL, and the policy is not asked when a cached
+answer is served. A policy that becomes stricter takes effect for cached entries when they expire:
+60 minutes for discovery documents and 10 for JWKS. Cached entries are shared by the relays of an
+upstream, so `relay` is the relay that happened to cause the fetch.
+
+### What the policy can enforce
+
+The policy sees a URL, not a connection. Use it for scheme, host, and port allow-lists. Check IP
+literals in the policy itself (`Url::host()` is `Host::Ipv4` or `Host::Ipv6`): a custom DNS
+resolver is never consulted for them. Do not resolve host names inside the policy. The client
+resolves the name again when it connects, so a name can answer differently the second time (DNS
+rebinding), and the policy's answer says nothing about the address that is used.
+
+Enforce address ranges for host names where the connection is made, with a `reqwest::dns::Resolve`
+that drops loopback, link-local, metadata, and private addresses, installed with
+`ClientBuilder::dns_resolver` on both clients. An `HTTP_PROXY` or `HTTPS_PROXY` makes the proxy
+resolve names, which bypasses that resolver; call `ClientBuilder::no_proxy` on both builders, or
+accept that limit knowingly.
 
 ## Authorization endpoint
 
@@ -176,9 +238,11 @@ portable OIDC Discovery contract. The metadata URL is hosted by oauthrelay while
 upstream issuer. Configure transparent-relay relying parties with manual endpoints as described in
 [Relay trust model](/oauthrelay/relay-model/).
 
-The document starts from the upstream's discovery metadata (or an empty document when all upstream
-endpoints are configured explicitly) and keeps what still holds for a client of the relay: the
-issuer, `jwks_uri`, `userinfo_endpoint` (it takes the upstream access token, which the relay never
+The document starts from the upstream's discovery metadata (or an empty document when the
+authorization, token, and JWKS endpoints are all configured explicitly, or when an upstream with
+explicit authorization and token endpoints definitely has no discovery document) and keeps what
+still holds for a client of the relay: the issuer, `jwks_uri` (omitted when the upstream has no
+JWKS), `userinfo_endpoint` (it takes the upstream access token, which the relay never
 replaces), `end_session_endpoint`, ID-token, claim, and subject-type members, and members
 oauthrelay does not recognize, except endpoints. Members that describe the relay's own endpoints
 are replaced:

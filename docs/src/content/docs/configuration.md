@@ -65,7 +65,7 @@ An upstream and a relay may use the same name because identities include the res
 | `spec.issuerUrl` | yes | Absolute HTTP(S) issuer URL used for discovery and preserved as the transparent trust authority. |
 | `spec.endpoints.authorization` | no | Explicit upstream authorization endpoint. Discovery supplies it when omitted. |
 | `spec.endpoints.token` | no | Explicit upstream token endpoint. Discovery supplies it when omitted. |
-| `spec.endpoints.jwks` | no | Explicit upstream JWKS endpoint. Discovery supplies it when omitted. |
+| `spec.endpoints.jwks` | no | Explicit upstream JWKS endpoint. When omitted, the upstream's discovery document supplies it if it has one; otherwise the upstream has no JWKS. |
 | `spec.oauthClient.clientId` | yes | Provider OAuth client ID. |
 | `spec.oauthClient.clientSecret` | yes | Provider OAuth client secret as a [secret value](#secret-values). |
 | `spec.oauthClient.tokenEndpointAuthMethod` | no | How oauthrelay authenticates at the upstream token endpoint: `client_secret_post` (default) or `client_secret_basic`. |
@@ -87,9 +87,32 @@ https://login.example.com/oidc/upstream/google/callback
 Here `OAUTHRELAY_PUBLIC_URL` is `https://login.example.com/oidc`. Set it to another path, such as
 `https://login.example.com/services/oauthrelay`, to serve the same API under that path instead.
 
-Explicit endpoints are useful for providers without standard discovery. Each omitted endpoint is
-resolved from `{issuerUrl}/.well-known/openid-configuration`. The issuer and JWKS remain
-upstream-owned by the relay contract.
+Explicit endpoints are useful for providers without standard discovery, such as OAuth2-only
+providers like GitHub, Notion, or Snowflake OAuth. The authorization and token endpoints are
+required: an omitted one is resolved from `{issuerUrl}/.well-known/openid-configuration`, and the
+relay answers 502 while that document cannot be fetched. Configure both and oauthrelay does not need
+the discovery document for them.
+
+The JWKS is optional. Without `spec.endpoints.jwks`, oauthrelay consults the discovery document
+and uses its `jwks_uri`. The upstream has no JWKS when the document is definitely absent: it
+answers 404 or 410, answers with something that is not a JSON object, or is a valid document
+without `jwks_uri`. Then the relay's discovery metadata omits `jwks_uri` and its `/jwks` endpoint
+answers 404. oauthrelay does not look for an absent document again for 30 seconds.
+
+An upstream that cannot be asked is not an upstream without a JWKS. A transport error, a timeout
+(each fetch of discovery or JWKS metadata has a 10 second deadline), or any other status, such as a
+5xx, makes relay discovery and `/jwks` answer 502, and the next request asks again. The issuer
+remains upstream-owned by the relay contract.
+
+The service does not follow HTTP redirects when it requests discovery documents, JWKS, or the
+token endpoint: such an answer is a 502 (a redirect from the token endpoint is never passed on to
+the client). Configure the final URL of an upstream that redirects.
+
+A relay with `requiredIdTokenClaims` or `idTokenPolicy` must verify the upstream ID token, which
+needs the JWKS. When the upstream has none, or cannot be asked for it, authorization-code redemption
+fails closed with HTTP 502 `server_error` and the code stays unconsumed; the relay never admits an
+unverified ID token.
+Do not configure either policy for an upstream that issues no ID tokens.
 
 ## Relay
 
@@ -177,11 +200,13 @@ authorization-code token request must still repeat the exact redirect URI stored
 
 `requiredIdTokenClaims` applies to successful authorization-code exchanges. oauthrelay verifies
 the upstream ID-token signature, issuer, audience, lifetime, subject, issued-at time, nonce when
-requested, authorized party, and access-token hash when present. Every configured claim must exist
-as a string with the exact configured value. The policy reads only signed ID-token claims; it does
-not read UserInfo. A failed policy returns `invalid_grant` without returning upstream tokens. Relay
-codes remain single-use after a failed check. Refresh grants do not evaluate this policy because an
-upstream refresh response does not always contain an ID token.
+requested, authorized party, and access-token hash when present, using the upstream JWKS. When the
+upstream has no JWKS, or it cannot be fetched, redemption fails closed with `server_error` instead
+of skipping verification. Every configured claim must exist as a string with the exact configured
+value. The policy reads only signed ID-token claims; it does not read UserInfo. A failed policy
+returns `invalid_grant` without returning upstream tokens. Relay codes remain single-use after a
+failed check. Refresh grants do not evaluate this policy because an upstream refresh response does
+not always contain an ID token.
 
 ### ID-token admission policy
 
@@ -603,10 +628,23 @@ An unknown `kid` triggers a JWKS refresh; concurrent requests share one fetch. F
 and failed fetch retries have a thirty-second cooldown per URL. A failed refresh preserves
 previously fetched keys until their normal cache expiry.
 
-Rust embedders configure trust-fetch TLS roots through
-`ClientAssertionHttpClient::new(reqwest::ClientBuilder)` and supply the result as
-`RelayConfig.client_assertion_http`. Its constructor enforces the redirect policy and deadline.
-The `RelayConfig.http` client controls upstream traffic independently.
+Rust embedders build `RelayConfig` with `RelayConfig::new(public_url, sealer)` and the `with_*`
+methods (`with_store`, `with_http`, `with_client_assertion_http`, `with_outbound`,
+`with_redirect`). The struct is `#[non_exhaustive]`, so fields can be added without breaking them.
+
+Both HTTP clients take a `reqwest::ClientBuilder`: `UpstreamHttpClient::new(builder)` for
+`RelayConfig.http` (discovery, JWKS, and the token endpoint) and
+`ClientAssertionHttpClient::new(builder)` for `RelayConfig.client_assertion_http` (trust-fetch TLS
+roots). Their constructors replace the builder's redirect policy with one that follows none;
+`ClientAssertionHttpClient` also enforces a ten second deadline. Both are `reqwest` 0.13 types, so an
+embedder must use the same major version.
+
+`oauthrelay_core::default_client_builder()` returns a builder that trusts the bundled Mozilla root
+certificates (`webpki-roots`) instead of the host's store, so it also works in container images
+without a system CA bundle. The standalone service and the `Default` of both clients use it. A
+`reqwest::Client::new()` uses the platform verifier, which relies on the host's store. To restrict
+the URLs the relay requests, see
+[outbound requests](/oauthrelay/reference/http-endpoints/#embedding-outbound-requests).
 
 ```yaml
 clientAuthentication:

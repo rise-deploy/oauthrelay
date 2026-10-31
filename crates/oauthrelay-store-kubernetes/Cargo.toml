@@ -26,7 +26,7 @@ tracing.workspace = true
 [dev-dependencies]
 axum.workspace = true
 http-body-util.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["query"] }
 serde_urlencoded.workspace = true
 serde_yaml.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
