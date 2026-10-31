@@ -327,7 +327,7 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
         routing::post,
         Router,
     };
-    use oauthrelay_core::{router, KeyStrategy, RelayConfig, XChaChaSealer};
+    use oauthrelay_core::{router, DefaultLayout, KeyStrategy, RelayConfig, XChaChaSealer};
     use tower::ServiceExt;
 
     let path = std::env::var("OAUTHRELAY_KUBERNETES_TEST_KUBECONFIG").unwrap();
@@ -429,7 +429,7 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
             client_assertion_http: Default::default(),
             redirect: Default::default(),
         },
-        KeyStrategy::SingleSegment,
+        Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),
     );
     for (name, token_audience, expected) in [
         ("worker", audience, StatusCode::ACCEPTED),
