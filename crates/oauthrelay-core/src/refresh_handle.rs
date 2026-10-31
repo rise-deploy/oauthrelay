@@ -1,17 +1,20 @@
 //! Sealed refresh-token handles.
 //!
 //! In `sealed` mode a relay never shows its client the upstream refresh token. Token responses
-//! carry a handle instead: the upstream token sealed with the relay's sealer, bound to the relay
-//! key and to this purpose through the associated data. Only the relay that issued a handle can
-//! open it, and seal-key rotation applies through the sealer's previous-key mechanism.
+//! carry a handle instead: the upstream token sealed with the relay's sealer, bound through the
+//! associated data to this purpose and to a [`HandleBinding`]: the relay key, the relay's
+//! generation, and the identity of its upstream. Only the relay that issued a handle, still
+//! pointing at the same upstream, can open it, and seal-key rotation applies through the sealer's
+//! previous-key mechanism.
 
-use crate::{ResourceKey, SealError, Sealer};
+use crate::{router::issuer_identifier, Relay, ResourceKey, SealError, Sealer, Upstream};
 use serde::{
     de::{MapAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// Recognizable, versioned prefix of every sealed handle. The remainder is a sealer envelope.
@@ -31,15 +34,92 @@ pub(crate) struct OpenedHandle {
     pub issued_at: u64,
 }
 
-fn associated_data(relay: &ResourceKey) -> Vec<u8> {
-    format!("refresh:{relay}").into_bytes()
+/// Domain separation of the upstream-identity fingerprint. A new binding scheme gets a new tag.
+const FINGERPRINT_DOMAIN: &[u8] = b"oauthrelay refresh-token binding v1";
+
+/// What a refresh-token handle, and every rotating-mode record that holds or leads to an upstream
+/// token, is bound to: the relay key and a fingerprint of the relay's generation and of the
+/// upstream identity a refresh token belongs to.
+///
+/// The upstream identity is the configured issuer URL (normalized as for ID-token issuer
+/// comparison), the configured token endpoint override if there is one, and the upstream
+/// `client_id`. A change to any of them, or to the relay's generation, changes the fingerprint,
+/// so handles issued before no longer open: the relay answers `invalid_grant` without sending
+/// the stored upstream token anywhere. Discovered endpoints are not part of the identity, so a
+/// change in the provider's discovery document does not sign anyone out; neither does any other
+/// relay or upstream setting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HandleBinding {
+    relay: ResourceKey,
+    fingerprint: [u8; 32],
+}
+
+impl HandleBinding {
+    /// The binding of `relay` as it is configured now, with `upstream` the upstream it references.
+    pub(crate) fn new(relay: &Relay, upstream: &Upstream) -> Self {
+        Self::with_fingerprint(relay.key.clone(), fingerprint(relay, upstream))
+    }
+
+    /// A binding whose fingerprint was computed earlier, for example when the upstream answered
+    /// the code exchange whose tokens are being handed out now.
+    pub(crate) fn with_fingerprint(relay: ResourceKey, fingerprint: [u8; 32]) -> Self {
+        Self { relay, fingerprint }
+    }
+
+    pub(crate) fn relay(&self) -> &ResourceKey {
+        &self.relay
+    }
+
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+}
+
+/// Domain-separated SHA-256 over the relay generation and the upstream identity. Every field is
+/// length-prefixed and absent values are distinct from empty ones, so no two configurations
+/// share an encoding.
+pub(crate) fn fingerprint(relay: &Relay, upstream: &Upstream) -> [u8; 32] {
+    fn field(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            None => hasher.update([0]),
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+        }
+    }
+    // Exhaustive, so that a new upstream field has to be classified as identity or not.
+    let Upstream {
+        key: _,
+        issuer_url,
+        authorization_endpoint: _,
+        token_endpoint,
+        jwks_uri: _,
+        client_id,
+        client_secret: _,
+        token_endpoint_auth_method: _,
+    } = upstream;
+    let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_DOMAIN);
+    field(&mut hasher, relay.generation.as_deref());
+    field(&mut hasher, Some(&issuer_identifier(issuer_url)));
+    field(&mut hasher, token_endpoint.as_ref().map(url::Url::as_str));
+    field(&mut hasher, Some(client_id));
+    hasher.finalize().into()
+}
+
+fn associated_data(binding: &HandleBinding) -> Vec<u8> {
+    let mut data = format!("refresh:{}\0", binding.relay).into_bytes();
+    data.extend_from_slice(&binding.fingerprint);
+    data
 }
 
 /// Why a handle could not be sealed or opened.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HandleError {
-    /// Not a handle this relay issued: wrong shape, tampered with, issued for another relay, or
-    /// sealed under a key that is no longer configured. (When sealing: the value could not be
+    /// Not a handle this relay issued: wrong shape, tampered with, issued for another relay or
+    /// under another binding, or sealed under a key that is no longer configured. (When sealing: the value could not be
     /// encoded or sealed.)
     Invalid,
     /// The sealer could not be reached; the handle may be fine.
@@ -55,10 +135,10 @@ impl From<SealError> for HandleError {
     }
 }
 
-/// Seals an upstream refresh token into a handle for `relay`.
+/// Seals an upstream refresh token into a handle bound to `binding`.
 pub(crate) async fn seal_handle(
     sealer: &dyn Sealer,
-    relay: &ResourceKey,
+    binding: &HandleBinding,
     upstream_token: &str,
     issued_at: u64,
 ) -> Result<String, HandleError> {
@@ -67,21 +147,22 @@ pub(crate) async fn seal_handle(
         issued_at,
     })
     .map_err(|_| HandleError::Invalid)?;
-    let envelope = sealer.seal(&plaintext, &associated_data(relay)).await?;
+    let envelope = sealer.seal(&plaintext, &associated_data(binding)).await?;
     Ok(format!("{HANDLE_PREFIX}{envelope}"))
 }
 
-/// Opens a handle issued by `relay`. Anything else, including a raw upstream token, a handle
-/// issued for another relay, or a tampered handle, is rejected.
+/// Opens a handle issued under `binding`. Anything else, including a raw upstream token, a handle
+/// issued for another relay, another relay generation or another upstream identity, or a
+/// tampered handle, is rejected.
 pub(crate) async fn open_handle(
     sealer: &dyn Sealer,
-    relay: &ResourceKey,
+    binding: &HandleBinding,
     handle: &str,
 ) -> Result<OpenedHandle, HandleError> {
     let envelope = handle
         .strip_prefix(HANDLE_PREFIX)
         .ok_or(HandleError::Invalid)?;
-    let plaintext = sealer.unseal(envelope, &associated_data(relay)).await?;
+    let plaintext = sealer.unseal(envelope, &associated_data(binding)).await?;
     let handle: RefreshHandle =
         postcard::from_bytes(&plaintext).map_err(|_| HandleError::Invalid)?;
     Ok(OpenedHandle {
@@ -132,7 +213,7 @@ pub(crate) fn names_refresh_token(body: &[u8]) -> bool {
 /// response must not be returned, as it would expose the upstream token.
 pub(crate) async fn seal_token_response(
     sealer: &dyn Sealer,
-    relay: &ResourceKey,
+    binding: &HandleBinding,
     status: u16,
     body: &[u8],
     issued_at: u64,
@@ -158,7 +239,7 @@ pub(crate) async fn seal_token_response(
         if token.is_empty() {
             continue;
         }
-        let handle = seal_handle(sealer, relay, &token, issued_at)
+        let handle = seal_handle(sealer, binding, &token, issued_at)
             .await
             .map_err(|error| match error {
                 HandleError::SealerUnavailable => SubstitutionError::SealerUnavailable,
@@ -254,12 +335,12 @@ mod tests {
     use super::*;
     use crate::XChaChaSealer;
 
-    fn key(name: &str) -> ResourceKey {
-        ResourceKey::new(name).unwrap()
+    fn binding(name: &str) -> HandleBinding {
+        HandleBinding::with_fingerprint(ResourceKey::new(name).unwrap(), [3; 32])
     }
 
     async fn seal(sealer: &XChaChaSealer, body: &str) -> Option<String> {
-        seal_token_response(sealer, &key("app"), 200, body.as_bytes(), 42)
+        seal_token_response(sealer, &binding("app"), 200, body.as_bytes(), 42)
             .await
             .unwrap()
             .map(|bytes| String::from_utf8(bytes).unwrap())
@@ -268,40 +349,55 @@ mod tests {
     #[tokio::test]
     async fn handle_round_trips_and_is_bound_to_the_relay() {
         let sealer = XChaChaSealer::new(&[1; 32], None).unwrap();
-        let handle = seal_handle(&sealer, &key("app"), "upstream-token", 7)
+        let handle = seal_handle(&sealer, &binding("app"), "upstream-token", 7)
             .await
             .unwrap();
         assert!(handle.starts_with("rrt1."));
         assert!(!handle.contains("upstream-token"));
-        let opened = open_handle(&sealer, &key("app"), &handle).await.unwrap();
+        let opened = open_handle(&sealer, &binding("app"), &handle)
+            .await
+            .unwrap();
         assert_eq!(opened.upstream_token, "upstream-token");
         assert_eq!(opened.issued_at, 7);
-        assert!(open_handle(&sealer, &key("other"), &handle).await.is_err());
-        assert!(open_handle(&sealer, &key("app"), "upstream-token")
+        assert!(open_handle(&sealer, &binding("other"), &handle)
             .await
             .is_err());
-        assert!(open_handle(&sealer, &key("app"), &handle["rrt1.".len()..])
+        let rebound = HandleBinding::with_fingerprint(ResourceKey::new("app").unwrap(), [4; 32]);
+        assert_eq!(
+            open_handle(&sealer, &rebound, &handle).await.unwrap_err(),
+            HandleError::Invalid
+        );
+        assert!(open_handle(&sealer, &binding("app"), "upstream-token")
             .await
             .is_err());
-        assert!(open_handle(&sealer, &key("app"), "rrt1.").await.is_err());
+        assert!(
+            open_handle(&sealer, &binding("app"), &handle["rrt1.".len()..])
+                .await
+                .is_err()
+        );
+        assert!(open_handle(&sealer, &binding("app"), "rrt1.")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn handles_survive_seal_key_rotation() {
         let old = XChaChaSealer::new(&[1; 32], None).unwrap();
-        let handle = seal_handle(&old, &key("app"), "upstream-token", 7)
+        let handle = seal_handle(&old, &binding("app"), "upstream-token", 7)
             .await
             .unwrap();
         let rotated = XChaChaSealer::new(&[2; 32], Some(&[1; 32])).unwrap();
         assert_eq!(
-            open_handle(&rotated, &key("app"), &handle)
+            open_handle(&rotated, &binding("app"), &handle)
                 .await
                 .unwrap()
                 .upstream_token,
             "upstream-token"
         );
         let retired = XChaChaSealer::new(&[2; 32], None).unwrap();
-        assert!(open_handle(&retired, &key("app"), &handle).await.is_err());
+        assert!(open_handle(&retired, &binding("app"), &handle)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -318,7 +414,7 @@ mod tests {
             r#","a":{"y":[1, 2],"b":null},"big":123456789012345678901234567890}"#
         );
         assert_eq!(
-            open_handle(&sealer, &key("app"), handle)
+            open_handle(&sealer, &binding("app"), handle)
                 .await
                 .unwrap()
                 .upstream_token,
@@ -344,7 +440,7 @@ mod tests {
             assert_eq!(
                 seal_token_response(
                     &sealer,
-                    &key("app"),
+                    &binding("app"),
                     status,
                     br#"{"refresh_token":"secret"}"#,
                     0
@@ -378,7 +474,7 @@ mod tests {
             "{\"refresh_token\": \"secret\"",
         ] {
             assert_eq!(
-                seal_token_response(&sealer, &key("app"), 200, body.as_bytes(), 0).await,
+                seal_token_response(&sealer, &binding("app"), 200, body.as_bytes(), 0).await,
                 Err(SubstitutionError::UnrecognizedBody),
                 "{body}"
             );
@@ -435,5 +531,101 @@ mod tests {
         ] {
             assert!(!has_handle_prefix(token), "{token}");
         }
+    }
+
+    fn upstream() -> Upstream {
+        Upstream {
+            key: ResourceKey::new("idp").unwrap(),
+            issuer_url: url::Url::parse("https://issuer.example").unwrap(),
+            authorization_endpoint: None,
+            token_endpoint: None,
+            jwks_uri: None,
+            client_id: "client".into(),
+            client_secret: crate::SecretString::new("secret"),
+            token_endpoint_auth_method: crate::TokenEndpointAuthMethod::ClientSecretPost,
+        }
+    }
+
+    fn relay() -> Relay {
+        Relay {
+            key: ResourceKey::new("app").unwrap(),
+            upstream: ResourceKey::new("idp").unwrap(),
+            generation: None,
+            client_auth: crate::ClientAuth::Public,
+            scopes: vec!["openid".into()],
+            allowed_scopes: None,
+            required_id_token_claims: Default::default(),
+            id_token_policy: None,
+            refresh_tokens: Default::default(),
+            redirect_policy: vec![
+                crate::RedirectMatcher::uri("https://app.example/callback").unwrap()
+            ],
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_covers_generation_and_upstream_identity_only() {
+        let base = fingerprint(&relay(), &upstream());
+        let url = |value: &str| url::Url::parse(value).unwrap();
+        let changed_upstream: [fn(&mut Upstream); 5] = [
+            |u| u.issuer_url = url::Url::parse("https://other.example").unwrap(),
+            |u| u.issuer_url = url::Url::parse("https://issuer.example/tenant").unwrap(),
+            |u| u.token_endpoint = Some(url::Url::parse("https://issuer.example/token").unwrap()),
+            |u| u.client_id = "other-client".into(),
+            |u| u.client_id = String::new(),
+        ];
+        for change in changed_upstream {
+            let mut upstream = upstream();
+            change(&mut upstream);
+            assert_ne!(fingerprint(&relay(), &upstream), base);
+        }
+        let mut overridden = upstream();
+        overridden.token_endpoint = Some(url("https://issuer.example/token"));
+        let mut other_override = overridden.clone();
+        other_override.token_endpoint = Some(url("https://issuer.example/oauth/token"));
+        assert_ne!(
+            fingerprint(&relay(), &overridden),
+            fingerprint(&relay(), &other_override)
+        );
+        for generation in ["", "1", "2"] {
+            let mut relay = relay();
+            relay.generation = Some(generation.into());
+            assert_ne!(fingerprint(&relay, &upstream()), base, "{generation:?}");
+        }
+        let mut first = relay();
+        first.generation = Some("1".into());
+        let mut second = relay();
+        second.generation = Some("2".into());
+        assert_ne!(
+            fingerprint(&first, &upstream()),
+            fingerprint(&second, &upstream())
+        );
+
+        // The issuer is compared as the ID-token issuer is: a bare origin with or without its
+        // trailing slash is the same issuer.
+        let mut slash = upstream();
+        slash.issuer_url = url("https://issuer.example/");
+        assert_eq!(fingerprint(&relay(), &slash), base);
+
+        // Nothing else about the upstream or the relay is part of the identity.
+        let mut unrelated = upstream();
+        unrelated.key = ResourceKey::new("renamed").unwrap();
+        unrelated.authorization_endpoint = Some(url("https://issuer.example/authorize"));
+        unrelated.jwks_uri = Some(url("https://issuer.example/jwks"));
+        unrelated.client_secret = crate::SecretString::new("rotated");
+        unrelated.token_endpoint_auth_method = crate::TokenEndpointAuthMethod::ClientSecretBasic;
+        let mut edited = relay();
+        edited.key = ResourceKey::new("renamed").unwrap();
+        edited.upstream = ResourceKey::new("renamed").unwrap();
+        edited.client_auth = crate::ClientAuth::UpstreamClient;
+        edited.scopes = vec!["openid".into(), "email".into()];
+        edited.allowed_scopes = Some(vec!["openid".into(), "email".into()]);
+        edited
+            .required_id_token_claims
+            .insert("hd".into(), "example.com".into());
+        edited.refresh_tokens.mode = crate::RefreshTokenMode::Rotating;
+        edited.refresh_tokens.grace_period_seconds = 5;
+        edited.redirect_policy = vec![crate::RedirectMatcher::uri("https://b.example/cb").unwrap()];
+        assert_eq!(fingerprint(&edited, &unrelated), base);
     }
 }

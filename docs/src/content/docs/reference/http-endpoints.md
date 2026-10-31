@@ -109,8 +109,10 @@ other members are unchanged.
 ```
 
 The refresh grant takes that handle as `refresh_token`. Anything else, including a raw upstream
-token, a handle from another relay, or a modified handle, returns HTTP 400 with
-`error=invalid_grant`, and the request is not sent to the upstream. If the upstream refresh response
+token, a handle from another relay, a handle issued before the relay's
+[upstream identity or generation changed](/oauthrelay/configuration/#changing-a-relays-upstream),
+or a modified handle, returns HTTP 400 with `error=invalid_grant`, and the request is not sent to
+the upstream. If the upstream refresh response
 has no `refresh_token`, neither does the relay's response, and the client keeps its handle.
 Non-2xx upstream responses are returned unchanged. The relay sends `Accept: application/json` to
 the upstream and reads any 2xx body as JSON whatever its content type; a 2xx body that is not a
@@ -132,7 +134,7 @@ even when the provider returned none; present that one next.
 
 | Situation | Response |
 | --- | --- |
-| Handle unknown, expired, revoked, past the family's maximum lifetime, not issued by this relay, or stored under a seal key that is no longer configured | 400 `invalid_grant`; the provider is not contacted. |
+| Handle unknown, expired, revoked, past the family's maximum lifetime, not issued by this relay, issued before the relay's [upstream identity or generation changed](/oauthrelay/configuration/#changing-a-relays-upstream), or stored under a seal key that is no longer configured | 400 `invalid_grant`; the provider is not contacted. |
 | Handle already used, within `gracePeriodSeconds` of its rotation | The response of that rotation again, with the same successor handle. |
 | Handle already used, after the grace period | 400 `invalid_grant`, and the whole family is revoked. |
 | Another request is rotating the same handle and does not finish within five seconds | 503 `temporarily_unavailable` with `Retry-After: 1`; retry. |

@@ -19,7 +19,7 @@ use oauthrelay_secret_resolver::StandardSecretResolver;
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -141,6 +141,8 @@ impl KubernetesProvider {
         upstreams: impl IntoIterator<Item = Upstream>,
         relays: impl IntoIterator<Item = Relay>,
     ) -> anyhow::Result<ProviderSnapshot> {
+        let relays: Vec<Relay> = relays.into_iter().collect();
+        let generations = relay_generations(&relays);
         let documents = documents(&self.namespace, upstreams, relays)?;
         let mut resolver = StandardSecretResolver::new(None).with_kubernetes_secrets(Arc::new(
             KubernetesSecrets {
@@ -150,10 +152,34 @@ impl KubernetesProvider {
         if let Some(aws) = &self.aws_secrets {
             resolver = resolver.with_aws_secrets(aws.clone());
         }
-        tokio::time::timeout(REQUEST_TIMEOUT, compile_resources(documents, &resolver))
-            .await
-            .context("Kubernetes configuration compilation timed out")?
+        let snapshot =
+            tokio::time::timeout(REQUEST_TIMEOUT, compile_resources(documents, &resolver))
+                .await
+                .context("Kubernetes configuration compilation timed out")??;
+        Ok(with_generations(snapshot, &generations))
     }
+}
+
+/// The `metadata.uid` of each Relay resource by name. A Relay deleted and recreated under the
+/// same name gets a new uid, so its predecessor's refresh-token handles stop working.
+fn relay_generations(relays: &[Relay]) -> HashMap<String, String> {
+    relays
+        .iter()
+        .filter_map(|relay| Some((relay.meta().name.clone()?, relay.meta().uid.clone()?)))
+        .collect()
+}
+
+/// Sets each compiled relay's generation to its resource's uid.
+fn with_generations(
+    mut snapshot: ProviderSnapshot,
+    generations: &HashMap<String, String>,
+) -> ProviderSnapshot {
+    for (key, relay) in &mut snapshot.relays {
+        if let Some(uid) = generations.get(key.as_str()) {
+            Arc::make_mut(relay).generation = Some(uid.clone());
+        }
+    }
+    snapshot
 }
 
 fn metadata(

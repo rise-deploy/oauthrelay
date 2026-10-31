@@ -591,6 +591,7 @@ pub async fn compile_resources(
         let relay = Relay {
             key: key.clone(),
             upstream,
+            generation: None,
             client_auth,
             scopes: resource.spec.scopes.default,
             allowed_scopes: resource.spec.scopes.allowed,

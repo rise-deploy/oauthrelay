@@ -151,6 +151,7 @@ mod tests {
         Arc::new(Relay {
             key: ResourceKey::new(key).unwrap(),
             upstream: ResourceKey::new(upstream).unwrap(),
+            generation: None,
             client_auth: ClientAuth::UpstreamClient,
             scopes: vec![],
             allowed_scopes: None,

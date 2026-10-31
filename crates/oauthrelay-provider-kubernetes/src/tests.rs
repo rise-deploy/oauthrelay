@@ -15,7 +15,7 @@ fn upstream(secret: Value) -> Value {
 }
 fn relay() -> Value {
     json!({"apiVersion":"oauthrelay.dev/v1alpha1", "kind":"Relay",
-        "metadata":{"name":"app", "namespace":"team", "resourceVersion":"1"},
+        "metadata":{"name":"app", "namespace":"team", "resourceVersion":"1", "uid":"0f3c6a52-relay-uid"},
         "spec":{"upstreamRef":{"name":"issuer"}, "refreshTokens":{"mode":"rotating"}, "clientAuthentication":{"type":"Public"},
         "redirectPolicy":[{"uri":"https://app.example/cb"}]}})
 }
@@ -48,6 +48,34 @@ fn kubernetes_metadata_is_accepted_but_namespace_must_match() {
     let resource: Upstream = serde_json::from_value(upstream(json!({"value":"secret"}))).unwrap();
     assert!(documents("other", [resource.clone()], []).is_err());
     assert_eq!(documents("team", [resource], []).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn relay_generation_is_the_resource_uid() {
+    let upstream: Upstream = serde_json::from_value(upstream(json!({"value":"secret"}))).unwrap();
+    let first: Relay = serde_json::from_value(relay()).unwrap();
+    let mut recreated = first.clone();
+    recreated.metadata.uid = Some("9a1d-recreated-uid".into());
+    let mut without_uid = first.clone();
+    without_uid.metadata.uid = None;
+
+    let compile = async |relay: Relay| {
+        let relays = [relay];
+        let generations = relay_generations(&relays);
+        let documents = documents("team", [upstream.clone()], relays).unwrap();
+        let snapshot = compile_resources(documents, &StandardSecretResolver::new(None))
+            .await
+            .unwrap();
+        with_generations(snapshot, &generations).relays[&"app".parse().unwrap()]
+            .generation
+            .clone()
+    };
+    assert_eq!(compile(first).await.as_deref(), Some("0f3c6a52-relay-uid"));
+    assert_eq!(
+        compile(recreated).await.as_deref(),
+        Some("9a1d-recreated-uid")
+    );
+    assert_eq!(compile(without_uid).await, None);
 }
 
 #[test]
@@ -264,6 +292,16 @@ async fn complete_reads_resolve_secrets_and_enforce_rbac_errors() {
     let snapshot = provider.load().await.unwrap();
     assert_eq!(password(&snapshot), "first\n");
     assert_eq!(snapshot.relays.len(), 1);
+    assert_eq!(
+        snapshot
+            .relays
+            .values()
+            .next()
+            .unwrap()
+            .generation
+            .as_deref(),
+        Some("0f3c6a52-relay-uid")
+    );
     api.0.lock().unwrap().forbidden = true;
     assert!(provider.load().await.is_err());
 }

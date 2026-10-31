@@ -1,7 +1,8 @@
 use crate::{
     model::valid_scope_token,
     refresh_handle::{
-        has_handle_prefix, open_handle, seal_token_response, HandleError, SubstitutionError,
+        fingerprint, has_handle_prefix, open_handle, seal_token_response, HandleBinding,
+        HandleError, SubstitutionError,
     },
     rotation::{IssueError, RefreshOutcome, Rotator, UpstreamFailure, UpstreamRefresher},
     ClientAuth, ClientJwks, Endpoint, PathLayout, RedirectOptions, RefreshTokenMode, Relay,
@@ -139,6 +140,11 @@ struct CodeEnvelope {
     client_code_challenge: Option<String>,
     id_token_nonce: Option<String>,
     upstream_response: StoredResponse,
+    /// The [`HandleBinding`] fingerprint of the relay and upstream that obtained
+    /// `upstream_response`. Refresh-token handles issued at redemption carry it, so they belong
+    /// to the upstream identity that issued the refresh token even if the configuration changed
+    /// in between.
+    handle_fingerprint: [u8; 32],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -608,6 +614,7 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
             content_type,
             body,
         },
+        handle_fingerprint: fingerprint(&relay, upstream),
     };
     let sealed = match seal_postcard(state, &relay.key, &envelope).await {
         Ok(value) => value,
@@ -786,6 +793,9 @@ async fn exchange_sealed_code(
             "ID token validation is unavailable",
         );
     }
+    // Handles carry the binding of the relay and upstream that obtained this response, so they
+    // belong to the upstream identity that issued its refresh token.
+    let binding = HandleBinding::with_fingerprint(relay.key.clone(), envelope.handle_fingerprint);
     // Sealing commits nothing, so it runs before the replay marker: a sealer failure leaves the
     // code redeemable. (Rotating mode writes its family to the store, so it follows the marker.)
     let sealed_body = if relay.refresh_tokens.mode == RefreshTokenMode::Sealed && validation.is_ok()
@@ -793,7 +803,7 @@ async fn exchange_sealed_code(
         let upstream_response = &envelope.upstream_response;
         match seal_token_response(
             state.cfg.sealer.as_ref(),
-            &relay.key,
+            &binding,
             upstream_response.status,
             &upstream_response.body,
             unix_now(),
@@ -849,7 +859,7 @@ async fn exchange_sealed_code(
             }
         }
         RefreshTokenMode::Rotating => {
-            let Some(rotator) = rotator(state, relay) else {
+            let Some(rotator) = rotator(state, relay, binding) else {
                 return rotation_store_required();
             };
             match rotator.issue_in_response(&stored).await {
@@ -977,7 +987,7 @@ async fn validate_id_token_policy(
     }
 }
 
-fn issuer_identifier(url: &Url) -> String {
+pub(crate) fn issuer_identifier(url: &Url) -> String {
     if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
         url.as_str().trim_end_matches('/').to_owned()
     } else {
@@ -1037,11 +1047,14 @@ async fn refresh(
             "refresh_token is required",
         );
     };
+    // Handles open only under the relay's current generation and upstream identity, so a handle
+    // issued before either changed is rejected before its upstream token is sent anywhere.
+    let binding = HandleBinding::new(relay, upstream);
     if relay.refresh_tokens.mode == RefreshTokenMode::Rotating {
         if rotation_store_missing(state, relay) {
             return rotation_store_required();
         }
-        let Some(rotator) = rotator(state, relay) else {
+        let Some(rotator) = rotator(state, relay, binding) else {
             return rotation_store_required();
         };
         if let Some(rejection) = scope_rejection(relay, form) {
@@ -1091,7 +1104,7 @@ async fn refresh(
         );
     }
     let upstream_token = if sealed {
-        match open_handle(state.cfg.sealer.as_ref(), &relay.key, presented).await {
+        match open_handle(state.cfg.sealer.as_ref(), &binding, presented).await {
             Ok(opened) => Some(opened.upstream_token),
             Err(HandleError::SealerUnavailable) => return sealer_unavailable(),
             Err(HandleError::Invalid) => {
@@ -1115,7 +1128,7 @@ async fn refresh(
             };
             match seal_token_response(
                 state.cfg.sealer.as_ref(),
-                &relay.key,
+                &binding,
                 stored.status,
                 &stored.body,
                 unix_now(),
@@ -1247,12 +1260,12 @@ impl UpstreamRefresher for UpstreamRefreshRequest<'_> {
     }
 }
 
-fn rotator(state: &AppState, relay: &Relay) -> Option<Rotator> {
+fn rotator(state: &AppState, relay: &Relay, binding: HandleBinding) -> Option<Rotator> {
     state.cfg.store.as_ref().map(|store| {
         Rotator::new(
             store.clone(),
             state.cfg.sealer.clone(),
-            relay.key.clone(),
+            binding,
             &relay.refresh_tokens,
         )
     })

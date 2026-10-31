@@ -1,10 +1,10 @@
 use super::*;
 use crate::{
-    refresh_handle::{open_handle, seal_handle},
+    refresh_handle::{open_handle, seal_handle, HandleBinding},
     rotation::Rotator,
     seal::FlakySealer,
     ClientAuth, DefaultLayout, KeyStrategy, MemoryStore, ProviderSnapshot, RedirectMatcher,
-    RefreshTokenMode, RefreshTokens, SecretString, TokenEndpointAuthMethod, Upstream,
+    RefreshTokenMode, RefreshTokens, Registry, SecretString, TokenEndpointAuthMethod, Upstream,
     XChaChaSealer, DEFAULT_GRACE_PERIOD_SECONDS, DEFAULT_MAX_LIFETIME_SECONDS,
 };
 use axum::{
@@ -46,6 +46,14 @@ struct MockCapture {
     accept: Arc<StdMutex<Vec<Option<String>>>>,
     /// The `Authorization` header of every token request.
     authorization: Arc<StdMutex<Vec<Option<String>>>>,
+    /// The handle binding of the fixture's relay as first configured.
+    binding: Arc<std::sync::OnceLock<HandleBinding>>,
+}
+
+impl MockCapture {
+    fn binding(&self) -> HandleBinding {
+        self.binding.get().expect("set by the fixture").clone()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -471,6 +479,7 @@ async fn setup_signed_policy(
     let relay = Arc::new(Relay {
         key: key.clone(),
         upstream: key.clone(),
+        generation: None,
         client_auth: client_auth.clone(),
         scopes: vec!["openid".into(), "email".into(), "profile".into()],
         allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
@@ -627,18 +636,8 @@ async fn setup_with_upstream_auth(
     (app, sealer, task, capture)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn setup_with_sealer(
-    key: &str,
-    auth: ClientAuth,
-    strategy: Arc<dyn PathLayout>,
-    allowed_scopes: Option<Vec<String>>,
-    endpoint_configuration: EndpointConfiguration,
-    refresh_tokens: RefreshTokens,
-    store: Arc<dyn TransientStore>,
-    token_endpoint_auth_method: TokenEndpointAuthMethod,
-    sealer: Arc<dyn Sealer>,
-) -> (Router, tokio::task::JoinHandle<()>, MockCapture) {
+/// Serves the mock identity provider on a random local port.
+async fn start_mock_idp() -> (Url, MockCapture, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let base = Url::parse(&format!("http://{address}/")).unwrap();
@@ -653,7 +652,22 @@ async fn setup_with_sealer(
             capture: capture.clone(),
         });
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    (base, capture, task)
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn setup_with_sealer(
+    key: &str,
+    auth: ClientAuth,
+    strategy: Arc<dyn PathLayout>,
+    allowed_scopes: Option<Vec<String>>,
+    endpoint_configuration: EndpointConfiguration,
+    refresh_tokens: RefreshTokens,
+    store: Arc<dyn TransientStore>,
+    token_endpoint_auth_method: TokenEndpointAuthMethod,
+    sealer: Arc<dyn Sealer>,
+) -> (Router, tokio::task::JoinHandle<()>, MockCapture) {
+    let (base, capture, task) = start_mock_idp().await;
     let key = ResourceKey::new(key).unwrap();
     let authorization_endpoint =
         (!matches!(endpoint_configuration, EndpointConfiguration::Discovered))
@@ -676,6 +690,7 @@ async fn setup_with_sealer(
     let relay = Arc::new(Relay {
         key: key.clone(),
         upstream: key.clone(),
+        generation: None,
         client_auth: auth,
         scopes: vec!["openid".into(), "email".into()],
         allowed_scopes,
@@ -688,6 +703,10 @@ async fn setup_with_sealer(
                 .unwrap(),
         ],
     });
+    capture
+        .binding
+        .set(HandleBinding::new(&relay, &upstream))
+        .unwrap();
     let mut resources = ProviderSnapshot::default();
     resources.upstreams.insert(key.clone(), upstream);
     resources.relays.insert(key, relay);
@@ -738,6 +757,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             Arc::new(Relay {
                 key,
                 upstream: upstream_key.clone(),
+                generation: None,
                 client_auth: ClientAuth::UpstreamClient,
                 scopes: vec!["openid".into()],
                 allowed_scopes: None,
@@ -988,7 +1008,7 @@ const SEALED_VERIFIER: &str = "a-public-verifier-with-enough-entropy-123456789";
 
 #[tokio::test]
 async fn sealed_mode_replaces_the_refresh_token_on_the_code_grant() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
     let code = authorization_code(&app, "google", Some(&pkce_challenge(SEALED_VERIFIER))).await;
     let response = post_token(
         &app,
@@ -1011,14 +1031,10 @@ async fn sealed_mode_replaces_the_refresh_token_on_the_code_grant() {
     let handle = value["refresh_token"].as_str().unwrap();
     assert!(handle.starts_with("rrt1."));
     assert_eq!(
-        open_handle(
-            sealer.as_ref(),
-            &ResourceKey::new("google").unwrap(),
-            handle
-        )
-        .await
-        .unwrap()
-        .upstream_token,
+        open_handle(sealer.as_ref(), &capture.binding(), handle)
+            .await
+            .unwrap()
+            .upstream_token,
         "refresh"
     );
     // Member order is the upstream's, not alphabetical.
@@ -1032,7 +1048,7 @@ async fn sealed_mode_replaces_the_refresh_token_on_the_code_grant() {
 #[tokio::test]
 async fn sealed_refresh_round_trips_through_the_upstream() {
     let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
-    let key = ResourceKey::new("google").unwrap();
+    let key = capture.binding();
     let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
         .await
         .unwrap();
@@ -1080,15 +1096,10 @@ async fn sealed_refresh_round_trips_through_the_upstream() {
 
 #[tokio::test]
 async fn sealed_refresh_without_an_upstream_refresh_token_returns_none() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
-    let handle = seal_handle(
-        sealer.as_ref(),
-        &ResourceKey::new("google").unwrap(),
-        "refresh",
-        1,
-    )
-    .await
-    .unwrap();
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
+    let handle = seal_handle(sealer.as_ref(), &capture.binding(), "refresh", 1)
+        .await
+        .unwrap();
     let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(
@@ -1125,13 +1136,16 @@ async fn sealed_code_grant_without_an_upstream_refresh_token_is_unchanged() {
 #[tokio::test]
 async fn sealed_mode_rejects_raw_foreign_and_tampered_refresh_tokens() {
     let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
-    let key = ResourceKey::new("google").unwrap();
+    let key = capture.binding();
     let valid = seal_handle(sealer.as_ref(), &key, "refresh", 1)
         .await
         .unwrap();
     let foreign = seal_handle(
         sealer.as_ref(),
-        &ResourceKey::new("other-relay").unwrap(),
+        &HandleBinding::with_fingerprint(
+            ResourceKey::new("other-relay").unwrap(),
+            key.fingerprint(),
+        ),
         "refresh",
         1,
     )
@@ -1175,15 +1189,10 @@ async fn sealed_mode_applies_to_confidential_relays_and_checks_client_auth_first
         client_id: "application".into(),
         client_secret: SecretString::new("application-secret"),
     };
-    let (app, sealer, task, _) = setup_sealed(auth).await;
-    let handle = seal_handle(
-        sealer.as_ref(),
-        &ResourceKey::new("google").unwrap(),
-        "rotating",
-        1,
-    )
-    .await
-    .unwrap();
+    let (app, sealer, task, capture) = setup_sealed(auth).await;
+    let handle = seal_handle(sealer.as_ref(), &capture.binding(), "rotating", 1)
+        .await
+        .unwrap();
     let form = |secret: &str| {
         format!(
             "{}&client_id=application&client_secret={secret}",
@@ -1606,6 +1615,7 @@ async fn code_verifier_without_a_code_challenge_is_rejected_for_every_client_aut
                     content_type: Some("application/json".into()),
                     body: br#"{"access_token":"access","token_type":"Bearer"}"#.to_vec(),
                 },
+                handle_fingerprint: [0; 32],
             };
             sealer
                 .seal(&postcard::to_stdvec(&envelope).unwrap(), b"downgrade")
@@ -1679,6 +1689,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
             content_type: None,
             body: vec![],
         },
+        handle_fingerprint: [0; 32],
     };
     let code = sealer
         .seal(&postcard::to_stdvec(&expired).unwrap(), b"google")
@@ -2763,6 +2774,7 @@ async fn discovery_advertises_the_relay_scope_allow_list() {
 #[test]
 fn discovery_refresh_grant_follows_an_upstream_list_and_authorization_code_is_always_advertised() {
     let relay = Relay {
+        generation: None,
         key: ResourceKey::new("google").unwrap(),
         upstream: ResourceKey::new("google").unwrap(),
         client_auth: ClientAuth::UpstreamClient,
@@ -2799,6 +2811,7 @@ fn discovery_refresh_grant_follows_an_upstream_list_and_authorization_code_is_al
 #[test]
 fn discovery_drops_unknown_upstream_endpoints_but_keeps_other_unknown_members() {
     let relay = Relay {
+        generation: None,
         key: ResourceKey::new("google").unwrap(),
         upstream: ResourceKey::new("google").unwrap(),
         client_auth: ClientAuth::UpstreamClient,
@@ -3052,6 +3065,7 @@ async fn custom_layout_urls_are_appended_to_a_public_url_with_a_path() {
         id_token_policy: None,
         refresh_tokens: Default::default(),
         redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
+        generation: None,
     });
     let mut resources = ProviderSnapshot::default();
     resources.upstreams.insert(key.clone(), upstream);
@@ -4011,14 +4025,9 @@ async fn upstream_requests_ask_for_json() {
         &confidential_code_grant_form(&code, SEALED_VERIFIER),
     )
     .await;
-    let handle = seal_handle(
-        sealer.as_ref(),
-        &ResourceKey::new("google").unwrap(),
-        "refresh",
-        1,
-    )
-    .await
-    .unwrap();
+    let handle = seal_handle(sealer.as_ref(), &capture.binding(), "refresh", 1)
+        .await
+        .unwrap();
     post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     let accept = capture.accept.lock().unwrap().clone();
     assert_eq!(accept.len(), 2, "one code exchange and one refresh");
@@ -4103,7 +4112,7 @@ async fn client_secret_basic_authenticates_sealed_refresh() {
         TokenEndpointAuthMethod::ClientSecretBasic,
     )
     .await;
-    let key = ResourceKey::new("google").unwrap();
+    let key = capture.binding();
     let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
         .await
         .unwrap();
@@ -4132,7 +4141,7 @@ async fn client_secret_basic_authenticates_rotating_refresh() {
     let handle = Rotator::new(
         store,
         sealer,
-        ResourceKey::new("google").unwrap(),
+        capture.binding(),
         &rotating(ROTATING_GRACE_SECONDS),
     )
     .issue("rotating")
@@ -4684,15 +4693,10 @@ fn basic_credentials_parse_strictly() {
 
 #[tokio::test]
 async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
-    let handle = seal_handle(
-        sealer.as_ref(),
-        &ResourceKey::new("google").unwrap(),
-        "plain-json",
-        1,
-    )
-    .await
-    .unwrap();
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
+    let handle = seal_handle(sealer.as_ref(), &capture.binding(), "plain-json", 1)
+        .await
+        .unwrap();
     let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
@@ -4708,15 +4712,10 @@ async fn sealed_mode_substitutes_a_json_body_whatever_its_content_type() {
 
 #[tokio::test]
 async fn sealed_mode_fails_closed_on_a_form_encoded_success_body() {
-    let (app, sealer, task, _) = setup_sealed(ClientAuth::UpstreamClient).await;
-    let handle = seal_handle(
-        sealer.as_ref(),
-        &ResourceKey::new("google").unwrap(),
-        "form-encoded",
-        1,
-    )
-    .await
-    .unwrap();
+    let (app, sealer, task, capture) = setup_sealed(ClientAuth::UpstreamClient).await;
+    let handle = seal_handle(sealer.as_ref(), &capture.binding(), "form-encoded", 1)
+        .await
+        .unwrap();
     let response = post_token(&app, "google", &confidential_refresh_form(&handle)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = String::from_utf8(response_body(response).await).unwrap();
@@ -4797,7 +4796,7 @@ async fn handle_prefixed_tokens_are_never_forwarded_in_any_mode() {
 
 #[tokio::test]
 async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_failures() {
-    let (app, sealer, task, _) = setup_with_refresh_tokens(
+    let (app, sealer, task, capture) = setup_with_refresh_tokens(
         "google",
         ClientAuth::UpstreamClient,
         default_layout(KeyStrategy::SingleSegment),
@@ -4806,7 +4805,7 @@ async fn sealed_refresh_passes_upstream_errors_through_and_reports_transport_fai
         SEALED,
     )
     .await;
-    let key = ResourceKey::new("google").unwrap();
+    let key = capture.binding();
     let handle = async |token: &str| seal_handle(sealer.as_ref(), &key, token, 1).await.unwrap();
 
     let response = post_token(
@@ -4891,7 +4890,7 @@ impl RotatingFixture {
         Rotator::new(
             self.store.clone(),
             self.sealer.clone(),
-            ResourceKey::new("google").unwrap(),
+            self.capture.binding(),
             &rotating(ROTATING_GRACE_SECONDS),
         )
         .issue(upstream_token)
@@ -5076,7 +5075,7 @@ async fn rotating_mode_migrates_sealed_handles_and_rejects_raw_tokens() {
     let fixture = RotatingFixture::new(ROTATING_GRACE_SECONDS).await;
     let sealed = seal_handle(
         fixture.sealer.as_ref(),
-        &ResourceKey::new("google").unwrap(),
+        &fixture.capture.binding(),
         "rotating",
         unix_now(),
     )
@@ -5093,7 +5092,7 @@ async fn rotating_mode_migrates_sealed_handles_and_rejects_raw_tokens() {
     // A sealed handle older than the family lifetime is not migrated.
     let expired = seal_handle(
         fixture.sealer.as_ref(),
-        &ResourceKey::new("google").unwrap(),
+        &fixture.capture.binding(),
         "rotating",
         unix_now() - DEFAULT_MAX_LIFETIME_SECONDS,
     )
@@ -5147,6 +5146,7 @@ async fn rotating_relay_without_a_store_fails_with_a_server_error() {
         Arc::new(Relay {
             key: key.clone(),
             upstream: key,
+            generation: None,
             client_auth: ClientAuth::Public,
             scopes: vec!["openid".into()],
             allowed_scopes: None,
@@ -5320,6 +5320,7 @@ fn development_redirect_app_with(redirect: RedirectOptions, sealer: Arc<XChaChaS
         token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
     });
     let relay = Arc::new(Relay {
+        generation: None,
         key: key.clone(),
         upstream: key.clone(),
         client_auth: ClientAuth::UpstreamClient,
@@ -5836,7 +5837,7 @@ async fn a_seal_failure_at_the_callback_returns_a_bare_503_and_no_code() {
 #[tokio::test]
 async fn an_unavailable_sealer_fails_a_sealed_refresh_with_503_and_keeps_the_handle_valid() {
     let (app, sealer, _, task, capture) = setup_flaky(SEALED).await;
-    let key = ResourceKey::new("google").unwrap();
+    let key = capture.binding();
     let handle = seal_handle(sealer.as_ref(), &key, "rotating", 1)
         .await
         .unwrap();
@@ -5868,7 +5869,7 @@ async fn an_unavailable_sealer_fails_a_rotating_refresh_with_503_and_keeps_the_f
     let handle = Rotator::new(
         store.clone(),
         sealer.clone(),
-        ResourceKey::new("google").unwrap(),
+        capture.binding(),
         &rotating(ROTATING_GRACE_SECONDS),
     )
     .issue("rotating-upstream")
@@ -5886,4 +5887,368 @@ async fn an_unavailable_sealer_fails_a_rotating_refresh_with_503_and_keeps_the_f
     let response = post_token(&app, "google", &form).await;
     assert_eq!(response.status(), StatusCode::OK);
     task.abort();
+}
+
+/// A relay served from a [`Registry`], so a test can change its configuration between requests
+/// the way a provider reload does.
+struct ReconfigurableRelay {
+    app: Router,
+    registry: Arc<Registry>,
+    base: Url,
+    upstream: Upstream,
+    relay: Relay,
+    /// The relay as currently configured, which decides how the client authenticates.
+    current: StdMutex<Relay>,
+    capture: MockCapture,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReconfigurableRelay {
+    async fn new(refresh_tokens: RefreshTokens) -> Self {
+        let (base, capture, task) = start_mock_idp().await;
+        let upstream = Upstream {
+            key: ResourceKey::new("idp").unwrap(),
+            issuer_url: base.clone(),
+            authorization_endpoint: Some(base.join("authorize").unwrap()),
+            token_endpoint: Some(base.join("token").unwrap()),
+            jwks_uri: None,
+            client_id: "upstream-client".into(),
+            client_secret: SecretString::new("upstream-secret"),
+            token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost,
+        };
+        let relay = Relay {
+            key: ResourceKey::new("app").unwrap(),
+            upstream: upstream.key.clone(),
+            generation: Some("generation-1".into()),
+            // A `Public` relay must rotate; the other modes authenticate the relying party with
+            // credentials of the relay's own, which are independent of the upstream's.
+            client_auth: if refresh_tokens.mode == RefreshTokenMode::Rotating {
+                ClientAuth::Public
+            } else {
+                ClientAuth::ClientSecret {
+                    client_id: "application".into(),
+                    client_secret: SecretString::new("application-secret"),
+                }
+            },
+            scopes: vec!["openid".into()],
+            allowed_scopes: None,
+            required_id_token_claims: HashMap::new(),
+            id_token_policy: None,
+            refresh_tokens,
+            redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
+        };
+        let registry = Arc::new(Registry::default());
+        let app = router(
+            registry.clone(),
+            RelayConfig {
+                public_url: Url::parse("https://relay.example/").unwrap(),
+                sealer: Arc::new(XChaChaSealer::new(&[7_u8; 32], None).unwrap()),
+                store: Some(Arc::new(MemoryStore::default())),
+                http: reqwest::Client::new(),
+                client_assertion_http: Default::default(),
+                redirect: Default::default(),
+            },
+            default_layout(KeyStrategy::SingleSegment),
+        );
+        let fixture = Self {
+            app,
+            registry,
+            base,
+            current: StdMutex::new(relay.clone()),
+            upstream,
+            relay,
+            capture,
+            task,
+        };
+        fixture.configure(vec![fixture.upstream.clone()], fixture.relay.clone());
+        fixture
+    }
+
+    fn configure(&self, upstreams: Vec<Upstream>, relay: Relay) {
+        let mut snapshot = ProviderSnapshot::default();
+        for upstream in upstreams {
+            snapshot
+                .upstreams
+                .insert(upstream.key.clone(), Arc::new(upstream));
+        }
+        snapshot
+            .relays
+            .insert(relay.key.clone(), Arc::new(relay.clone()));
+        snapshot.validate().unwrap();
+        self.registry.replace(snapshot);
+        *self.current.lock().unwrap() = relay;
+    }
+
+    /// Applies `change` to the configuration the fixture started with.
+    fn change(&self, change: impl FnOnce(&mut Upstream, &mut Relay)) {
+        let mut upstream = self.upstream.clone();
+        let mut relay = self.relay.clone();
+        change(&mut upstream, &mut relay);
+        self.configure(vec![upstream], relay);
+    }
+
+    fn restore(&self) {
+        self.change(|_, _| {});
+    }
+
+    /// The credentials the relay currently expects from the relying party, if any.
+    fn client_credentials(&self) -> Option<(String, String)> {
+        match &self.current.lock().unwrap().client_auth {
+            ClientAuth::ClientSecret {
+                client_id,
+                client_secret,
+            } => Some((client_id.clone(), client_secret.expose().to_owned())),
+            _ => None,
+        }
+    }
+
+    /// The code a completed upstream sign-in hands the application.
+    async fn code(&self) -> String {
+        authorization_code(&self.app, "app", Some(&pkce_challenge(SEALED_VERIFIER))).await
+    }
+
+    /// Redeems `code` and returns the refresh-token handle of the response.
+    async fn redeem(&self, code: &str) -> String {
+        let mut pairs = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", "https://app.example/callback"),
+            ("code_verifier", SEALED_VERIFIER),
+        ];
+        let credentials = self.client_credentials();
+        if let Some((id, secret)) = &credentials {
+            pairs.push(("client_id", id));
+            pairs.push(("client_secret", secret));
+        }
+        let response = post_token(
+            &self.app,
+            "app",
+            &serde_urlencoded::to_string(pairs).unwrap(),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        let handle = body["refresh_token"].as_str().unwrap().to_owned();
+        assert!(handle.starts_with("rrt"), "{handle}");
+        handle
+    }
+
+    async fn sign_in(&self) -> String {
+        let code = self.code().await;
+        self.redeem(&code).await
+    }
+
+    async fn refresh(&self, handle: &str) -> (StatusCode, Value) {
+        let mut pairs = vec![("grant_type", "refresh_token"), ("refresh_token", handle)];
+        let credentials = self.client_credentials();
+        if let Some((id, secret)) = &credentials {
+            pairs.push(("client_id", id));
+            pairs.push(("client_secret", secret));
+        }
+        let response = post_token(
+            &self.app,
+            "app",
+            &serde_urlencoded::to_string(pairs).unwrap(),
+        )
+        .await;
+        let status = response.status();
+        let body = serde_json::from_slice(&response_body(response).await).unwrap();
+        (status, body)
+    }
+
+    /// Refreshes successfully and returns the handle to present next.
+    async fn refresh_ok(&self, handle: &str, edit: &str) -> String {
+        let (status, body) = self.refresh(handle).await;
+        assert!(status.is_success(), "{edit}: {status} {body}");
+        body["refresh_token"].as_str().unwrap_or(handle).to_owned()
+    }
+
+    /// Refreshes and expects `invalid_grant` without any upstream request.
+    async fn refresh_rejected(&self, handle: &str, edit: &str) {
+        let requests = self.upstream_requests();
+        let (status, body) = self.refresh(handle).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{edit}: {body}");
+        assert_eq!(body["error"], "invalid_grant", "{edit}");
+        assert_eq!(
+            self.upstream_requests(),
+            requests,
+            "{edit}: the upstream must not be asked"
+        );
+    }
+
+    fn upstream_requests(&self) -> usize {
+        self.capture.token.lock().unwrap().len()
+    }
+}
+
+type UpstreamEdit = (&'static str, fn(&mut Upstream, &mut Relay, &Url));
+
+/// Configuration changes that leave the relay's upstream identity and generation alone.
+fn unrelated_edits(rotating: bool) -> Vec<UpstreamEdit> {
+    let mut edits: Vec<UpstreamEdit> = vec![
+        ("redirect policy", |_, relay, _| {
+            relay.redirect_policy = vec![
+                RedirectMatcher::uri("https://app.example/callback").unwrap(),
+                RedirectMatcher::origin("https://other.example").unwrap(),
+            ]
+        }),
+        ("scopes", |_, relay, _| {
+            relay.scopes = vec!["openid".into(), "email".into()];
+            relay.allowed_scopes = Some(vec!["openid".into(), "email".into(), "profile".into()]);
+        }),
+        ("client authentication", |_, relay, _| {
+            relay.client_auth = ClientAuth::ClientSecret {
+                client_id: "application".into(),
+                client_secret: SecretString::new("rotated-application-secret"),
+            }
+        }),
+        ("ID-token policy", |_, relay, _| {
+            relay
+                .required_id_token_claims
+                .insert("hd".into(), "example.com".into());
+        }),
+        (
+            "upstream client secret and authentication method",
+            |upstream, _, _| {
+                upstream.client_secret = SecretString::new("rotated-secret");
+                upstream.token_endpoint_auth_method = TokenEndpointAuthMethod::ClientSecretBasic;
+            },
+        ),
+        (
+            "upstream authorization and JWKS endpoints",
+            |upstream, _, base| {
+                upstream.authorization_endpoint = Some(base.join("authorize?prompt=none").unwrap());
+                upstream.jwks_uri = Some(base.join("jwks").unwrap());
+            },
+        ),
+    ];
+    if rotating {
+        edits.push(("rotation settings", |_, relay, _| {
+            relay.refresh_tokens.grace_period_seconds = 5;
+            relay.refresh_tokens.max_lifetime_seconds = 3_600;
+        }));
+    }
+    edits
+}
+
+/// Changes of the upstream identity or of the relay generation.
+fn identity_changes() -> Vec<UpstreamEdit> {
+    vec![
+        ("issuer URL", |upstream, _, base| {
+            upstream.issuer_url = base.join("tenant-b/").unwrap()
+        }),
+        ("token endpoint override", |upstream, _, base| {
+            upstream.token_endpoint = Some(base.join("token?tenant=b").unwrap())
+        }),
+        ("upstream client_id", |upstream, _, _| {
+            upstream.client_id = "other-client".into()
+        }),
+        ("relay generation", |_, relay, _| {
+            relay.generation = Some("generation-2".into())
+        }),
+    ]
+}
+
+async fn assert_handles_follow_the_upstream_identity(refresh_tokens: RefreshTokens) {
+    let rotating = refresh_tokens.mode == RefreshTokenMode::Rotating;
+    let fixture = ReconfigurableRelay::new(refresh_tokens).await;
+
+    // Unrelated edits keep a handle valid.
+    let mut handle = fixture.sign_in().await;
+    for (edit, apply) in unrelated_edits(rotating) {
+        fixture.change(|upstream, relay| apply(upstream, relay, &fixture.base));
+        handle = fixture.refresh_ok(&handle, edit).await;
+    }
+    fixture.restore();
+    fixture.refresh_ok(&handle, "restored").await;
+
+    // Each identity change signs the handle's holder out without sending its upstream token
+    // anywhere.
+    for (edit, apply) in identity_changes() {
+        fixture.restore();
+        let handle = fixture.sign_in().await;
+        fixture.change(|upstream, relay| apply(upstream, relay, &fixture.base));
+        fixture.refresh_rejected(&handle, edit).await;
+        // A handle issued under the new identity works.
+        let fresh = fixture.sign_in().await;
+        fixture.refresh_ok(&fresh, edit).await;
+    }
+
+    // Pointing the relay at another Upstream resource.
+    fixture.restore();
+    let handle = fixture.sign_in().await;
+    let mut other = fixture.upstream.clone();
+    other.key = ResourceKey::new("idp-b").unwrap();
+    other.issuer_url = fixture.base.join("b/").unwrap();
+    other.client_id = "upstream-client-b".into();
+    let mut relay = fixture.relay.clone();
+    relay.upstream = other.key.clone();
+    fixture.configure(vec![fixture.upstream.clone(), other], relay);
+    fixture.refresh_rejected(&handle, "upstreamRef").await;
+
+    // An Upstream resource with the same issuer, token endpoint override, and client_id is the
+    // same OAuth client at the same provider, so switching to it keeps handles valid whatever
+    // else differs, including its name.
+    fixture.restore();
+    let handle = fixture.sign_in().await;
+    let mut twin = fixture.upstream.clone();
+    twin.key = ResourceKey::new("idp-twin").unwrap();
+    twin.client_secret = SecretString::new("twin-secret");
+    twin.token_endpoint_auth_method = TokenEndpointAuthMethod::ClientSecretBasic;
+    let mut relay = fixture.relay.clone();
+    relay.upstream = twin.key.clone();
+    fixture.configure(vec![fixture.upstream.clone(), twin], relay);
+    let requests = fixture.upstream_requests();
+    fixture
+        .refresh_ok(&handle, "upstreamRef to an identical upstream")
+        .await;
+    assert_eq!(fixture.upstream_requests(), requests + 1);
+
+    // A code obtained before the change yields a handle bound to the upstream that issued its
+    // refresh token, which the changed relay does not accept.
+    fixture.restore();
+    let code = fixture.code().await;
+    fixture.change(|upstream, _| upstream.client_id = "other-client".into());
+    let handle = fixture.redeem(&code).await;
+    fixture
+        .refresh_rejected(&handle, "code redeemed after the change")
+        .await;
+    fixture.task.abort();
+}
+
+#[tokio::test]
+async fn sealed_handles_are_bound_to_the_upstream_identity_and_relay_generation() {
+    assert_handles_follow_the_upstream_identity(SEALED).await;
+}
+
+#[tokio::test]
+async fn rotating_handles_are_bound_to_the_upstream_identity_and_relay_generation() {
+    assert_handles_follow_the_upstream_identity(rotating(ROTATING_GRACE_SECONDS)).await;
+}
+
+#[tokio::test]
+async fn migrating_a_sealed_handle_to_rotating_honours_the_binding() {
+    let fixture = ReconfigurableRelay::new(SEALED).await;
+    let kept = fixture.sign_in().await;
+    let stale = fixture.sign_in().await;
+    assert!(kept.starts_with("rrt1.") && stale.starts_with("rrt1."));
+
+    // The relay switches to rotating: a sealed handle becomes a rotating family.
+    fixture.change(|_, relay| relay.refresh_tokens = rotating(ROTATING_GRACE_SECONDS));
+    let migrated = fixture.refresh_ok(&kept, "migration").await;
+    assert!(migrated.starts_with("rrt2."));
+
+    // Switching and changing the upstream identity at once: the sealed handle does not migrate.
+    fixture.change(|upstream, relay| {
+        relay.refresh_tokens = rotating(ROTATING_GRACE_SECONDS);
+        upstream.client_id = "other-client".into();
+    });
+    fixture
+        .refresh_rejected(&stale, "migration after an upstream change")
+        .await;
+    // Neither does the family the earlier migration started.
+    fixture
+        .refresh_rejected(&migrated, "family after an upstream change")
+        .await;
+    fixture.task.abort();
 }

@@ -127,6 +127,18 @@ File, SSM, and Kubernetes providers can be enabled together, in that precedence 
 provider must supply a valid graph itself. On duplicate `(kind, name)` identities, the earlier
 provider wins. Lambda uses complete reads at invocation refresh boundaries.
 
+## Refresh tokens and recreated relays
+
+A `sealed` or `rotating` relay binds its refresh-token handles to the Relay resource's
+`metadata.uid`. Deleting a Relay and creating one with the same name gives it a new uid, so the
+new relay rejects its predecessor's handles with `invalid_grant` and their users sign in again.
+Updates to an existing Relay, including `kubectl apply` and `kubectl replace`, keep the uid and
+the handles. Deleting and recreating a Relay with kubectl (`kubectl replace --force` is a delete
+plus a create), a GitOps tool that recreates resources, or a namespace restored from a backup
+therefore signs its users out. See
+[Changing a relay's upstream](/oauthrelay/configuration/#changing-a-relays-upstream) for the
+upstream settings handles are bound to.
+
 ## Deployment and RBAC
 
 The repository's [deployment example](https://github.com/rise-deploy/oauthrelay/blob/develop/deploy/kubernetes.yaml)

@@ -839,6 +839,7 @@ mod tests {
         snapshot.relays.insert(
             key.clone(),
             Arc::new(Relay {
+                generation: None,
                 key: key.clone(),
                 upstream: key,
                 client_auth: ClientAuth::UpstreamClient,
@@ -887,6 +888,7 @@ mod tests {
         let relay = Arc::new(Relay {
             key: key.clone(),
             upstream: key.clone(),
+            generation: None,
             client_auth: ClientAuth::UpstreamClient,
             scopes: vec![],
             allowed_scopes: None,
