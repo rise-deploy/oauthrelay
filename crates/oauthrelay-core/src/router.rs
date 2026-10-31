@@ -5,8 +5,9 @@ use crate::{
         HandleError, SubstitutionError,
     },
     rotation::{IssueError, RefreshOutcome, Rotator, UpstreamFailure, UpstreamRefresher},
-    ClientAuth, ClientJwks, Endpoint, PathLayout, RefreshTokenMode, Relay, ResourceKey,
-    ResourceResolver, SealError, Sealer, TokenEndpointAuthMethod, TransientStore, Upstream,
+    ClientAuth, ClientJwks, Endpoint, PathLayout, RedirectOptions, RefreshTokenMode, Relay,
+    ResourceKey, ResourceResolver, SealError, Sealer, TokenEndpointAuthMethod, TransientStore,
+    Upstream,
 };
 use axum::{
     body::Body,
@@ -83,7 +84,9 @@ pub struct RelayConfig {
     pub store: Option<Arc<dyn TransientStore>>,
     pub http: reqwest::Client,
     pub client_assertion_http: ClientAssertionHttpClient,
-    pub allow_localhost_loopback: bool,
+    /// Development-time widenings of redirect and CORS matching; all off by default. A resolved
+    /// relay that needs a widening left off here fails [`Relay::validate_for`].
+    pub redirect: RedirectOptions,
 }
 
 #[derive(Clone)]
@@ -268,7 +271,7 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if let Err(error) = relay.validate() {
+    if let Err(error) = relay.validate_for(state.cfg.redirect) {
         tracing::error!(%key, %error, "resolved relay is invalid");
         if matches!(endpoint, Endpoint::Token) {
             return oauth_error(
@@ -288,11 +291,9 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
             };
             authorize(&state, &relay, &upstream, query).await
         }
-        (Endpoint::Token, Method::OPTIONS) => preflight(
-            &relay,
-            request.headers(),
-            state.cfg.allow_localhost_loopback,
-        ),
+        (Endpoint::Token, Method::OPTIONS) => {
+            preflight(&relay, request.headers(), state.cfg.redirect)
+        }
         (Endpoint::Token, Method::POST) => token(&state, &relay, &upstream, request).await,
         (Endpoint::Discovery, Method::GET) => discovery(&state, &relay, &upstream).await,
         (Endpoint::Jwks, Method::GET) => jwks(&state, &upstream).await,
@@ -472,7 +473,7 @@ async fn authorize(
     let Some(redirect_value) = query.redirect_uri else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if !relay.redirect_allowed(&redirect_value, state.cfg.allow_localhost_loopback) {
+    if !relay.redirect_allowed(&redirect_value, state.cfg.redirect) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if query
@@ -551,10 +552,14 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let relay = match state.resolver.resolve_relay(&relay_key).await {
-        Ok(Some(relay)) if relay.upstream == upstream.key && relay.validate().is_ok() => relay,
+        Ok(Some(relay))
+            if relay.upstream == upstream.key && relay.validate_for(state.cfg.redirect).is_ok() =>
+        {
+            relay
+        }
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if !relay.redirect_allowed(&flow.app_redirect_uri, state.cfg.allow_localhost_loopback) {
+    if !relay.redirect_allowed(&flow.app_redirect_uri, state.cfg.redirect) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let mut redirect = flow.app_redirect_uri.clone();
@@ -647,7 +652,7 @@ async fn token(
     upstream: &Upstream,
     request: Request<Body>,
 ) -> Response {
-    let origin = allowed_cors_origin(relay, request.headers(), state.cfg.allow_localhost_loopback);
+    let origin = allowed_cors_origin(relay, request.headers(), state.cfg.redirect);
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(bytes) => bytes,
@@ -2000,8 +2005,8 @@ fn stored_response(stored: StoredResponse) -> Response {
     response.body(Body::from(stored.body)).unwrap()
 }
 
-fn preflight(relay: &Relay, headers: &HeaderMap, allow_localhost_loopback: bool) -> Response {
-    let origin = allowed_cors_origin(relay, headers, allow_localhost_loopback);
+fn preflight(relay: &Relay, headers: &HeaderMap, options: RedirectOptions) -> Response {
+    let origin = allowed_cors_origin(relay, headers, options);
     if origin.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -2011,14 +2016,14 @@ fn preflight(relay: &Relay, headers: &HeaderMap, allow_localhost_loopback: bool)
 fn allowed_cors_origin(
     relay: &Relay,
     headers: &HeaderMap,
-    allow_localhost_loopback: bool,
+    options: RedirectOptions,
 ) -> Option<HeaderValue> {
     let value = headers.get(header::ORIGIN)?;
     let url = Url::parse(value.to_str().ok()?).ok()?;
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         return None;
     }
-    if relay.cors_origin_allowed(&url, allow_localhost_loopback) {
+    if relay.cors_origin_allowed(&url, options) {
         Some(value.clone())
     } else {
         None

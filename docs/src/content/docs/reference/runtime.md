@@ -31,11 +31,12 @@ for namespace selection, refresh settings, CRD installation, and deployment exam
 | `OAUTHRELAY_STORE_KUBERNETES_RESOURCE` | no | `transientrecords.oauthrelay.dev` | Resource holding the records of the `kubernetes` store: that one, or Dex's `authcodes.dex.coreos.com` (requires Dex 2.46.0 or later). |
 | `OAUTHRELAY_STORE_KUBERNETES_NAMESPACE` | no | provider, pod, or kubeconfig namespace | Namespace holding the records of the `kubernetes` store. Required, and never inferred, with `authcodes.dex.coreos.com`: Dex's namespace. |
 | `OAUTHRELAY_STORE_KUBERNETES_SWEEP` | no | `60s` | Interval at which the `kubernetes` store deletes expired records, or `off`. |
-| `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` | no | `false` | Treat `localhost` as an alias for configured IP-literal loopback redirect matchers. |
+| `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` | no | `false` | Let `loopback` and `loopbackOrigin` redirect matchers also match `localhost` and `*.localhost`. |
+| `OAUTHRELAY_ALLOW_HTTP_ORIGINS` | no | `false` | Development only: let `origin` redirect matchers name and match `http://` origins. Off, a relay with an `http://` origin stops startup, or, when a refresh introduces it, answers 500 on every relay endpoint while other relays keep serving. |
 | `OAUTHRELAY_LOG` | no | `info` | `tracing` filter. |
 
 Durations require an explicit unit such as `30s`, `5m`, or `1h` and must be greater than zero.
-The localhost compatibility value must be `true` or `false`.
+The localhost and HTTP-origin values must be `true` or `false`.
 Provider collision precedence is File, SSM, then Kubernetes.
 
 ## Build features

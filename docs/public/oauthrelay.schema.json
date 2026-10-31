@@ -413,6 +413,20 @@
         "value"
       ]
     },
+    "LoopbackOriginRedirectPolicy": {
+      "description": "Variable-port, variable-path loopback matcher.",
+      "type": "object",
+      "properties": {
+        "loopbackOrigin": {
+          "description": "`http://127.0.0.1` or `http://[::1]` without a port or path; every port, path, and query is allowed.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "loopbackOrigin"
+      ]
+    },
     "LoopbackRedirectPolicy": {
       "description": "Variable-port loopback matcher.",
       "type": "object",
@@ -479,11 +493,11 @@
       ]
     },
     "OriginRedirectPolicy": {
-      "description": "HTTPS origin matcher.",
+      "description": "Origin matcher.",
       "type": "object",
       "properties": {
         "origin": {
-          "description": "HTTPS scheme, host, and optional port; every path and query at the origin is allowed.",
+          "description": "HTTPS scheme, host, and optional port; every path and query at the origin is allowed.\nHTTP origins require the service's allow-HTTP-origins development option.",
           "type": "string"
         }
       },
@@ -751,12 +765,16 @@
           "$ref": "#/$defs/UriRedirectPolicy"
         },
         {
-          "description": "Match every path and query at one HTTPS origin.",
+          "description": "Match every path and query at one HTTPS origin (HTTP when the service allows HTTP origins).",
           "$ref": "#/$defs/OriginRedirectPolicy"
         },
         {
           "description": "Match one loopback path and query on any runtime port.",
           "$ref": "#/$defs/LoopbackRedirectPolicy"
+        },
+        {
+          "description": "Match every path and query on a loopback host on any runtime port.",
+          "$ref": "#/$defs/LoopbackOriginRedirectPolicy"
         }
       ]
     },

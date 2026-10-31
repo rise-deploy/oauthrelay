@@ -459,7 +459,7 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
             store: None,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
-            allow_localhost_loopback: false,
+            redirect: Default::default(),
         },
         Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),
     );
