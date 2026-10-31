@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, Ipv6Addr},
     str::FromStr,
     sync::Arc,
 };
@@ -205,7 +205,10 @@ pub enum RefreshTokenMode {
 
 /// Development-time widenings of redirect and CORS matching, set by the serving `RelayConfig`.
 ///
-/// Both default to off. A widening never applies unless its flag is on.
+/// Every flag defaults to off, and a widening never applies unless its flag is on. Construct it
+/// with `..Default::default()`, as in
+/// `RedirectOptions { allow_http_origins: true, ..Default::default() }`, so flags added later
+/// keep their off default without breaking the construction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RedirectOptions {
     /// Loopback matchers also match the hosts `localhost` and `*.localhost` (RFC 6761 §6.3).
@@ -246,9 +249,18 @@ impl RedirectMatcher {
     /// [`RedirectOptions::allow_http_origins`] is on, and [`Relay::validate_for`] rejects it
     /// otherwise.
     pub fn http_origin(value: &str) -> Result<Self, String> {
+        validate_raw_uri(value)?;
         let origin = Origin::parse(value)?;
         if origin.url().scheme() != "http" {
             return Err("must use http".into());
+        }
+        if !matches!(raw_path_and_query(value), Some("" | "/"))
+            || !canonical_authority(value, origin.url())
+        {
+            return Err(
+                "must be spelled canonically as http://host or http://host:port, without a path"
+                    .into(),
+            );
         }
         Ok(Self::Origin(origin))
     }
@@ -270,7 +282,9 @@ impl RedirectMatcher {
         }
         let origin = Origin::parse(value).map_err(|_| error())?;
         validate_loopback_origin(&origin).map_err(|_| error())?;
-        if !canonical_authority(value, origin.url()) {
+        if !canonical_authority(value, origin.url())
+            || raw_authority(value).is_none_or(|(_, port)| port.is_some())
+        {
             return Err(error());
         }
         Ok(Self::LoopbackOrigin(origin))
@@ -406,9 +420,10 @@ impl Relay {
         })
     }
 
-    /// Validates the relay for a server running with `options`: everything [`Relay::validate`]
-    /// checks, and additionally that no matcher depends on a widening `options` leaves off, so a
-    /// relay whose matcher could never match fails loudly instead of rejecting every redirect.
+    /// Runtime validation: everything [`Relay::validate`] checks, plus the checks that depend on
+    /// the serving [`RedirectOptions`]. A matcher that needs a widening `options` leaves off (an
+    /// `http://` origin without `allow_http_origins`) fails here, so the relay fails loudly instead
+    /// of silently rejecting those redirects. The router applies this to every resolved relay.
     pub fn validate_for(&self, options: RedirectOptions) -> Result<(), String> {
         self.validate()?;
         if !options.allow_http_origins {
@@ -431,8 +446,9 @@ impl Relay {
         Ok(())
     }
 
-    /// Validates the relay's structure. `http://` origins are structurally valid here; whether the
-    /// serving configuration permits them is checked by [`Relay::validate_for`].
+    /// Structural validation only: checks that do not depend on how the relay is served. It does
+    /// not consult [`RedirectOptions`], so an `http://` origin passes here; use
+    /// [`Relay::validate_for`] to check a relay against the serving options.
     pub fn validate(&self) -> Result<(), String> {
         if self
             .required_id_token_claims
@@ -612,21 +628,61 @@ fn origin_permitted(origin: &Origin, options: RedirectOptions) -> bool {
     }
 }
 
-/// Whether `raw` spells its scheme and authority exactly as `url` serializes them (ASCII case
-/// aside) and continues with a path, a query, or nothing. Lenient parser forms such as `http:/host`,
-/// `http:///host`, shortened or zero-padded IPv4 hosts, percent-encoded hosts, padded or explicit
-/// default ports, and empty user information never pass.
+/// The raw host and optional port between `://` and the first `/`, `?`, or `#`. A bracketed host
+/// keeps its brackets.
+fn raw_authority(raw: &str) -> Option<(&str, Option<&str>)> {
+    let rest = raw.split_once("://")?.1;
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let (host, tail) = authority.split_at(close + 1);
+        match tail {
+            "" => Some((host, None)),
+            tail => Some((host, Some(tail.strip_prefix(':')?))),
+        }
+    } else {
+        Some(match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        })
+    }
+}
+
+/// Whether `raw` spells its scheme, host, and port unambiguously as `url` parsed them, so lenient
+/// parser forms never pass: `http:host`, `http:/host`, `http:///host`, empty user information,
+/// shortened, octal, or hexadecimal IPv4 hosts, percent-encoded hosts, and zero-padded ports.
+/// Scheme and host compare without regard to ASCII case. A bracketed IPv6 literal may use any
+/// spelling of the parsed address, such as `[0:0:0:0:0:0:0:1]` for `[::1]`, and a port may be
+/// the scheme's default spelled out, such as `:80`.
 fn canonical_authority(raw: &str, url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
+    let Some((scheme, _)) = raw.split_once("://") else {
         return false;
     };
-    let prefix = match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
+    let Some((host, port)) = raw_authority(raw) else {
+        return false;
     };
-    raw.get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
-        && matches!(raw.as_bytes().get(prefix.len()), None | Some(b'/' | b'?'))
+    let host_matches = match url.host() {
+        Some(Host::Ipv6(address)) => {
+            host.strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .and_then(|literal| literal.parse::<Ipv6Addr>().ok())
+                == Some(address)
+        }
+        Some(_) => url
+            .host_str()
+            .is_some_and(|parsed| host.eq_ignore_ascii_case(parsed)),
+        None => false,
+    };
+    let port_matches = match port {
+        None => url.port().is_none(),
+        Some(port) => {
+            !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && (port == "0" || !port.starts_with('0'))
+                && port.parse::<u16>().ok() == url.port_or_known_default()
+        }
+    };
+    scheme.eq_ignore_ascii_case(url.scheme()) && host_matches && port_matches
 }
 
 fn valid_redirect_url(url: &Url) -> bool {
@@ -766,6 +822,23 @@ mod tests {
             ..relay.clone()
         };
         assert!(!normalized_path.redirect_allowed("http://127.0.0.1:49152/callback", OFF));
+        // Any spelling of the IPv6 loopback address and an explicit default port are unambiguous.
+        for spelled in [
+            "http://[0:0:0:0:0:0:0:1]:49152/oauth/callback",
+            "http://[::1]:80/oauth/callback",
+        ] {
+            assert!(relay.redirect_allowed(spelled, OFF), "{spelled}");
+        }
+        assert!(relay.redirect_allowed("http://127.0.0.1:80/oauth/callback?source=cli", OFF));
+        for ambiguous in [
+            "http://127.1:49152/oauth/callback?source=cli",
+            "http://0x7f.0.0.1:49152/oauth/callback?source=cli",
+            "http://127.0.0.1:080/oauth/callback?source=cli",
+            "http://[::1]:049152/oauth/callback",
+            "http:///127.0.0.1:49152/oauth/callback?source=cli",
+        ] {
+            assert!(!relay.redirect_allowed(ambiguous, LOCALHOST), "{ambiguous}");
+        }
         for bad in [
             "http://127.0.0.1:49152\\evil/oauth/callback?source=cli",
             "http://127.0.0.1:49152\\@evil.test/oauth/callback?source=cli",
@@ -853,12 +926,16 @@ mod tests {
             "http://127.0.0.1/",
             "http://[::1]",
             "http://[::1]/",
+            "http://[0:0:0:0:0:0:0:1]",
         ] {
             assert!(RedirectMatcher::loopback_origin(good).is_ok(), "{good}");
         }
         for bad in [
             "https://127.0.0.1",
             "http://127.0.0.1:8080",
+            "http://127.0.0.1:80",
+            "http://[::1]:80",
+            "http://127.1",
             "http://127.0.0.1/callback",
             "http://127.0.0.1/.",
             "http://127.0.0.1/a/..",
@@ -890,6 +967,14 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("must not contain duplicates"));
+        let duplicate = relay_with(vec![
+            RedirectMatcher::loopback_origin("http://[::1]").unwrap(),
+            RedirectMatcher::loopback_origin("http://[0:0:0:0:0:0:0:1]").unwrap(),
+        ]);
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .contains("must not contain duplicates"));
         let distinct = relay_with(vec![
             RedirectMatcher::loopback_origin("http://127.0.0.1").unwrap(),
             RedirectMatcher::loopback("http://127.0.0.1/").unwrap(),
@@ -914,7 +999,12 @@ mod tests {
             "http://127.0.0.1:1/?",
             "http://127.0.0.1?next=%2F",
             "HTTP://127.0.0.1:8080/cb",
+            "http://127.0.0.1:80/cb",
             "http://[::1]:49152/auth/callback?state=x",
+            "http://[0:0:0:0:0:0:0:1]:49152/cb",
+            "http://[0000:0000:0000:0000:0000:0000:0000:0001]:49152/cb",
+            "http://[::0:1]/cb",
+            "http://[::1]:80/cb",
         ] {
             assert!(relay.redirect_allowed(good, OFF), "{good}");
         }
@@ -945,8 +1035,16 @@ mod tests {
             "http://2130706433:49152/cb",
             "http://%31%32%37.0.0.1:49152/cb",
             "http://127.0.0.1:049152/cb",
-            "http://127.0.0.1:80/cb",
-            "http://[0:0:0:0:0:0:0:1]:49152/cb",
+            "http://127.0.0.1:080/cb",
+            "http://127.0.0.1:/cb",
+            "http://127.0.0.1:+80/cb",
+            "http://[::1]:049152/cb",
+            "http://[::1]:/cb",
+            "http://[::1]x/cb",
+            "http://[::2]:49152/cb",
+            "http://[::ffff:127.0.0.1]:49152/cb",
+            "http://0177.0.0.1:49152/cb",
+            "http://127.0.0.01:49152/cb",
             "http://127.0.0.1:49152/c b",
             "http://127.0.0.1:49152/cb\t",
             "http://127.0.0.1:49152/caf\u{e9}",
@@ -1062,6 +1160,26 @@ mod tests {
         assert!(RedirectMatcher::http_origin("http://dev.example#x").is_err());
         assert!(RedirectMatcher::http_origin("http://dev.example?x").is_err());
         assert!(RedirectMatcher::http_origin("ftp://dev.example").is_err());
+        assert!(RedirectMatcher::http_origin("http://dev.example:80").is_ok());
+        assert!(RedirectMatcher::http_origin("http://[::1]:3000").is_ok());
+        assert!(RedirectMatcher::http_origin("http://[0:0:0:0:0:0:0:1]:3000").is_ok());
+        for bad in [
+            "http:dev.example:3000",
+            "http:/dev.example:3000",
+            "http:///dev.example:3000",
+            "http://dev.example:080",
+            "http://dev.example:03000",
+            "http://dev.example:",
+            "http://@dev.example:3000",
+            "http://%64ev.example:3000",
+            "http://127.1:3000",
+            "http://dev.example:3000/.",
+            "http://dev.example:3000\\",
+            " http://dev.example:3000",
+            "http://dev.example:3000\t",
+        ] {
+            assert!(RedirectMatcher::http_origin(bad).is_err(), "{bad}");
+        }
 
         let relay = relay_with(vec![
             RedirectMatcher::http_origin("http://dev.example:3000").unwrap(),
@@ -1107,6 +1225,17 @@ mod tests {
         ] {
             assert!(!relay.redirect_allowed(bad, ALL), "{bad}");
         }
+        // An explicit default port is unambiguous, on either side.
+        let default_port = relay_with(vec![
+            RedirectMatcher::http_origin("http://dev.example").unwrap()
+        ]);
+        assert!(default_port.redirect_allowed("http://dev.example:80/cb", HTTP_ORIGINS));
+        assert!(default_port.redirect_allowed("http://dev.example/cb", HTTP_ORIGINS));
+        assert!(!default_port.redirect_allowed("http://dev.example:080/cb", HTTP_ORIGINS));
+        let explicit_port = relay_with(vec![
+            RedirectMatcher::http_origin("http://dev.example:80").unwrap()
+        ]);
+        assert!(explicit_port.redirect_allowed("http://dev.example/cb", HTTP_ORIGINS));
         // The https origin keeps matching with or without the flag.
         assert!(relay.redirect_allowed("https://secure.example/cb", OFF));
         assert!(relay.redirect_allowed("https://secure.example/cb", HTTP_ORIGINS));

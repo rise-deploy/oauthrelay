@@ -568,10 +568,12 @@ pub async fn compile_resources(
             .map(|(index, policy)| {
                 let matcher = match policy {
                     RedirectPolicyEntry::Uri(policy) => RedirectMatcher::uri(policy.uri),
-                    RedirectPolicyEntry::Origin(policy) => RedirectMatcher::origin(&policy.origin)
-                        .or_else(|error| {
-                            RedirectMatcher::http_origin(&policy.origin).map_err(|_| error)
-                        }),
+                    RedirectPolicyEntry::Origin(policy) => match Url::parse(&policy.origin) {
+                        Ok(url) if url.scheme() == "http" => {
+                            RedirectMatcher::http_origin(&policy.origin)
+                        }
+                        _ => RedirectMatcher::origin(&policy.origin),
+                    },
                     RedirectPolicyEntry::Loopback(policy) => {
                         RedirectMatcher::loopback(&policy.loopback)
                     }
@@ -1150,6 +1152,18 @@ mod tests {
             (
                 r#"{"origin":"ftp://dev.example"}"#,
                 "must be an http(s) origin",
+            ),
+            (
+                r#"{"origin":"http:dev.example:3000"}"#,
+                "must be spelled canonically",
+            ),
+            (
+                r#"{"origin":"http://dev.example:080"}"#,
+                "must be spelled canonically",
+            ),
+            (
+                r#"{"origin":"http://@dev.example:3000"}"#,
+                "must be spelled canonically",
             ),
         ] {
             let entry: RedirectPolicyEntry = serde_json::from_str(policy).unwrap();

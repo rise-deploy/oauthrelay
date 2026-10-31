@@ -13,8 +13,7 @@
 //!     store: None,
 //!     http: reqwest::Client::new(),
 //!     client_assertion_http: Default::default(),
-//!     allow_localhost_loopback: false,
-//!     allow_http_origins: false,
+//!     redirect: Default::default(),
 //! };
 //! let app = router(Arc::new(resources), config, KeyStrategy::TwoSegment);
 //! let _host = axum::Router::new().nest("/", app);

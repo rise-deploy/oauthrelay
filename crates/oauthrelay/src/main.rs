@@ -154,8 +154,7 @@ async fn main() -> anyhow::Result<()> {
             client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
                 reqwest::Client::builder(),
             )?,
-            allow_localhost_loopback: redirect_options.allow_localhost_loopback,
-            allow_http_origins: redirect_options.allow_http_origins,
+            redirect: redirect_options,
         },
         KeyStrategy::SingleSegment,
     );

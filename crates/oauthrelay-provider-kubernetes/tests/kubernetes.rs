@@ -427,8 +427,7 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
             store: None,
             http: reqwest::Client::new(),
             client_assertion_http: Default::default(),
-            allow_localhost_loopback: false,
-            allow_http_origins: false,
+            redirect: Default::default(),
         },
         KeyStrategy::SingleSegment,
     );

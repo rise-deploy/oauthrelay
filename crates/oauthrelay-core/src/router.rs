@@ -68,21 +68,9 @@ pub struct RelayConfig {
     pub store: Option<Arc<dyn TransientStore>>,
     pub http: reqwest::Client,
     pub client_assertion_http: ClientAssertionHttpClient,
-    /// Loopback redirect matchers also match the hosts `localhost` and `*.localhost`.
-    pub allow_localhost_loopback: bool,
-    /// `origin` redirect matchers may name and match `http://` origins. Off, a relay carrying an
-    /// http origin fails validation.
-    pub allow_http_origins: bool,
-}
-
-impl RelayConfig {
-    /// The redirect and CORS widenings this configuration enables.
-    pub fn redirect_options(&self) -> RedirectOptions {
-        RedirectOptions {
-            allow_localhost_loopback: self.allow_localhost_loopback,
-            allow_http_origins: self.allow_http_origins,
-        }
-    }
+    /// Development-time widenings of redirect and CORS matching; all off by default. A resolved
+    /// relay that needs a widening left off here fails [`Relay::validate_for`].
+    pub redirect: RedirectOptions,
 }
 
 #[derive(Clone)]
@@ -265,7 +253,7 @@ async fn dispatch(
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if let Err(error) = relay.validate_for(state.cfg.redirect_options()) {
+    if let Err(error) = relay.validate_for(state.cfg.redirect) {
         tracing::error!(%key, %error, "resolved relay is invalid");
         if matches!(endpoint, Endpoint::Token) {
             return oauth_error(
@@ -286,7 +274,7 @@ async fn dispatch(
             authorize(&state, &relay, &upstream, query).await
         }
         (Endpoint::Token, Method::OPTIONS) => {
-            preflight(&relay, request.headers(), state.cfg.redirect_options())
+            preflight(&relay, request.headers(), state.cfg.redirect)
         }
         (Endpoint::Token, Method::POST) => token(&state, &relay, &upstream, request).await,
         (Endpoint::Discovery, Method::GET) => discovery(&state, &relay, &upstream).await,
@@ -501,7 +489,7 @@ async fn authorize(
     let Some(redirect_value) = query.redirect_uri else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if !relay.redirect_allowed(&redirect_value, state.cfg.redirect_options()) {
+    if !relay.redirect_allowed(&redirect_value, state.cfg.redirect) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if query
@@ -580,14 +568,13 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
     };
     let relay = match state.resolver.resolve_relay(&relay_key).await {
         Ok(Some(relay))
-            if relay.upstream == upstream.key
-                && relay.validate_for(state.cfg.redirect_options()).is_ok() =>
+            if relay.upstream == upstream.key && relay.validate_for(state.cfg.redirect).is_ok() =>
         {
             relay
         }
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if !relay.redirect_allowed(&flow.app_redirect_uri, state.cfg.redirect_options()) {
+    if !relay.redirect_allowed(&flow.app_redirect_uri, state.cfg.redirect) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let mut redirect = flow.app_redirect_uri.clone();
@@ -679,7 +666,7 @@ async fn token(
     upstream: &Upstream,
     request: Request<Body>,
 ) -> Response {
-    let origin = allowed_cors_origin(relay, request.headers(), state.cfg.redirect_options());
+    let origin = allowed_cors_origin(relay, request.headers(), state.cfg.redirect);
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(bytes) => bytes,
