@@ -1,9 +1,11 @@
 use crate::{
     model::valid_scope_token,
-    refresh_handle::{has_handle_prefix, open_handle, seal_token_response, SubstitutionError},
+    refresh_handle::{
+        has_handle_prefix, open_handle, seal_token_response, HandleError, SubstitutionError,
+    },
     rotation::{IssueError, RefreshOutcome, Rotator, UpstreamFailure, UpstreamRefresher},
-    ClientAuth, ClientJwks, RefreshTokenMode, Relay, ResourceKey, ResourceResolver, Sealer,
-    TokenEndpointAuthMethod, TransientStore, Upstream,
+    ClientAuth, ClientJwks, RefreshTokenMode, Relay, ResourceKey, ResourceResolver, SealError,
+    Sealer, TokenEndpointAuthMethod, TransientStore, Upstream,
 };
 use axum::{
     body::Body,
@@ -534,7 +536,7 @@ async fn authorize(
         issued_at: unix_now(),
         nonce: random_array(),
     };
-    let sealed = match seal_postcard(state, &upstream.key, &flow) {
+    let sealed = match seal_postcard(state, &upstream.key, &flow).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
@@ -558,8 +560,9 @@ async fn authorize(
 }
 
 async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest) -> Response {
-    let flow = match unseal_postcard::<FlowEnvelope>(state, &upstream.key, &query.state) {
+    let flow = match unseal_postcard::<FlowEnvelope>(state, &upstream.key, &query.state).await {
         Ok(value) if fresh(value.issued_at, FLOW_TTL) => value,
+        Err(UnsealError::Unavailable) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
     let relay_key = match ResourceKey::new(&flow.relay_key) {
@@ -626,7 +629,7 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
             body,
         },
     };
-    let sealed = match seal_postcard(state, &relay.key, &envelope) {
+    let sealed = match seal_postcard(state, &relay.key, &envelope).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
@@ -717,10 +720,11 @@ async fn exchange_sealed_code(
             "code is required",
         );
     };
-    let envelope = match unseal_postcard::<CodeEnvelope>(state, &relay.key, code) {
+    let envelope = match unseal_postcard::<CodeEnvelope>(state, &relay.key, code).await {
         Ok(value) if value.relay_key == relay.key.as_str() && fresh(value.issued_at, CODE_TTL) => {
             value
         }
+        Err(UnsealError::Unavailable) => return sealer_unavailable(),
         _ => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -838,7 +842,9 @@ async fn exchange_sealed_code(
                 stored.status,
                 &stored.body,
                 unix_now(),
-            ) {
+            )
+            .await
+            {
                 Ok(Some(body)) => stored.body = body,
                 Ok(None) => {}
                 Err(error) => return substitution_failed(relay, error),
@@ -852,6 +858,7 @@ async fn exchange_sealed_code(
                 Ok(Some(body)) => stored.body = body,
                 Ok(None) => {}
                 Err(IssueError::Store) => return refresh_state_unavailable(),
+                Err(IssueError::SealerUnavailable) => return sealer_unavailable(),
                 Err(IssueError::UnrecognizedBody) => {
                     return substitution_failed(relay, SubstitutionError::UnrecognizedBody)
                 }
@@ -1072,6 +1079,7 @@ async fn refresh(
                 "upstream returned an unusable token response",
             ),
             RefreshOutcome::StoreFailed => refresh_state_unavailable(),
+            RefreshOutcome::SealerUnavailable => sealer_unavailable(),
         };
     }
     let sealed = relay.refresh_tokens.mode == RefreshTokenMode::Sealed;
@@ -1085,9 +1093,10 @@ async fn refresh(
         );
     }
     let upstream_token = if sealed {
-        match open_handle(state.cfg.sealer.as_ref(), &relay.key, presented) {
+        match open_handle(state.cfg.sealer.as_ref(), &relay.key, presented).await {
             Ok(opened) => Some(opened.upstream_token),
-            Err(()) => {
+            Err(HandleError::SealerUnavailable) => return sealer_unavailable(),
+            Err(HandleError::Invalid) => {
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
@@ -1112,7 +1121,9 @@ async fn refresh(
                 stored.status,
                 &stored.body,
                 unix_now(),
-            ) {
+            )
+            .await
+            {
                 Ok(Some(body)) => stored.body = body,
                 Ok(None) => {}
                 Err(error) => return substitution_failed(relay, error),
@@ -1947,6 +1958,7 @@ fn substitution_failed(relay: &Relay, error: SubstitutionError) -> Response {
             "server_error",
             "token response could not be sealed",
         ),
+        SubstitutionError::SealerUnavailable => sealer_unavailable(),
         SubstitutionError::UnrecognizedBody => {
             tracing::error!(
                 relay = %relay.key,
@@ -1959,6 +1971,16 @@ fn substitution_failed(relay: &Relay, error: SubstitutionError) -> Response {
             )
         }
     }
+}
+
+/// The sealer could not be reached, so a value cannot be sealed or opened right now. The value
+/// is not known to be bad, so this is a server error rather than `invalid_grant`.
+fn sealer_unavailable() -> Response {
+    oauth_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        "sealing is unavailable",
+    )
 }
 
 fn required_claims_error() -> Response {
@@ -1983,7 +2005,7 @@ fn found(location: &str) -> Response {
     }
 }
 
-fn seal_postcard<T: Serialize>(
+async fn seal_postcard<T: Serialize>(
     state: &AppState,
     key: &ResourceKey,
     value: &T,
@@ -1993,20 +2015,36 @@ fn seal_postcard<T: Serialize>(
         .cfg
         .sealer
         .seal(&bytes, key.as_str().as_bytes())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .await
+        .map_err(|error| match error {
+            SealError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            SealError::InvalidKey | SealError::InvalidEnvelope => StatusCode::INTERNAL_SERVER_ERROR,
+        })
 }
 
-fn unseal_postcard<T: for<'de> Deserialize<'de>>(
+/// Why a sealed value could not be opened.
+enum UnsealError {
+    /// Malformed, tampered with, or issued for another resource.
+    Invalid,
+    /// The sealer could not be reached.
+    Unavailable,
+}
+
+async fn unseal_postcard<T: for<'de> Deserialize<'de>>(
     state: &AppState,
     key: &ResourceKey,
     value: &str,
-) -> Result<T, ()> {
+) -> Result<T, UnsealError> {
     let bytes = state
         .cfg
         .sealer
         .unseal(value, key.as_str().as_bytes())
-        .map_err(|_| ())?;
-    postcard::from_bytes(&bytes).map_err(|_| ())
+        .await
+        .map_err(|error| match error {
+            SealError::Unavailable => UnsealError::Unavailable,
+            SealError::InvalidKey | SealError::InvalidEnvelope => UnsealError::Invalid,
+        })?;
+    postcard::from_bytes(&bytes).map_err(|_| UnsealError::Invalid)
 }
 
 fn relay_base_url(public_url: &Url, key: &ResourceKey) -> Url {
