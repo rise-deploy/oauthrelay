@@ -269,8 +269,18 @@ without an admission policy or without a successful upstream response log a `ski
 ## Refresh tokens
 
 By default a relay is transparent: the upstream refresh token reaches the relying party and comes
-back at the refresh grant. For a `Public` relay the relying party is typically a browser, so a
-refresh token that leaks from it can be refreshed through the relay indefinitely.
+back at the refresh grant. A refresh token that leaks from the relying party can then be refreshed
+through the relay for as long as the provider honours it.
+
+A `Public` relay must use `refreshTokens.mode: rotating`. Its relying party, typically a browser or
+native app, cannot keep a credential, and [RFC 9700 section
+4.14.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2) requires a public client's refresh
+tokens to be sender-constrained or rotated; the relay does not sender-constrain them. A `Public`
+relay with `passthrough` (the default) or `sealed` fails validation, naming the relay: at startup the
+configuration is rejected, and a provider refresh keeps its last good snapshot and logs the error.
+The Kubernetes `Relay` CRD also rejects it at admission (see
+[Kubernetes provider](/oauthrelay/reference/kubernetes-provider/)). `rotating` needs a transient
+store shared by every serving instance; see [Rotating refresh tokens](#rotating-refresh-tokens).
 
 In every mode, including `passthrough`, a refresh token that starts with `rrt` followed by digits
 and a dot (such as `rrt1.`) is a relay handle, never an upstream token, and is never forwarded to
@@ -288,6 +298,7 @@ handle is answered with `invalid_grant`.
 | Lifetime bound set by the relay | none | none | `maxLifetimeSeconds` |
 | Revoke every token at once | at the provider | replace the seal key | replace the seal key |
 | Needs a store | no | no | yes |
+| Allowed for `Public` relays | no | no | yes |
 
 `sealed` hides the upstream token but does not shorten the life of a leaked handle; use `rotating`
 when a stolen refresh token has to stop working. In both, the relay holds the upstream token only
@@ -295,7 +306,8 @@ encrypted with `OAUTHRELAY_SEAL_KEY`, so the store or a captured handle reveals 
 the key. Within `gracePeriodSeconds` of a rotation, anyone presenting the spent handle gets the
 same successor, so the grace window is the one span in which a thief goes undetected.
 
-Set `refreshTokens.mode: sealed` to keep upstream refresh tokens inside the relay:
+Set `refreshTokens.mode: sealed` to keep upstream refresh tokens inside the relay, here for a
+server-side relying party with its own client secret:
 
 ```yaml oauthrelay-config
 apiVersion: oauthrelay.dev/v1alpha1
@@ -314,16 +326,21 @@ spec:
 apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
-  name: spa
+  name: web
 spec:
   upstreamRef:
     name: google
   refreshTokens:
     mode: sealed
   clientAuthentication:
-    type: Public
+    type: ClientSecret
+    clientId: web-backend
+    clientSecret:
+      valueFrom:
+        env:
+          name: WEB_BACKEND_CLIENT_SECRET
   redirectPolicy:
-    - origin: https://app.example.com
+    - uri: https://app.example.com/oauth/callback
 ```
 
 In `sealed` mode every successful JSON token response, from the authorization-code grant and from
@@ -465,6 +482,12 @@ assertion alone and ignores the `Authorization` header.
 The token endpoint's CORS policy allows only the `Content-Type` request header, so browser relying
 parties cannot send `Authorization: Basic`; they are `Public` clients.
 
+The relay's metadata advertises the accepted methods in `token_endpoint_auth_methods_supported`:
+`client_secret_basic` and `client_secret_post` for `UpstreamClient` and `ClientSecret`, `none` for
+`Public`, and `private_key_jwt`, with the accepted assertion algorithms in
+`token_endpoint_auth_signing_alg_values_supported`, for `PrivateKeyJwt` (see
+[Transparent metadata](/oauthrelay/reference/http-endpoints/#transparent-metadata)).
+
 ### UpstreamClient
 
 The relying party presents the referenced upstream's client ID and secret. This is useful when a
@@ -479,9 +502,12 @@ clientAuthentication:
 
 Client authentication credentials are not accepted: a `client_secret`, a client assertion, or an
 `Authorization: Basic` header is answered with `401 invalid_client`. `client_id`, when present, is a
-public identifier rather than a credential. Every authorization-code flow must use S256 PKCE.
+public identifier rather than a credential. Every authorization-code flow must use S256 PKCE, and
+the relay must use [rotating refresh tokens](#rotating-refresh-tokens):
 
 ```yaml
+refreshTokens:
+  mode: rotating
 clientAuthentication:
   type: Public
 ```

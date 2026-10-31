@@ -91,7 +91,7 @@
           ]
         },
         {
-          "description": "Accept no client secret and require S256 PKCE for authorization-code flows.",
+          "description": "Accept no client secret and require S256 PKCE for authorization-code flows. Requires\nrefreshTokens.mode: rotating.",
           "type": "object",
           "properties": {
             "type": {
@@ -872,7 +872,7 @@
           "minItems": 1
         },
         "refreshTokens": {
-          "description": "How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.",
+          "description": "How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`; a\n`Public` relay must use `rotating`.",
           "$ref": "#/$defs/RefreshTokensSpec"
         },
         "requiredIdTokenClaims": {

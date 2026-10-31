@@ -39,6 +39,18 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const ID_TOKEN_CLOCK_SKEW: u64 = 60;
+/// Signature algorithms accepted for `private_key_jwt` client assertions.
+const CLIENT_ASSERTION_ALGORITHMS: [Algorithm; 9] = [
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::EdDSA,
+];
 
 /// HTTP transport for client assertion trust metadata and keys. Redirects are rejected.
 /// The builder permits custom TLS roots without weakening the redirect policy or request deadline.
@@ -730,6 +742,14 @@ async fn exchange_sealed_code(
                 "PKCE verification failed",
             );
         }
+    } else if form.code_verifier.is_some() {
+        // RFC 9700 section 4.8.2: a verifier for a code issued without a challenge is a PKCE
+        // downgrade attempt, whatever the client authentication.
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "code_verifier was sent but the authorization request had no code_challenge",
+        );
     } else if matches!(relay.client_auth, ClientAuth::Public) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -1494,18 +1514,7 @@ async fn verify_private_key_jwt(
     require_single_use: bool,
 ) -> Result<(), ()> {
     let header = decode_header(assertion).map_err(|_| ())?;
-    if !matches!(
-        header.alg,
-        Algorithm::RS256
-            | Algorithm::RS384
-            | Algorithm::RS512
-            | Algorithm::PS256
-            | Algorithm::PS384
-            | Algorithm::PS512
-            | Algorithm::ES256
-            | Algorithm::ES384
-            | Algorithm::EdDSA
-    ) {
+    if !CLIENT_ASSERTION_ALGORITHMS.contains(&header.alg) {
         return Err(());
     }
     let remote_url = match source {
@@ -1653,7 +1662,120 @@ async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Resp
     } else if let Some(object) = doc.as_object_mut() {
         object.remove("jwks_uri");
     }
+    if let Some(object) = doc.as_object_mut() {
+        describe_relay(object, relay);
+    }
     Json(doc).into_response()
+}
+
+/// Upstream metadata for features a client of the relay cannot use: the relay does not relay the
+/// grants, request forms, or sender constraints they belong to, or (`signed_metadata`) they would
+/// override the relay's own values. Upstream endpoints are handled by [`RELAY_CLIENT_ENDPOINTS`].
+const UPSTREAM_ONLY_METADATA: &[&str] = &[
+    "require_pushed_authorization_requests",
+    "backchannel_authentication_request_signing_alg_values_supported",
+    "backchannel_token_delivery_modes_supported",
+    "backchannel_user_code_parameter_supported",
+    "mtls_endpoint_aliases",
+    "tls_client_certificate_bound_access_tokens",
+    "dpop_signing_alg_values_supported",
+    "require_request_uri_registration",
+    "require_signed_request_object",
+    "request_object_signing_alg_values_supported",
+    "request_object_encryption_alg_values_supported",
+    "request_object_encryption_enc_values_supported",
+    "authorization_signing_alg_values_supported",
+    "authorization_encryption_alg_values_supported",
+    "authorization_encryption_enc_values_supported",
+    "check_session_iframe",
+    "frontchannel_logout_supported",
+    "frontchannel_logout_session_supported",
+    "backchannel_logout_supported",
+    "backchannel_logout_session_supported",
+    "http_logout_supported",
+    "signed_metadata",
+];
+
+/// The `*_endpoint` members a client of the relay can use: the relay's own two, and upstream
+/// endpoints that take what the relay passes through unchanged (the access token, the ID token as
+/// `id_token_hint`). Every other `*_endpoint`, such as registration, device authorization, PAR or
+/// CIBA, belongs to a flow the relay does not provide and is removed.
+const RELAY_CLIENT_ENDPOINTS: &[&str] = &[
+    "authorization_endpoint",
+    "token_endpoint",
+    "userinfo_endpoint",
+    "end_session_endpoint",
+    "revocation_endpoint",
+    "introspection_endpoint",
+];
+
+/// Upstream token revocation and introspection. They accept only upstream tokens, so they stay
+/// only in `passthrough` mode, where the client holds the upstream refresh token rather than a
+/// relay handle.
+const UPSTREAM_TOKEN_MANAGEMENT_METADATA: &[&str] = &[
+    "revocation_endpoint",
+    "revocation_endpoint_auth_methods_supported",
+    "revocation_endpoint_auth_signing_alg_values_supported",
+    "introspection_endpoint",
+    "introspection_endpoint_auth_methods_supported",
+    "introspection_endpoint_auth_signing_alg_values_supported",
+    "introspection_signing_alg_values_supported",
+    "introspection_encryption_alg_values_supported",
+    "introspection_encryption_enc_values_supported",
+];
+
+/// Replaces upstream metadata that would misdescribe the relay with what the relay's own
+/// authorization and token endpoints accept. Members describing the upstream identity and its ID
+/// tokens, which pass through unchanged, are kept, as are unrecognized members other than
+/// endpoints.
+fn describe_relay(doc: &mut serde_json::Map<String, Value>, relay: &Relay) {
+    doc.retain(|name, _| {
+        !UPSTREAM_ONLY_METADATA.contains(&name.as_str())
+            && (!name.ends_with("_endpoint") || RELAY_CLIENT_ENDPOINTS.contains(&name.as_str()))
+    });
+    if relay.refresh_tokens.mode != RefreshTokenMode::Passthrough {
+        for name in UPSTREAM_TOKEN_MANAGEMENT_METADATA {
+            doc.remove(*name);
+        }
+    }
+    doc.insert("response_types_supported".into(), json!(["code"]));
+    doc.insert("response_modes_supported".into(), json!(["query"]));
+    // The relay forwards the refresh grant, so it is advertised unless the upstream lists its
+    // grants without it. An absent list keeps it, although RFC 8414 would read absence as
+    // `authorization_code` and `implicit` only: providers such as Entra ID omit the member yet
+    // issue refresh tokens.
+    let refresh = doc
+        .get("grant_types_supported")
+        .and_then(Value::as_array)
+        .is_none_or(|upstream| upstream.iter().any(|value| value == "refresh_token"));
+    let grant_types = if refresh {
+        json!(["authorization_code", "refresh_token"])
+    } else {
+        json!(["authorization_code"])
+    };
+    doc.insert("grant_types_supported".into(), grant_types);
+    doc.insert("code_challenge_methods_supported".into(), json!(["S256"]));
+    doc.insert("request_parameter_supported".into(), Value::Bool(false));
+    doc.insert("request_uri_parameter_supported".into(), Value::Bool(false));
+    if let Some(allowed) = &relay.allowed_scopes {
+        doc.insert("scopes_supported".into(), json!(allowed));
+    }
+    let auth_methods = match &relay.client_auth {
+        ClientAuth::UpstreamClient | ClientAuth::ClientSecret { .. } => {
+            json!(["client_secret_basic", "client_secret_post"])
+        }
+        ClientAuth::Public => json!(["none"]),
+        ClientAuth::PrivateKeyJwt { .. } => json!(["private_key_jwt"]),
+    };
+    doc.insert("token_endpoint_auth_methods_supported".into(), auth_methods);
+    if matches!(relay.client_auth, ClientAuth::PrivateKeyJwt { .. }) {
+        doc.insert(
+            "token_endpoint_auth_signing_alg_values_supported".into(),
+            json!(CLIENT_ASSERTION_ALGORITHMS),
+        );
+    } else {
+        doc.remove("token_endpoint_auth_signing_alg_values_supported");
+    }
 }
 
 async fn jwks(state: &AppState, upstream: &Upstream) -> Response {

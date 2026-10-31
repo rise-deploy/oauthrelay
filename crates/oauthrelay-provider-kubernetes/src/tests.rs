@@ -16,7 +16,7 @@ fn upstream(secret: Value) -> Value {
 fn relay() -> Value {
     json!({"apiVersion":"oauthrelay.dev/v1alpha1", "kind":"Relay",
         "metadata":{"name":"app", "namespace":"team", "resourceVersion":"1"},
-        "spec":{"upstreamRef":{"name":"issuer"}, "clientAuthentication":{"type":"Public"},
+        "spec":{"upstreamRef":{"name":"issuer"}, "refreshTokens":{"mode":"rotating"}, "clientAuthentication":{"type":"Public"},
         "redirectPolicy":[{"uri":"https://app.example/cb"}]}})
 }
 fn secret(value: &str) -> Value {
@@ -87,6 +87,26 @@ fn crds_are_deterministic_namespaced_and_structural() {
             .to_string()
             .contains("x-kubernetes-preserve-unknown-fields"));
         if crd["spec"]["names"]["kind"] == "Relay" {
+            let rules = schema["properties"]["spec"]["x-kubernetes-validations"]
+                .as_array()
+                .unwrap();
+            assert_eq!(rules.len(), 1);
+            let rule = rules[0]["rule"].as_str().unwrap();
+            assert!(
+                rule.contains("self.clientAuthentication.type != 'Public'")
+                    && rule.contains("self.refreshTokens.mode == 'rotating'"),
+                "{rule}"
+            );
+            // The rule only reads fields the structural schema declares.
+            let spec = &schema["properties"]["spec"]["properties"];
+            assert_eq!(
+                spec["clientAuthentication"]["properties"]["type"]["type"],
+                "string"
+            );
+            assert_eq!(
+                spec["refreshTokens"]["properties"]["mode"]["type"],
+                "string"
+            );
             let policy = &schema["properties"]["spec"]["properties"]["idTokenPolicy"];
             assert_eq!(policy["properties"]["anyOf"]["type"], "array");
             assert_eq!(policy["properties"]["anyOf"]["minItems"], 1);

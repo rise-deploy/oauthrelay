@@ -168,7 +168,8 @@ pub struct RelayResourceSpec {
     /// Typed admission policy applied to the verified upstream ID token, in addition to requiredIdTokenClaims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token_policy: Option<IdTokenPolicy>,
-    /// How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`.
+    /// How upstream refresh tokens are handed to relying parties. Defaults to `passthrough`; a
+    /// `Public` relay must use `rotating`.
     #[serde(default, skip_serializing_if = "RefreshTokensSpec::is_default")]
     pub refresh_tokens: RefreshTokensSpec,
     /// Authentication required at the relay token endpoint.
@@ -297,7 +298,8 @@ pub struct LoopbackOriginRedirectPolicy {
 pub enum ClientAuthentication {
     /// Require the referenced upstream's OAuth client ID and secret.
     UpstreamClient,
-    /// Accept no client secret and require S256 PKCE for authorization-code flows.
+    /// Accept no client secret and require S256 PKCE for authorization-code flows. Requires
+    /// refreshTokens.mode: rotating.
     Public,
     /// Require a relay-specific client ID and shared secret.
     ClientSecret {
@@ -890,6 +892,35 @@ mod tests {
         ] {
             value["spec"]["refreshTokens"] = invalid;
             assert!(serde_json::from_value::<ResourceDocument>(value.clone()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn public_relays_without_rotation_are_rejected_naming_the_relay() {
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        for mode in [
+            RefreshTokenModeSpec::Passthrough,
+            RefreshTokenModeSpec::Sealed,
+        ] {
+            let mut resources = documents(SecretValue::Value(InlineSecret {
+                value: "secret".into(),
+            }));
+            let ResourceDocument::Relay(relay) = &mut resources[1] else {
+                unreachable!();
+            };
+            relay.spec.client_authentication = ClientAuthentication::Public;
+            relay.spec.refresh_tokens.mode = mode;
+            let error = format!(
+                "{:#}",
+                compile_resources(resources, &secrets).await.unwrap_err()
+            );
+            assert!(
+                error.starts_with("Relay/cognito: ")
+                    && error.contains("Public requires refreshTokens.mode: rotating"),
+                "{error}"
+            );
         }
     }
 
