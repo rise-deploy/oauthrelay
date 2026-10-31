@@ -104,6 +104,10 @@ An upstream that cannot be asked is not an upstream without a JWKS. A transport 
 5xx, makes relay discovery and `/jwks` answer 502, and the next request asks again. The issuer
 remains upstream-owned by the relay contract.
 
+The service does not follow HTTP redirects when it requests discovery documents, JWKS, or the
+token endpoint: such an answer is a 502 (a redirect from the token endpoint is never passed on to
+the client). Configure the final URL of an upstream that redirects.
+
 A relay with `requiredIdTokenClaims` or `idTokenPolicy` must verify the upstream ID token, which
 needs the JWKS. When the upstream has none, or cannot be asked for it, authorization-code redemption
 fails closed with HTTP 502 `server_error` and the code stays unconsumed; the relay never admits an
@@ -624,16 +628,22 @@ An unknown `kid` triggers a JWKS refresh; concurrent requests share one fetch. F
 and failed fetch retries have a thirty-second cooldown per URL. A failed refresh preserves
 previously fetched keys until their normal cache expiry.
 
-Rust embedders configure trust-fetch TLS roots through
-`ClientAssertionHttpClient::new(reqwest::ClientBuilder)` and supply the result as
-`RelayConfig.client_assertion_http`. Its constructor enforces the redirect policy and deadline.
-The `RelayConfig.http` client controls upstream traffic independently.
-Both clients are `reqwest` 0.13 types, so an embedder must use the same major version.
+Rust embedders build `RelayConfig` with `RelayConfig::new(public_url, sealer)` and the `with_*`
+methods (`with_store`, `with_http`, `with_client_assertion_http`, `with_outbound`,
+`with_redirect`). The struct is `#[non_exhaustive]`, so fields can be added without breaking them.
+
+Both HTTP clients take a `reqwest::ClientBuilder`: `UpstreamHttpClient::new(builder)` for
+`RelayConfig.http` (discovery, JWKS, and the token endpoint) and
+`ClientAssertionHttpClient::new(builder)` for `RelayConfig.client_assertion_http` (trust-fetch TLS
+roots). Their constructors replace the builder's redirect policy with one that follows none;
+`ClientAssertionHttpClient` also enforces a ten second deadline. Both are `reqwest` 0.13 types, so an
+embedder must use the same major version.
+
 `oauthrelay_core::default_client_builder()` returns a builder that trusts the bundled Mozilla root
 certificates (`webpki-roots`) instead of the host's store, so it also works in container images
-without a system CA bundle. The standalone service and `ClientAssertionHttpClient::default()` use
-it. A `reqwest::Client::new()` uses the platform verifier, which relies on the host's store. The
-default builder does not follow redirects; see
+without a system CA bundle. The standalone service and the `Default` of both clients use it. A
+`reqwest::Client::new()` uses the platform verifier, which relies on the host's store. To restrict
+the URLs the relay requests, see
 [outbound requests](/oauthrelay/reference/http-endpoints/#embedding-outbound-requests).
 
 ```yaml

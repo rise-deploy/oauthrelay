@@ -1,3 +1,6 @@
+// The tests play the browser and the upstreams, which are not subject to the outbound policy.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use crate::{
     refresh_handle::{open_handle, seal_handle, HandleBinding},
@@ -267,6 +270,18 @@ struct SignedFixtureState {
     discovery_hits: Arc<AtomicUsize>,
     /// The path of every request the fixture received.
     requests: Arc<StdMutex<Vec<String>>>,
+    /// The endpoints (`discovery`, `jwks`, `token`) that answer with a redirect to `/userinfo`.
+    redirecting: Arc<StdMutex<Vec<&'static str>>>,
+}
+
+impl SignedFixtureState {
+    fn redirects(&self, endpoint: &str) -> bool {
+        self.redirecting.lock().unwrap().contains(&endpoint)
+    }
+}
+
+fn redirect_to_userinfo() -> Response {
+    (StatusCode::FOUND, [(header::LOCATION, "/userinfo")]).into_response()
 }
 
 async fn record_request(
@@ -297,6 +312,8 @@ enum SignedDiscovery {
     Array,
     /// A valid document whose `jwks_uri` names the fixture under another host name.
     ForeignJwks,
+    /// A valid document whose `jwks_uri` is the discovery document itself.
+    SelfJwks,
 }
 
 /// What the signed fixture's upstream configures explicitly.
@@ -312,6 +329,9 @@ enum SignedJwks {
 
 async fn signed_discovery(State(state): State<SignedFixtureState>) -> Response {
     state.discovery_hits.fetch_add(1, Ordering::SeqCst);
+    if state.redirects("discovery") {
+        return redirect_to_userinfo();
+    }
     let mode = *state.discovery.lock().unwrap();
     match mode {
         SignedDiscovery::NotFound => return StatusCode::NOT_FOUND.into_response(),
@@ -323,7 +343,10 @@ async fn signed_discovery(State(state): State<SignedFixtureState>) -> Response {
         }
         SignedDiscovery::NotJson => return "<html>not discovery</html>".into_response(),
         SignedDiscovery::Array => return Json(json!(["not", "an", "object"])).into_response(),
-        SignedDiscovery::Full | SignedDiscovery::WithoutJwks | SignedDiscovery::ForeignJwks => {}
+        SignedDiscovery::Full
+        | SignedDiscovery::WithoutJwks
+        | SignedDiscovery::ForeignJwks
+        | SignedDiscovery::SelfJwks => {}
     }
     let mut doc = json!({
         "issuer": state.issuer,
@@ -337,6 +360,9 @@ async fn signed_discovery(State(state): State<SignedFixtureState>) -> Response {
     });
     if matches!(mode, SignedDiscovery::WithoutJwks) {
         doc.as_object_mut().unwrap().remove("jwks_uri");
+    }
+    if matches!(mode, SignedDiscovery::SelfJwks) {
+        doc["jwks_uri"] = json!(state.base.join(".well-known/openid-configuration").unwrap());
     }
     if matches!(mode, SignedDiscovery::ForeignJwks) {
         let mut foreign = state.base.join("jwks").unwrap();
@@ -374,6 +400,9 @@ async fn signed_authorize(State(state): State<SignedFixtureState>, uri: Uri) -> 
 }
 
 async fn signed_token(State(state): State<SignedFixtureState>, body: String) -> Response {
+    if state.redirects("token") {
+        return redirect_to_userinfo();
+    }
     let form: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
         .into_owned()
         .collect();
@@ -436,6 +465,9 @@ async fn signed_token(State(state): State<SignedFixtureState>, body: String) -> 
 }
 
 async fn signed_jwks(State(state): State<SignedFixtureState>) -> Response {
+    if state.redirects("jwks") {
+        return redirect_to_userinfo();
+    }
     if state
         .jwks_failures_remaining
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -516,6 +548,25 @@ async fn setup_signed_with_outbound(
     id_token_policy: Option<crate::IdTokenPolicy>,
     jwks_source: SignedJwks,
     outbound: Option<Arc<dyn OutboundPolicy>>,
+) -> SignedProfile {
+    setup_signed_with_http(
+        profile,
+        required_id_token_claims,
+        id_token_policy,
+        jwks_source,
+        outbound,
+        UpstreamHttpClient::default(),
+    )
+    .await
+}
+
+async fn setup_signed_with_http(
+    profile: RelayProfile,
+    required_id_token_claims: HashMap<String, String>,
+    id_token_policy: Option<crate::IdTokenPolicy>,
+    jwks_source: SignedJwks,
+    outbound: Option<Arc<dyn OutboundPolicy>>,
+    http: UpstreamHttpClient,
 ) -> (
     Router,
     SignedFixtureState,
@@ -553,6 +604,7 @@ async fn setup_signed_with_outbound(
         discovery: Arc::new(StdMutex::new(SignedDiscovery::Full)),
         discovery_hits: Arc::new(AtomicUsize::new(0)),
         requests: Arc::default(),
+        redirecting: Arc::default(),
     };
     let idp = Router::new()
         .route("/.well-known/openid-configuration", get(signed_discovery))
@@ -610,7 +662,7 @@ async fn setup_signed_with_outbound(
             public_url: Url::parse("https://relay.example/").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
             store: Some(Arc::new(MemoryStore::default())),
-            http: reqwest::Client::new(),
+            http,
             client_assertion_http: Default::default(),
             outbound,
             redirect: Default::default(),
@@ -844,7 +896,7 @@ async fn setup_with_sealer(
             public_url: Url::parse("https://relay.example/").unwrap(),
             sealer,
             store: Some(store),
-            http: reqwest::Client::new(),
+            http: Default::default(),
             client_assertion_http: Default::default(),
             outbound: None,
             redirect: Default::default(),
@@ -905,7 +957,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             public_url: Url::parse("https://relay.example/custom/base").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
             store: None,
-            http: reqwest::Client::new(),
+            http: Default::default(),
             client_assertion_http: Default::default(),
             outbound: None,
             redirect: Default::default(),
@@ -3129,6 +3181,8 @@ async fn a_remembered_absence_does_not_hide_a_document_the_required_path_fetched
 #[derive(Default)]
 struct RecordingPolicy {
     calls: StdMutex<Vec<(Url, OutboundPurpose)>>,
+    /// The relay and upstream of every check.
+    scopes: StdMutex<Vec<(Option<String>, Option<String>)>>,
     denied: StdMutex<Vec<OutboundPurpose>>,
     only_host: StdMutex<Option<String>>,
 }
@@ -3146,6 +3200,10 @@ impl RecordingPolicy {
         self.calls.lock().unwrap().clone()
     }
 
+    fn scopes(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.scopes.lock().unwrap().clone()
+    }
+
     fn purposes(&self) -> Vec<OutboundPurpose> {
         self.calls()
             .into_iter()
@@ -3158,10 +3216,14 @@ impl RecordingPolicy {
 impl OutboundPolicy for RecordingPolicy {
     async fn check(
         &self,
-        url: &Url,
-        purpose: OutboundPurpose,
+        request: &crate::OutboundRequest<'_>,
     ) -> Result<(), crate::OutboundDenied> {
+        let (url, purpose) = (request.url, request.purpose);
         self.calls.lock().unwrap().push((url.clone(), purpose));
+        self.scopes.lock().unwrap().push((
+            request.relay.map(ToString::to_string),
+            request.upstream.map(ToString::to_string),
+        ));
         let wrong_host = self
             .only_host
             .lock()
@@ -3246,6 +3308,11 @@ async fn an_allowing_policy_sees_every_request_before_it_is_sent() {
             OutboundPurpose::Refresh,
         ]
     );
+    // Every check says which relay and upstream the request is for.
+    assert!(policy
+        .scopes()
+        .iter()
+        .all(|scope| scope == &(Some("profile".to_owned()), Some("profile".to_owned()))));
     // Each request that reached the upstream was checked first, for the right URL and purpose.
     let checked: Vec<_> = policy
         .calls()
@@ -3442,11 +3509,14 @@ async fn client_assertion_fetches_are_checked_and_a_denial_rejects_the_assertion
         Arc::get_mut(&mut state.cfg).unwrap().outbound = Some(policy.clone());
         state
     };
+    let relay_key = ResourceKey::new("relay").unwrap();
     let verify = |state: AppState, source: Option<ClientJwks>| {
         let (issuer, assertion) = (issuer.clone(), assertion.clone());
+        let relay_key = relay_key.clone();
         async move {
             verify_private_key_jwt(
                 &state,
+                Some(&relay_key),
                 "relay",
                 &issuer,
                 "worker",
@@ -3474,6 +3544,11 @@ async fn client_assertion_fetches_are_checked_and_a_denial_rejects_the_assertion
         ]
     );
     assert_eq!(*seen.lock().unwrap(), ["metadata", "keys"]);
+    // The requests are made for the relay's client, not for an upstream.
+    assert!(policy
+        .scopes()
+        .iter()
+        .all(|scope| scope == &(Some("relay".to_owned()), None)));
 
     // A configured JWKS URL needs no metadata.
     seen.lock().unwrap().clear();
@@ -3530,6 +3605,132 @@ async fn the_default_client_builder_does_not_follow_redirects() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::FOUND);
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_cached_document_is_never_served_for_another_purpose() {
+    let (app, fixture, task, _, policy) =
+        setup_with_policy(HashMap::new(), SignedJwks::Unconfigured).await;
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::SelfJwks;
+    // The document names itself as the JWKS: the same URL is cached under discovery, then asked
+    // for as keys, and the policy is asked both times.
+    assert!(relay_discovery(&app, "profile").await["jwks_uri"].is_string());
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        policy.purposes(),
+        [OutboundPurpose::Discovery, OutboundPurpose::Jwks]
+    );
+    assert_eq!(policy.calls()[0].0, policy.calls()[1].0);
+    task.abort();
+
+    let (app, fixture, task, _, policy) =
+        setup_with_policy(HashMap::new(), SignedJwks::Unconfigured).await;
+    *fixture.discovery.lock().unwrap() = SignedDiscovery::SelfJwks;
+    assert!(relay_discovery(&app, "profile").await["jwks_uri"].is_string());
+    policy.deny(&[OutboundPurpose::Jwks]);
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::BAD_GATEWAY
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_upstream_redirect_is_a_502_and_is_never_followed() {
+    // Whatever redirect policy the builder asked for, the client follows none.
+    let following = || {
+        UpstreamHttpClient::new(
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)),
+        )
+        .unwrap()
+    };
+    let followed =
+        |fixture: &SignedFixtureState| relay_requests(fixture).contains(&"/userinfo".to_owned());
+
+    // Discovery, on the optional and the required path.
+    let (app, fixture, task, redirect_uri, _) = setup_signed_with_http(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Unconfigured,
+        None,
+        following(),
+    )
+    .await;
+    fixture.redirecting.lock().unwrap().push("discovery");
+    for path in [
+        "/relay/profile/.well-known/openid-configuration",
+        "/relay/profile/jwks",
+    ] {
+        assert_eq!(
+            get_status(&app, path).await,
+            StatusCode::BAD_GATEWAY,
+            "{path}"
+        );
+    }
+    assert!(!followed(&fixture));
+    task.abort();
+    let (app, fixture, task, redirect_uri_2, _) = setup_signed_with_http(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Discovered,
+        None,
+        following(),
+    )
+    .await;
+    fixture.redirecting.lock().unwrap().push("discovery");
+    let authorize = format!(
+        "/relay/profile/authorize?redirect_uri={}&state=s&scope=openid",
+        url::form_urlencoded::byte_serialize(redirect_uri_2.as_bytes()).collect::<String>()
+    );
+    assert_eq!(get_status(&app, &authorize).await, StatusCode::BAD_GATEWAY);
+    assert!(!followed(&fixture));
+    task.abort();
+    drop(redirect_uri);
+
+    // The JWKS, for the endpoint and for the ID-token check, with the policy approving the URL.
+    let policy = Arc::new(RecordingPolicy::default());
+    let (app, fixture, task, redirect_uri, _) = setup_signed_with_http(
+        RelayProfile::Cognito,
+        required_email_claim(),
+        None,
+        SignedJwks::Configured,
+        Some(policy.clone()),
+        following(),
+    )
+    .await;
+    fixture.redirecting.lock().unwrap().push("jwks");
+    assert_eq!(
+        get_status(&app, "/relay/profile/jwks").await,
+        StatusCode::BAD_GATEWAY
+    );
+    let response = redeem_signed_code(&app, &redirect_uri).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(!followed(&fixture));
+    task.abort();
+
+    // The token endpoint: neither the exchange nor a refresh passes a bare 3xx on.
+    let (app, fixture, task, redirect_uri, _) = setup_signed_with_http(
+        RelayProfile::Cognito,
+        HashMap::new(),
+        None,
+        SignedJwks::Configured,
+        None,
+        following(),
+    )
+    .await;
+    fixture.redirecting.lock().unwrap().push("token");
+    let (callback, _) = signed_authorization_callback(&app, &redirect_uri).await;
+    assert_eq!(callback.status(), StatusCode::BAD_GATEWAY);
+    let refresh = post_token(&app, "profile", fixture_refresh_form()).await;
+    assert_eq!(refresh.status(), StatusCode::BAD_GATEWAY);
+    assert!(!followed(&fixture));
+    assert!(refresh.headers().get(header::LOCATION).is_none());
     task.abort();
 }
 
@@ -4004,7 +4205,7 @@ async fn custom_layout_urls_are_appended_to_a_public_url_with_a_path() {
             public_url: Url::parse("https://relay.example/base").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
             store: None,
-            http: reqwest::Client::new(),
+            http: Default::default(),
             client_assertion_http: Default::default(),
             outbound: None,
             redirect: Default::default(),
@@ -4519,7 +4720,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
             public_url: "https://relay.example/".parse().unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
             store,
-            http: reqwest::Client::new(),
+            http: Default::default(),
             client_assertion_http: Default::default(),
             outbound: None,
             redirect: Default::default(),
@@ -4552,6 +4753,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
         assert!(
             verify_private_key_jwt(
                 &state,
+                None,
                 "relay",
                 "client",
                 "client",
@@ -4567,6 +4769,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     let assertion = sign(&claims);
     assert!(verify_private_key_jwt(
         &no_store,
+        None,
         "relay",
         "client",
         "client",
@@ -4579,6 +4782,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     let (first, second) = tokio::join!(
         verify_private_key_jwt(
             &state,
+            None,
             "relay",
             "client",
             "client",
@@ -4588,6 +4792,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
         ),
         verify_private_key_jwt(
             &other_instance,
+            None,
             "relay",
             "client",
             "client",
@@ -4601,6 +4806,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     fresh["jti"] = json!("request-2");
     assert!(verify_private_key_jwt(
         &state,
+        None,
         "relay",
         "client",
         "client",
@@ -4618,6 +4824,7 @@ async fn single_use_assertions_enforce_lifetime_and_atomic_replay_protection() {
     for _ in 0..2 {
         assert!(verify_private_key_jwt(
             &no_store,
+            None,
             "relay",
             "client",
             "client",
@@ -4637,7 +4844,7 @@ fn assertion_test_state() -> AppState {
             public_url: "https://relay.example/".parse().unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8; 32], None).unwrap()),
             store: None,
-            http: reqwest::Client::new(),
+            http: Default::default(),
             // Even a caller-supplied redirect policy cannot enable redirects for trust data.
             client_assertion_http: ClientAssertionHttpClient::new(
                 reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)),
@@ -4719,6 +4926,7 @@ async fn client_assertion_discovery_and_jwks_reject_redirects() {
     ] {
         assert!(verify_private_key_jwt(
             &state,
+            None,
             "relay",
             &issuer,
             "worker",
@@ -4736,6 +4944,7 @@ async fn client_assertion_discovery_and_jwks_reject_redirects() {
         &state.assertion_cache.metadata,
         &state.cfg.client_assertion_http.0,
         None,
+        Scope::default(),
         &redirect_discovery,
         DISCOVERY_TTL,
         OutboundPurpose::ClientAssertionMetadata,
@@ -4752,19 +4961,28 @@ async fn client_assertion_discovery_and_jwks_reject_redirects() {
         .metadata
         .lock()
         .await
-        .contains_key(redirect_discovery.as_str()));
+        .contains_key(&cache_key(
+            OutboundPurpose::ClientAssertionMetadata,
+            &redirect_discovery
+        )));
     let keys_url = Url::parse(&format!("{issuer}/keys")).unwrap();
-    cached_json(&state, &keys_url, JWKS_TTL, OutboundPurpose::Jwks)
-        .await
-        .unwrap();
-    assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    // The keys sit in the upstream cache, under the URL the assertion's keys come from.
+    state.cache.lock().await.insert(
+        cache_key(OutboundPurpose::Jwks, &keys_url),
+        CachedJson {
+            fetched: std::time::Instant::now(),
+            value: json!({"keys":[{"kty":"RSA",
+                "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+                "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}]}),
+        },
+    );
     assert!(
-        verify_private_key_jwt(&state, "relay", &issuer, "worker", None, &assertion, false)
+        verify_private_key_jwt(&state, None, "relay", &issuer, "worker", None, &assertion, false)
             .await
             .is_err(),
         "upstream cache entries cannot supply assertion trust keys"
     );
-    assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(target_hits.load(Ordering::SeqCst), 0);
     task.abort();
 }
 
@@ -4825,6 +5043,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         let initial_hits = hits.load(Ordering::SeqCst);
         assert!(verify_private_key_jwt(
             &state,
+            None,
             "relay",
             &issuer,
             "worker",
@@ -4839,6 +5058,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         let (a, b, c) = tokio::join!(
             verify_private_key_jwt(
                 &state,
+                None,
                 "relay",
                 &issuer,
                 "worker",
@@ -4848,6 +5068,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
             ),
             verify_private_key_jwt(
                 &state,
+                None,
                 "relay",
                 &issuer,
                 "worker",
@@ -4857,6 +5078,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
             ),
             verify_private_key_jwt(
                 &state,
+                None,
                 "relay",
                 &issuer,
                 "worker",
@@ -4874,6 +5096,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         for kid in ["unknown-1", "unknown-2", "unknown-3"] {
             assert!(verify_private_key_jwt(
                 &state,
+                None,
                 "relay",
                 &issuer,
                 "worker",
@@ -4894,6 +5117,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         failing.store(true, Ordering::SeqCst);
         assert!(verify_private_key_jwt(
             &state,
+            None,
             "relay",
             &issuer,
             "worker",
@@ -4905,6 +5129,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         .is_err());
         assert!(verify_private_key_jwt(
             &state,
+            None,
             "relay",
             &issuer,
             "worker",
@@ -4917,6 +5142,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         assert!(
             verify_private_key_jwt(
                 &state,
+                None,
                 "relay",
                 &issuer,
                 "worker",
@@ -4938,6 +5164,7 @@ async fn client_assertion_rotation_refreshes_once_and_throttles_unknown_keys() {
         entry.lock().await.retry_after = None;
         assert!(verify_private_key_jwt(
             &state,
+            None,
             "relay",
             &issuer,
             "worker",
@@ -6099,7 +6326,7 @@ async fn rotating_relay_without_a_store_fails_with_a_server_error() {
             public_url: Url::parse("https://relay.example/").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[7_u8; 32], None).unwrap()),
             store: None,
-            http: reqwest::Client::new(),
+            http: Default::default(),
             client_assertion_http: Default::default(),
             outbound: None,
             redirect: Default::default(),
@@ -6281,7 +6508,7 @@ fn development_redirect_app_with(redirect: RedirectOptions, sealer: Arc<XChaChaS
             public_url: Url::parse("https://relay.example/").unwrap(),
             sealer,
             store: None,
-            http: reqwest::Client::new(),
+            http: Default::default(),
             client_assertion_http: Default::default(),
             outbound: None,
             redirect,
@@ -6883,7 +7110,7 @@ impl ReconfigurableRelay {
                 public_url: Url::parse("https://relay.example/").unwrap(),
                 sealer: Arc::new(XChaChaSealer::new(&[7_u8; 32], None).unwrap()),
                 store: Some(Arc::new(MemoryStore::default())),
-                http: reqwest::Client::new(),
+                http: Default::default(),
                 client_assertion_http: Default::default(),
                 outbound: None,
                 redirect: Default::default(),

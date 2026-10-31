@@ -57,7 +57,15 @@ standalone service does.
 ```rust
 #[async_trait]
 pub trait OutboundPolicy: Send + Sync + 'static {
-    async fn check(&self, url: &Url, purpose: OutboundPurpose) -> Result<(), OutboundDenied>;
+    async fn check(&self, request: &OutboundRequest<'_>) -> Result<(), OutboundDenied>;
+}
+
+#[non_exhaustive]
+pub struct OutboundRequest<'a> {
+    pub url: &'a Url,
+    pub purpose: OutboundPurpose,
+    pub relay: Option<&'a ResourceKey>,     // the relay the request is made for, if any
+    pub upstream: Option<&'a ResourceKey>,  // the upstream it is made for, if any
 }
 
 #[non_exhaustive]
@@ -67,19 +75,38 @@ pub enum OutboundPurpose {
 ```
 
 `check` runs before every request sent with `RelayConfig.http` or
-`RelayConfig.client_assertion_http`, with the URL as the relay holds it, and not again for answers
-served from the metadata and key caches. A denied request is never sent and is unavailable, not
-absent: relay discovery and `/jwks` answer 502 and remember nothing, a code redemption that needs
-the JWKS answers 502 `server_error` and leaves the code unconsumed, token and refresh requests
-answer 502, and a client assertion is rejected as `invalid_client`. Denials are logged at `warn`
-(target `oauthrelay::outbound`) with the purpose and host, never the path or query.
+`RelayConfig.client_assertion_http`. Every request goes through one function that checks the URL
+and then sends that request, so the URL that was approved is the URL that is requested. The
+clients are `UpstreamHttpClient` and `ClientAssertionHttpClient`, which never follow redirects, and
+the relay rejects any redirect or any response that answers from another URL: a redirect from a
+discovery, JWKS, token, or refresh endpoint is a 502.
 
-The policy sees only the initial URL, so the clients must not follow redirects, or must enforce
-the policy on every hop. `oauthrelay_core::default_client_builder()` does not follow redirects;
-build `RelayConfig.http` with `redirect::Policy::none()` when using another builder.
-`ClientAssertionHttpClient` never follows them. Resolve host names and reject private, loopback,
-and link-local addresses inside the policy, or in the client's connector, if the network behind
-the relay must stay out of reach.
+A denied request is never sent and is unavailable, not absent: relay discovery and `/jwks` answer
+502 and remember nothing, a code redemption that needs the JWKS answers 502 `server_error` and
+leaves the code unconsumed, token and refresh requests answer 502, and a client assertion is
+rejected as `invalid_client`. The relay does not remember denials, so each request that needs a
+denied URL asks the policy again. Denials are logged at `warn` (target `oauthrelay::outbound`)
+with the purpose and host, never the path or query; keep paths, queries, and secrets out of the
+message of `OutboundDenied::new`, which is logged too.
+
+Metadata and keys are cached per purpose and URL, and the policy is not asked when a cached
+answer is served. A policy that becomes stricter takes effect for cached entries when they expire:
+60 minutes for discovery documents and 10 for JWKS. Cached entries are shared by the relays of an
+upstream, so `relay` is the relay that happened to cause the fetch.
+
+### What the policy can enforce
+
+The policy sees a URL, not a connection. Use it for scheme, host, and port allow-lists. Check IP
+literals in the policy itself (`Url::host()` is `Host::Ipv4` or `Host::Ipv6`): a custom DNS
+resolver is never consulted for them. Do not resolve host names inside the policy. The client
+resolves the name again when it connects, so a name can answer differently the second time (DNS
+rebinding), and the policy's answer says nothing about the address that is used.
+
+Enforce address ranges for host names where the connection is made, with a `reqwest::dns::Resolve`
+that drops loopback, link-local, metadata, and private addresses, installed with
+`ClientBuilder::dns_resolver` on both clients. An `HTTP_PROXY` or `HTTPS_PROXY` makes the proxy
+resolve names, which bypasses that resolver; call `ClientBuilder::no_proxy` on both builders, or
+accept that limit knowingly.
 
 ## Authorization endpoint
 

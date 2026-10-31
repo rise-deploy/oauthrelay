@@ -9,15 +9,10 @@
 //! use oauthrelay_core::{router, DefaultLayout, KeyStrategy, RelayConfig, ProviderSnapshot, XChaChaSealer};
 //! use std::sync::Arc;
 //! let resources = ProviderSnapshot::default(); // Populate from the host database.
-//! let config = RelayConfig {
-//!     public_url: "https://rise.example.com/oidc".parse().unwrap(),
-//!     sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
-//!     store: None,
-//!     http: oauthrelay_core::default_client_builder().build().unwrap(),
-//!     client_assertion_http: Default::default(),
-//!     outbound: None,
-//!     redirect: Default::default(),
-//! };
+//! let config = RelayConfig::new(
+//!     "https://rise.example.com/oidc".parse().unwrap(),
+//!     Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
+//! );
 //! let layout = Arc::new(DefaultLayout::new(KeyStrategy::TwoSegment));
 //! let app = router(Arc::new(resources), config, layout);
 //! let _host = axum::Router::new().merge(app);
@@ -43,7 +38,7 @@ pub use id_token_policy::*;
 pub use jwks::*;
 pub use layout::*;
 pub use model::*;
-pub use outbound::{OutboundDenied, OutboundPolicy, OutboundPurpose};
+pub use outbound::{OutboundDenied, OutboundPolicy, OutboundPurpose, OutboundRequest};
 pub use resolver::*;
 pub use router::*;
 pub use seal::*;

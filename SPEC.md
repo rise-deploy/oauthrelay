@@ -135,7 +135,7 @@ unvalidated redirect URI is never reflected into a response.
   enabled.
 - An `http://` origin matcher matches only when the HTTP-origins development option is enabled;
   otherwise the relay fails validation. Embedders set both options through
-  `RelayConfig.redirect` (`RedirectOptions`, built with `..Default::default()`); the router checks
+  `RelayConfig.redirect` (`RedirectOptions`, built with `..Default::default()`, or `RelayConfig::with_redirect`); the router checks
   each resolved relay with `Relay::validate_for`, while `Relay::validate` checks structure only.
 - Client-secret comparisons are constant-time.
 - A relying party authenticates to a password-style relay (`UpstreamClient`, `ClientSecret`) by
@@ -257,14 +257,21 @@ unvalidated redirect URI is never reflected into a response.
   (`rrt1.` in `sealed`; `rrt1.` and `rrt2.` in `rotating`) is opened as described above; any other
   handle is `invalid_grant`. A handle is not an upstream token, so forwarding one only leaks it.
 - Discovery and JWKS responses are cached for bounded TTLs.
-- Outbound requests: every request sent with `RelayConfig.http` or `client_assertion_http` (discovery,
-  JWKS, code exchange, refresh, client-assertion metadata and keys) is first offered to
-  `RelayConfig.outbound` (`OutboundPolicy::check(url, OutboundPurpose)`); `None` allows all. A
-  denial sends nothing and is "unavailable", never "absent": it sets no absence marker and is not
-  cached, discovery and `/jwks` answer 502, redemption answers 502 `server_error` and leaves the
-  code unconsumed, token and refresh answer 502, and a client assertion is `invalid_client`. The
-  policy sees only the initial URL; the clients must not follow redirects, which
-  `default_client_builder()` guarantees. Cached metadata and keys are not re-checked.
+- Outbound requests: every request sent with `RelayConfig.http` (`UpstreamHttpClient`) or
+  `client_assertion_http` (discovery, JWKS, code exchange, refresh, client-assertion metadata and
+  keys) goes through one function that first offers it to `RelayConfig.outbound`
+  (`OutboundPolicy::check(&OutboundRequest { url, purpose, relay, upstream })`; `None` allows all)
+  and then sends that same request. A clippy `disallowed_methods` rule keeps other sends out of
+  `oauthrelay-core`. The clients never follow redirects, and a redirect or a response from another
+  URL is rejected, so a 3xx from a discovery, JWKS, token, or refresh endpoint is a 502 and is
+  never passed to the client. A denial sends nothing and is "unavailable", never "absent": it sets
+  no absence marker and is not cached, discovery and `/jwks` answer 502, redemption answers 502
+  `server_error` and leaves the code unconsumed, token and refresh answer 502, and a client
+  assertion is `invalid_client`. Denials are not remembered. Cached metadata and keys (keyed by
+  purpose and URL) are not re-checked, so a stricter policy applies to them after the cache TTL.
+  The policy sees URLs: it allow-lists scheme, host and port and checks IP-literal hosts itself;
+  address ranges for host names belong in a `reqwest::dns::Resolve` on both clients (proxies bypass
+  it), never in a DNS lookup inside the policy.
 - Endpoint resolution: `authorization_endpoint` and `token_endpoint` are required, from configuration
   or else from the upstream discovery document (502 when it cannot be fetched). `jwks_uri` is
   optional: configured, else taken from the discovery document, else absent. The upstream

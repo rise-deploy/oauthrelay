@@ -146,17 +146,15 @@ async fn main() -> anyhow::Result<()> {
 
     let relay_router = router(
         registry.clone(),
-        RelayConfig {
-            public_url,
-            sealer,
-            store: Some(store),
-            http: oauthrelay_core::default_client_builder().build()?,
-            client_assertion_http: oauthrelay_core::ClientAssertionHttpClient::new(
+        RelayConfig::new(public_url, sealer)
+            .with_store(store)
+            .with_http(oauthrelay_core::UpstreamHttpClient::new(
                 oauthrelay_core::default_client_builder(),
-            )?,
-            outbound: None,
-            redirect: redirect_options,
-        },
+            )?)
+            .with_client_assertion_http(oauthrelay_core::ClientAssertionHttpClient::new(
+                oauthrelay_core::default_client_builder(),
+            )?)
+            .with_redirect(redirect_options),
         Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),
     );
     let ready = Arc::new(AtomicBool::new(true));
@@ -808,7 +806,8 @@ mod tests {
 
     #[test]
     fn both_service_http_clients_build() {
-        oauthrelay_core::default_client_builder().build().unwrap();
+        oauthrelay_core::UpstreamHttpClient::new(oauthrelay_core::default_client_builder())
+            .unwrap();
         oauthrelay_core::ClientAssertionHttpClient::new(oauthrelay_core::default_client_builder())
             .unwrap();
     }

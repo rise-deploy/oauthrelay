@@ -453,15 +453,10 @@ async fn service_account_token_authenticates_through_a_relay_cr() {
     let audience = "api://oauthrelay";
     let app = router(
         Arc::new(resources),
-        RelayConfig {
-            public_url: "https://relay.example/".parse().unwrap(),
-            sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
-            store: None,
-            http: reqwest::Client::new(),
-            client_assertion_http: Default::default(),
-            outbound: None,
-            redirect: Default::default(),
-        },
+        RelayConfig::new(
+            "https://relay.example/".parse().unwrap(),
+            Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
+        ),
         Arc::new(DefaultLayout::new(KeyStrategy::SingleSegment)),
     );
     for (name, token_audience, expected) in [
