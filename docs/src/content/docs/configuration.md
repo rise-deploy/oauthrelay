@@ -299,7 +299,8 @@ spec:
 In `sealed` mode every successful JSON token response, from the authorization-code grant and from
 the refresh grant, has its `refresh_token` replaced by an opaque handle that starts with `rrt1.`.
 The handle contains the upstream token encrypted with `OAUTHRELAY_SEAL_KEY`, bound to the relay
-name, so only this relay can open it. At the refresh grant the relay opens the handle and sends
+name and to its [upstream identity](#changing-a-relays-upstream), so only this relay, still
+pointing at the same provider client, can open it. At the refresh grant the relay opens the handle and sends
 the upstream token to the provider. Status, content type, member order, and every other member of
 the response are preserved. Non-2xx responses, and successful responses that carry no
 `refresh_token`, are returned unchanged. When a refresh response omits `refresh_token`, the
@@ -359,7 +360,7 @@ spec:
 
 In `rotating` mode the code grant returns a handle that starts with `rrt2.`: 32 random bytes that
 mean nothing outside the relay. The upstream token lives, encrypted with `OAUTHRELAY_SEAL_KEY` and
-bound to the relay, in the [transient store](/oauthrelay/reference/transient-store/). Every
+bound to the relay and its [upstream identity](#changing-a-relays-upstream), in the [transient store](/oauthrelay/reference/transient-store/). Every
 refresh grant presents a handle, refreshes upstream, and returns a **new** handle in the same
 `refresh_token` member; the presented handle is spent. If the upstream does not rotate its own
 token, the relay wraps the same upstream token in the new handle, so the response always carries a
@@ -393,7 +394,9 @@ refresh token and the client must always store the latest one.
   another family, until the provider stops honouring its upstream token (a known limitation). A
   sealed handle older than `maxLifetimeSeconds` is rejected with `invalid_grant`. Changed from
   `rotating` back to `sealed`, or to `passthrough`, every `rrt2.` handle is rejected with
-  `invalid_grant` and users sign in again. Raw upstream tokens are rejected in both modes.
+  `invalid_grant` and users sign in again. Raw upstream tokens are rejected in both modes. A
+  sealed handle migrates only while the relay's upstream identity is the one it was issued for
+  (see [Changing a relay's upstream](#changing-a-relays-upstream)).
 - **A store is required.** A `rotating` relay needs a transient store shared by every serving
   instance: use `OAUTHRELAY_STORE=dynamodb` (or `kubernetes`, for moderate refresh volumes inside a
   cluster) for more than one replica, and `dynamodb` for any Lambda deployment. With
@@ -403,6 +406,35 @@ refresh token and the client must always store the latest one.
 - If the store is unreachable, refresh grants fail closed with HTTP 503 `server_error`.
 
 Rotation settings are rejected on a relay that is not `rotating`.
+
+### Changing a relay's upstream
+
+`sealed` and `rotating` handles are bound to the upstream identity that issued the refresh token
+inside them: the upstream's `issuerUrl`, its `endpoints.token` override (when set), and its
+`oauthClient.clientId`. Changing any of them, or pointing `upstreamRef` at an Upstream that
+differs in any of them, **signs out every user of the relay**: each handle issued before is
+rejected with `invalid_grant` at its next refresh, and its upstream token is never sent to the
+newly configured provider. Users sign in again and get handles for the new upstream. This also
+applies to an authorization code issued before the change and redeemed after it: its tokens
+belong to the old upstream, so its handle is rejected at the first refresh.
+
+The identity uses configured values only. Endpoints the relay discovers from the issuer's
+discovery document are not part of it, so a provider that moves its token endpoint does not sign
+anyone out. Every other edit keeps handles valid: redirect policy, scopes, client authentication,
+ID-token admission policy, rotation settings, the upstream's client secret, its token endpoint
+authentication method, and its authorization and JWKS endpoints. Changing the refresh-token mode
+follows the [switching rules](#rotating-refresh-tokens) above. Restoring the previous upstream
+identity before the handles expire makes them usable again.
+
+An issuer URL that is a bare origin is compared with and without its trailing slash alike
+(`https://issuer.example` and `https://issuer.example/` are the same identity); any other
+spelling change, including a token endpoint override that only spells the discovered endpoint, is
+a new identity.
+
+A relay deleted and recreated under the same name keeps accepting its predecessor's handles when
+its configuration is the same, unless its provider supplies a generation. The
+[Kubernetes provider](/oauthrelay/reference/kubernetes-provider/#refresh-tokens-and-recreated-relays)
+does; the file and SSM providers do not.
 
 ## Client authentication
 
