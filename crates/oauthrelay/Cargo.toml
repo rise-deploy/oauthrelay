@@ -41,6 +41,7 @@ oauthrelay-provider-file = { path = "../oauthrelay-provider-file" }
 oauthrelay-provider-ssm = { path = "../oauthrelay-provider-ssm", default-features = false, optional = true }
 oauthrelay-store-dynamodb = { path = "../oauthrelay-store-dynamodb", default-features = false, optional = true }
 reqwest.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
