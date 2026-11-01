@@ -24,6 +24,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
+rustls.workspace = true
 serde_urlencoded.workspace = true
 serde_yaml.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

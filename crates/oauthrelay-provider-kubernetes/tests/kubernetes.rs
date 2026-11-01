@@ -14,8 +14,19 @@ use oauthrelay_core::{ConfigProvider, ProviderSnapshot};
 use oauthrelay_provider_kubernetes::{KubernetesProvider, Relay, Upstream};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Once},
+    time::Duration,
+};
 use tokio::sync::watch;
+
+fn install_rustls_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 async fn snapshot(
     rx: &mut watch::Receiver<ProviderSnapshot>,
@@ -49,6 +60,7 @@ fn relay(name: &str, auth: Value) -> Value {
 #[tokio::test]
 #[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
 async fn api_validation_namespace_isolation_and_watch_updates() {
+    install_rustls_provider();
     let path = std::env::var("OAUTHRELAY_KUBERNETES_TEST_KUBECONFIG")
         .expect("explicit disposable test kubeconfig required");
     let kubeconfig = kube::config::Kubeconfig::read_from(path).unwrap();
@@ -353,6 +365,7 @@ async fn api_validation_namespace_isolation_and_watch_updates() {
 #[tokio::test]
 #[ignore = "requires the disposable Kind cluster created by mise run kubernetes:test"]
 async fn service_account_token_authenticates_through_a_relay_cr() {
+    install_rustls_provider();
     use axum::{
         body::Body,
         http::{Request, StatusCode},
