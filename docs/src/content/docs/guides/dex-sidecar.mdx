@@ -1,0 +1,229 @@
+---
+title: "Dex with an oauthrelay sidecar"
+description: Apply upstream claim policies from Dex's Pod, using one hostname and Dex's Kubernetes service account and storage.
+sidebar:
+  order: 4
+---
+
+Applications continue to use Dex's issuer, clients and tokens. oauthrelay runs beside Dex and
+filters the upstream identity before Dex completes a sign-in:
+
+```text
+Application → Dex → oauthrelay → Google
+```
+
+This example serves Dex at `https://login.example.com` and oauthrelay below `/oauthrelay` on the
+same hostname. Both containers share Dex's Kubernetes ServiceAccount. oauthrelay reads a mounted
+configuration file and reuses Dex's `AuthCode` resource for shared replay protection; no oauthrelay
+configuration or storage CRDs are required.
+
+## Requirements
+
+- **Dex 2.46.0 or later**, using Kubernetes storage. Earlier Dex versions can redeem oauthrelay's
+  storage records through the device callback. Read the
+  [AuthCode mapping's trust and cleanup constraints](/oauthrelay/reference/transient-store/#using-dexs-authcode-resource)
+  before selecting it.
+- Dex's ServiceAccount needs `get`, `list`, `create`, `update`, and `delete` on `authcodes.dex.coreos.com`
+  in Dex's namespace. Its existing Kubernetes-storage Role normally supplies these permissions.
+  The sidecar inherits them and the Pod's service-account token; a second RoleBinding is unnecessary.
+  Both processes are one trust domain: this permission also exposes Dex's own authorization codes.
+  Ensure the service-account token is mounted in the sidecar.
+- Every replica must use the **same sealing key** and Google OAuth client credentials. Keep
+  oauthrelay's sweeper enabled and node clocks synchronized.
+
+## Upstream and admission policy
+
+Register `https://login.example.com/oauthrelay/upstream/google/callback` as an authorized redirect
+URI on the Google Web OAuth client. Gmail guests require an External OAuth audience; if the app
+is in Testing, add the guests as test users.
+
+Store this YAML stream in ConfigMap `dex-oauthrelay-config`, key `config.yaml`. Replace the client
+ID, Workspace domain and guest addresses. The client ID must also match Dex's connector below;
+the signed ID token's audience names that Google client. Place the ConfigMap, Secrets and sidecar
+Service in Dex's namespace.
+
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  oauthClient:
+    clientId: example.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: google
+spec:
+  upstreamRef:
+    name: google
+  scopes:
+    allowed: [openid, profile, email, offline_access]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    - uri: https://login.example.com/callback
+  idTokenPolicy:
+    required:
+      email_verified:
+        booleanEquals: true
+    anyOf:
+      - hd:
+          stringEquals: example.com
+      - email:
+          stringIn: [guest@gmail.com]
+```
+
+`required` must pass together with at least one `anyOf` branch: a verified Workspace user or an
+explicit Gmail guest. The matchers read Google's signed ID token, not UserInfo or claims Dex adds.
+`UpstreamClient` accepts Dex's Google client credentials, including its default HTTP Basic token
+request. Leave `refreshTokens.mode` at `passthrough`; Dex holds the upstream refresh token on the
+server side. See [admission policies](/oauthrelay/configuration/#id-token-admission-policy) for other
+matchers, including `stringLike` and array membership.
+
+## Dex connector
+
+Keep the existing Dex issuer, clients and connector ID when configuring an existing installation.
+Use Google's issuer with explicit authorization and token overrides:
+
+```yaml
+connectors:
+  - type: oidc
+    id: google
+    name: Google
+    config:
+      issuer: https://accounts.google.com
+      clientID: example.apps.googleusercontent.com
+      clientSecret: $GOOGLE_CLIENT_SECRET
+      redirectURI: https://login.example.com/callback
+      scopes: [profile, email]
+      providerDiscoveryOverrides:
+        authURL: https://login.example.com/oauthrelay/relay/google/authorize
+        tokenURL: https://login.example.com/oauthrelay/relay/google/token
+```
+
+Dex still verifies Google's issuer, audience and JWKS. Endpoint overrides also avoid making Dex's
+startup discovery depend on its own Pod's ingress being ready. Dex's callback stays `/callback`;
+Google returns to oauthrelay's upstream callback first, and oauthrelay then redirects to Dex.
+
+## Sidecar and routing
+
+Append this container to Dex's existing `spec.template.spec.containers`, retaining the Dex
+container and `serviceAccountName`. Supply `client-secret` in the existing `dex-google` Secret and
+one base64-encoded 32-byte `seal-key` in `dex-oauthrelay` (generate it with `openssl rand -base64 32`).
+The published oauthrelay image includes the Kubernetes store feature.
+
+```yaml
+- name: oauthrelay
+  image: ghcr.io/rise-deploy/oauthrelay:v0.6.1
+  ports:
+    - name: oauthrelay
+      containerPort: 8080
+  env:
+    - name: OAUTHRELAY_PUBLIC_URL
+      value: https://login.example.com/oauthrelay
+    - name: OAUTHRELAY_PROVIDER_FILE
+      value: /etc/oauthrelay/config.yaml
+    - name: GOOGLE_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef: {name: dex-google, key: client-secret}
+    - name: OAUTHRELAY_SEAL_KEY
+      valueFrom:
+        secretKeyRef: {name: dex-oauthrelay, key: seal-key}
+    - name: OAUTHRELAY_STORE
+      value: kubernetes
+    - name: OAUTHRELAY_STORE_KUBERNETES_RESOURCE
+      value: authcodes.dex.coreos.com
+    - name: OAUTHRELAY_STORE_KUBERNETES_NAMESPACE
+      valueFrom:
+        fieldRef: {fieldPath: metadata.namespace}
+    - name: OAUTHRELAY_STORE_KUBERNETES_SWEEP
+      value: 60s
+  volumeMounts:
+    - name: oauthrelay-config
+      mountPath: /etc/oauthrelay
+      readOnly: true
+  readinessProbe:
+    httpGet: {path: /readyz, port: oauthrelay}
+  livenessProbe:
+    httpGet: {path: /healthz, port: oauthrelay}
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: {drop: [ALL]}
+```
+
+Add this entry to the same Pod's `volumes`:
+
+```yaml
+- name: oauthrelay-config
+  configMap:
+    name: dex-oauthrelay-config
+```
+
+A Service exposes the sidecar's port, selecting Dex's existing Pod labels. Adjust the selector to
+match your Deployment:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex-oauthrelay
+spec:
+  selector:
+    app.kubernetes.io/name: dex
+    app.kubernetes.io/instance: dex
+  ports:
+    - name: http
+      port: 8080
+      targetPort: oauthrelay
+```
+
+On the existing TLS Ingress for `login.example.com`, route these paths to the two Services:
+
+```yaml
+paths:
+  - path: /oauthrelay
+    pathType: Prefix
+    backend:
+      service:
+        name: dex-oauthrelay
+        port: {name: http}
+  - path: /
+    pathType: Prefix
+    backend:
+      service:
+        name: dex
+        port: {number: 5556}
+```
+
+**Preserve the `/oauthrelay` prefix.** It is part of `OAUTHRELAY_PUBLIC_URL` and oauthrelay serves
+its routes there. Health probes use the sidecar's port directly, outside that prefix. Keep
+`OAUTHRELAY_PROVIDER_KUBERNETES` unset: Kubernetes is the transient store, while the File provider
+supplies configuration. Dex installs its storage CRDs; oauthrelay's startup check waits for them
+by failing and restarting until they exist.
+
+## Verification and policy scope
+
+Check Dex's `/.well-known/openid-configuration` and oauthrelay's
+`/oauthrelay/relay/google/.well-known/openid-configuration`. The first must name Dex as issuer;
+the second must retain Google as issuer and advertise authorization and token URLs below
+`/oauthrelay`. Complete a fresh sign-in through an application.
+
+A rejected policy returns `invalid_grant` to Dex without tokens; Dex shows a failed sign-in.
+Set `OAUTHRELAY_LOG=info,oauthrelay::id_token_policy=debug` to see matcher results without claim
+values or tokens. Test an allowed Workspace account, an explicit guest and an unlisted account.
+
+Admission applies only at sign-in. Refresh grants do not re-evaluate the policy; bound session
+lifetime with Dex's `expiry.refreshTokens.absoluteLifetime`. Application authorization is separate.
+
+For different application policies, use [one relay and Dex connector per policy](/oauthrelay/guides/dex-in-front/),
+bound to each application's Dex client with `allowedConnectors`. All relays can share this sidecar
+and the same Google `Upstream` and callback.

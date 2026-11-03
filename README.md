@@ -46,6 +46,7 @@ configuration; Amazon Cognito is one example.
 - [Relay trust model](https://rise-deploy.github.io/oauthrelay/relay-model/)
 - [Cognito relay to Google](https://rise-deploy.github.io/oauthrelay/guides/cognito-google-relay/)
 - [Dex in front of oauthrelay](https://rise-deploy.github.io/oauthrelay/guides/dex-in-front/)
+- [Dex with an oauthrelay sidecar](https://rise-deploy.github.io/oauthrelay/guides/dex-sidecar/)
 - [Configuration reference](https://rise-deploy.github.io/oauthrelay/configuration/)
 - [File provider](https://rise-deploy.github.io/oauthrelay/reference/file-provider/)
 - [Kubernetes provider](https://rise-deploy.github.io/oauthrelay/reference/kubernetes-provider/)

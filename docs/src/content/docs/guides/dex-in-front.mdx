@@ -17,6 +17,9 @@ Use this when different applications need different claim filters at the IdP bou
 applications cannot filter on their own, and you want a single IdP client registration for all of
 them.
 
+For a Kubernetes deployment with one hostname, see [Dex with an oauthrelay sidecar](/oauthrelay/guides/dex-sidecar/).
+It uses the File provider, Dex's ServiceAccount and `AuthCode` storage, and `/oauthrelay/*` routing.
+
 <Mermaid
   label="Two Dex clients are each bound to one Dex connector. Each connector points at its own oauthrelay relay, and both relays share one upstream IdP client."
   chart={`flowchart LR
