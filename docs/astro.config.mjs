@@ -4,6 +4,9 @@ import starlight from '@astrojs/starlight';
 export default defineConfig({
   site: 'https://rise-deploy.github.io',
   base: '/oauthrelay',
+  redirects: {
+    '/guides/dex-in-front/': '/oauthrelay/guides/dex-with-oauthrelay/',
+  },
   integrations: [
     starlight({
       title: 'oauthrelay',

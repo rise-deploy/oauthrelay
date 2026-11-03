@@ -314,7 +314,7 @@ Names are the SHA-256 of the key, and some keys are computable by whoever holds 
 token or assertion. Dex 2.46.0 ("fix(device): bind device-callback auth code to its request")
 rejects on `clientID` there too. oauthrelay cannot detect the version of the Dex that shares the
 namespace, so it logs a warning naming this minimum at startup and the requirement is yours to
-meet. The [Dex sidecar guide](/oauthrelay/guides/dex-in-front/) shows a deployment sharing Dex's
+meet. The [Dex with oauthrelay guide](/oauthrelay/guides/dex-with-oauthrelay/) shows a deployment sharing Dex's
 ServiceAccount and this store mapping.
 
 Dex installs `authcodes.dex.coreos.com` when it starts, so there is no CRD to apply; start

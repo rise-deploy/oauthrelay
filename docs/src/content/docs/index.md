@@ -21,7 +21,7 @@ Several relays can share one upstream without creating additional provider callb
 - [Relay trust model](/oauthrelay/relay-model/) explains the endpoint and token-trust boundaries.
 - [Cognito relay to Google](/oauthrelay/guides/cognito-google-relay/) applies one stable Google
   callback to any number of Cognito user pools.
-- [Dex with an oauthrelay sidecar](/oauthrelay/guides/dex-in-front/) uses one hostname, Dex's
+- [Dex with oauthrelay](/oauthrelay/guides/dex-with-oauthrelay/) uses one hostname, Dex's
   ServiceAccount, and shared replay storage to apply upstream ID-token admission policies.
 
 ## Reference
