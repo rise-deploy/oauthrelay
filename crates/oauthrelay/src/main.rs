@@ -123,6 +123,8 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow!("crds requires the oauthrelay kubernetes feature"));
     }
     init_tracing();
+    // The Kubernetes client needs a process default before any async connection setup.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let public_url = required_url("OAUTHRELAY_PUBLIC_URL")?;
     let current = seal_key("OAUTHRELAY_SEAL_KEY", true)?.expect("required key");
     let previous = seal_key("OAUTHRELAY_SEAL_KEY_PREVIOUS", false)?;
