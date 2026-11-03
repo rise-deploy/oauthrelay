@@ -1,248 +1,233 @@
 ---
-title: "Dex in front of oauthrelay: per-client claim policies"
-description: Give each Dex client its own ID-token admission policy by routing it to a dedicated oauthrelay relay over one shared IdP client.
+title: "Dex with an oauthrelay sidecar"
+description: Apply upstream claim policies from Dex's Pod, using one hostname and Dex's Kubernetes service account and storage.
 sidebar:
   order: 3
 ---
 
-import Mermaid from '../../../components/Mermaid.astro';
+Applications continue to use Dex's issuer, clients and tokens. oauthrelay runs beside Dex and
+filters the upstream identity before Dex completes a sign-in:
 
-Applications keep integrating with [Dex](https://dexidp.io/) as usual: Dex issuer, their own Dex
-client, Dex refresh tokens, Dex claim shapes. oauthrelay sits between Dex and the identity provider
-(IdP), one relay per claim policy, all relays sharing one `Upstream`. Dex binds each client to
-exactly one connector, so the policy a client gets is enforced by Dex's routing rather than by the
-application.
+```text
+Application → Dex → oauthrelay → Google
+```
 
-Use this when different applications need different claim filters at the IdP boundary, the
-applications cannot filter on their own, and you want a single IdP client registration for all of
-them.
-
-For a Kubernetes deployment with one hostname, see [Dex with an oauthrelay sidecar](/oauthrelay/guides/dex-sidecar/).
-It uses the File provider, Dex's ServiceAccount and `AuthCode` storage, and `/oauthrelay/*` routing.
-
-<Mermaid
-  label="Two Dex clients are each bound to one Dex connector. Each connector points at its own oauthrelay relay, and both relays share one upstream IdP client."
-  chart={`flowchart LR
-    A[App A<br/>Dex client app-a]
-    B[App B<br/>Dex client app-b]
-    D[Dex]
-    RA[oauthrelay relay-a<br/>policy A]
-    RB[oauthrelay relay-b<br/>policy B]
-    I[IdP<br/>one client]
-
-    A --> D
-    B --> D
-    D -->|connector relay-a| RA
-    D -->|connector relay-b| RB
-    RA --> I
-    RB --> I`}
-/>
+This example serves Dex at `https://login.example.com` and oauthrelay below `/oauthrelay` on the
+same hostname. Both containers share Dex's Kubernetes ServiceAccount. oauthrelay reads a mounted
+configuration file and reuses Dex's `AuthCode` resource for shared replay protection; no oauthrelay
+configuration or storage CRDs are required.
 
 ## Requirements
 
-- **Dex 2.46.0 or later.** The OAuth2 client option `allowedConnectors` was added in 2.46.0 and is
-  enforced on every token grant in the same release. Earlier versions let any client pass
-  `connector_id` or pick any connector, so the binding that selects the policy would be advisory
-  only.
-- oauthrelay reachable from Dex over HTTPS. Dex also needs to reach the IdP's JWKS endpoint, because
-  relay metadata keeps the IdP's `jwks_uri`.
-- One IdP OAuth client whose redirect URI is the oauthrelay callback for the shared upstream,
-  `{OAUTHRELAY_PUBLIC_URL}/upstream/{upstream-name}/callback`. Both relays use this one callback.
-  This guide uses `https://login.example.com/oidc/upstream/idp/callback`.
-- Optional: oauthrelay's [transient store in Dex's `AuthCode` objects](/oauthrelay/reference/transient-store/#using-dexs-authcode-resource) needs Dex 2.46.0 too, for a different reason.
+- **Dex 2.46.0 or later**, using Kubernetes storage. Earlier Dex versions can redeem oauthrelay's
+  storage records through the device callback. Read the
+  [AuthCode mapping's trust and cleanup constraints](/oauthrelay/reference/transient-store/#using-dexs-authcode-resource)
+  before selecting it.
+- Dex's ServiceAccount needs `get`, `list`, `create`, `update`, and `delete` on `authcodes.dex.coreos.com`
+  in Dex's namespace. Its existing Kubernetes-storage Role normally supplies these permissions.
+  The sidecar inherits them and the Pod's service-account token; a second RoleBinding is unnecessary.
+  Both processes are one trust domain: this permission also exposes Dex's own authorization codes.
+  Ensure the service-account token is mounted in the sidecar.
+- Every replica must use the **same sealing key** and Google OAuth client credentials. Keep
+  oauthrelay's sweeper enabled and node clocks synchronized.
 
-The hostnames below are used throughout: Dex at `https://dex.example.com/dex`, oauthrelay at
-`OAUTHRELAY_PUBLIC_URL=https://login.example.com/oidc`, and the IdP at `https://idp.example.com`.
+## Upstream and admission policy
 
-## Worked example
+Register `https://login.example.com/oauthrelay/upstream/google/callback` as an authorized redirect
+URI on the Google Web OAuth client. Gmail guests require an External OAuth audience; if the app
+is in Testing, add the guests as test users.
 
-App A is for engineering staff and App B for partner users. Both sign in through the same IdP.
-
-### oauthrelay resources
-
-One upstream holds the IdP client. Each relay carries one policy.
+Store this YAML stream in ConfigMap `dex-oauthrelay-config`, key `config.yaml`. Replace the client
+ID, Workspace domain and guest addresses. The client ID must also match Dex's connector below;
+the signed ID token's audience names that Google client. Place the ConfigMap, Secrets and sidecar
+Service in Dex's namespace.
 
 ```yaml oauthrelay-config
 apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
-  name: idp
+  name: google
 spec:
-  issuerUrl: https://idp.example.com
+  issuerUrl: https://accounts.google.com
   oauthClient:
-    clientId: dex-relay
+    clientId: example.apps.googleusercontent.com
     clientSecret:
       valueFrom:
         env:
-          name: IDP_CLIENT_SECRET
+          name: GOOGLE_CLIENT_SECRET
 ---
 apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
-  name: relay-a
+  name: google
 spec:
   upstreamRef:
-    name: idp
+    name: google
   scopes:
-    allowed: [openid, profile, email, groups, offline_access]
+    allowed: [openid, profile, email, offline_access]
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
-    - uri: https://dex.example.com/dex/callback
-  idTokenPolicy:
-    required:
-      groups:
-        arrayContainsAny: [engineering, platform]
----
-apiVersion: oauthrelay.dev/v1alpha1
-kind: Relay
-metadata:
-  name: relay-b
-spec:
-  upstreamRef:
-    name: idp
-  scopes:
-    allowed: [openid, profile, email, groups, offline_access]
-  clientAuthentication:
-    type: UpstreamClient
-  redirectPolicy:
-    - uri: https://dex.example.com/dex/callback
+    - uri: https://login.example.com/callback
   idTokenPolicy:
     required:
       email_verified:
         booleanEquals: true
-      email:
-        stringLike: "*@partner.example.org"
+    anyOf:
+      - hd:
+          stringEquals: example.com
+      - email:
+          stringIn: [guest@gmail.com]
 ```
 
-- `UpstreamClient` makes the relay accept the IdP client's ID and secret from Dex. This is the
-  fitting choice because Dex validates the ID token's `aud` against its connector `clientID`, and
-  the ID token the IdP issued names the IdP client. The Dex connector therefore has to be
-  configured with that same client ID. The relay token endpoint accepts the client credentials as
-  HTTP Basic (Dex's default) or in the form body.
-- The `uri` redirect entry is Dex's callback, `{Dex issuer}/callback`, matched exactly.
-- Every scope Dex requests must be in `scopes.allowed`; a scope outside it is rejected. Add
-  `offline_access` if Dex requests it from your IdP, and any extra scope you add to a connector's
-  `scopes`, such as `groups` here.
-- `idTokenPolicy` matchers read top-level claims of the IdP's ID token. `relay-a` admits users whose
-  `groups` array contains `engineering` or `platform`; `relay-b` admits verified partner email
-  addresses. The IdP has to put the claim in the ID token: the scope that requests `groups` and the
-  claim's name are IdP-specific, so check what yours emits. Providers that omit the claim for some
-  users, such as Microsoft Entra ID for users in too many groups, are denied for those users, because
-  an absent claim fails the rule (`missing_claim`).
-- `refreshTokens.mode` stays at its default, `passthrough`. The refresh tokens oauthrelay would wrap
-  are held by Dex on the server side rather than by browsers, so sealing them adds nothing.
+`required` must pass together with at least one `anyOf` branch: a verified Workspace user or an
+explicit Gmail guest. The matchers read Google's signed ID token, not UserInfo or claims Dex adds.
+`UpstreamClient` accepts Dex's Google client credentials, including its default HTTP Basic token
+request. Leave `refreshTokens.mode` at `passthrough`; Dex holds the upstream refresh token on the
+server side. See [admission policies](/oauthrelay/configuration/#id-token-admission-policy) for other
+matchers, including `stringLike` and array membership.
 
-See [ID-token admission policy](/oauthrelay/configuration/#id-token-admission-policy) for the
-operators and evaluation rules.
+## Dex connector
 
-### Dex configuration
-
-Each connector points at one relay. Dex fetches discovery from the relay, which keeps the IdP's
-issuer and JWKS and rewrites only the authorization and token endpoints. `issuerAlias` carries the
-IdP issuer that the discovery document and the ID token's `iss` contain, so Dex's issuer validation
-passes.
+Keep the existing Dex issuer, clients and connector ID when configuring an existing installation.
+Use Google's issuer with explicit authorization and token overrides:
 
 ```yaml
 connectors:
   - type: oidc
-    id: relay-a
-    name: Staff sign-in
+    id: google
+    name: Google
     config:
-      issuer: https://login.example.com/oidc/relay/relay-a
-      issuerAlias: https://idp.example.com
-      clientID: dex-relay
-      clientSecret: $IDP_CLIENT_SECRET
-      redirectURI: https://dex.example.com/dex/callback
-      scopes: [profile, email, groups]
-  - type: oidc
-    id: relay-b
-    name: Partner sign-in
-    config:
-      issuer: https://login.example.com/oidc/relay/relay-b
-      issuerAlias: https://idp.example.com
-      clientID: dex-relay
-      clientSecret: $IDP_CLIENT_SECRET
-      redirectURI: https://dex.example.com/dex/callback
-      scopes: [profile, email, groups]
-
-staticClients:
-  - id: app-a
-    name: App A
-    secret: $APP_A_CLIENT_SECRET
-    redirectURIs:
-      - https://app-a.example.com/callback
-    allowedConnectors: [relay-a]
-  - id: app-b
-    name: App B
-    secret: $APP_B_CLIENT_SECRET
-    redirectURIs:
-      - https://app-b.example.com/callback
-    allowedConnectors: [relay-b]
+      issuer: https://accounts.google.com
+      clientID: example.apps.googleusercontent.com
+      clientSecret: $GOOGLE_CLIENT_SECRET
+      redirectURI: https://login.example.com/callback
+      scopes: [profile, email]
+      providerDiscoveryOverrides:
+        authURL: https://login.example.com/oauthrelay/relay/google/authorize
+        tokenURL: https://login.example.com/oauthrelay/relay/google/token
 ```
 
-Both connectors share the IdP client ID and secret. Only `issuer` differs, and with it the relay,
-and so the policy. `insecureEnableGroups: true` on a connector is only needed if Dex itself should
-pass the IdP's groups on to the applications; the relay's group rule does not depend on it.
+Dex still verifies Google's issuer, audience and JWKS. Endpoint overrides also avoid making Dex's
+startup discovery depend on its own Pod's ingress being ready. Dex's callback stays `/callback`;
+Google returns to oauthrelay's upstream callback first, and oauthrelay then redirects to Dex.
 
-Instead of `issuerAlias`, a connector can keep the IdP as its issuer and override just the two
-endpoints. Dex then does not fetch discovery from oauthrelay:
+## Sidecar and routing
+
+Append this container to Dex's existing `spec.template.spec.containers`, retaining the Dex
+container and `serviceAccountName`. Supply `client-secret` in the existing `dex-google` Secret and
+one base64-encoded 32-byte `seal-key` in `dex-oauthrelay` (generate it with `openssl rand -base64 32`).
+The published oauthrelay image includes the Kubernetes store feature.
 
 ```yaml
-config:
-  issuer: https://idp.example.com
-  providerDiscoveryOverrides:
-    authURL: https://login.example.com/oidc/relay/relay-a/authorize
-    tokenURL: https://login.example.com/oidc/relay/relay-a/token
+- name: oauthrelay
+  image: ghcr.io/rise-deploy/oauthrelay:v0.6.1
+  ports:
+    - name: oauthrelay
+      containerPort: 8080
+  env:
+    - name: OAUTHRELAY_PUBLIC_URL
+      value: https://login.example.com/oauthrelay
+    - name: OAUTHRELAY_PROVIDER_FILE
+      value: /etc/oauthrelay/config.yaml
+    - name: GOOGLE_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef: {name: dex-google, key: client-secret}
+    - name: OAUTHRELAY_SEAL_KEY
+      valueFrom:
+        secretKeyRef: {name: dex-oauthrelay, key: seal-key}
+    - name: OAUTHRELAY_STORE
+      value: kubernetes
+    - name: OAUTHRELAY_STORE_KUBERNETES_RESOURCE
+      value: authcodes.dex.coreos.com
+    - name: OAUTHRELAY_STORE_KUBERNETES_NAMESPACE
+      valueFrom:
+        fieldRef: {fieldPath: metadata.namespace}
+    - name: OAUTHRELAY_STORE_KUBERNETES_SWEEP
+      value: 60s
+  volumeMounts:
+    - name: oauthrelay-config
+      mountPath: /etc/oauthrelay
+      readOnly: true
+  readinessProbe:
+    httpGet: {path: /readyz, port: oauthrelay}
+  livenessProbe:
+    httpGet: {path: /healthz, port: oauthrelay}
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: {drop: [ALL]}
 ```
 
-## How a login flows
+Add this entry to the same Pod's `volumes`:
 
-1. App A sends the browser to Dex with its own Dex client. `allowedConnectors` leaves `relay-a` as
-   the only connector, so Dex goes straight to it.
-2. Dex redirects to `relay-a`'s authorization endpoint with Dex's callback as `redirect_uri`.
-   oauthrelay checks the redirect and scopes against the relay and redirects to the IdP with its
-   own callback.
-3. The user authenticates at the IdP, which returns to the oauthrelay callback. oauthrelay exchanges
-   the code with the IdP and redirects to Dex's callback with a single-use relay code.
-4. Dex posts that code to `relay-a`'s token endpoint with the IdP client's credentials. oauthrelay
-   verifies the IdP's ID token and evaluates `idTokenPolicy`.
-5. On success the response is the IdP's, byte for byte. Dex validates the ID token against the IdP
-   issuer and JWKS.
-6. Dex issues its own code and tokens to App A, which validates them against the Dex issuer.
+```yaml
+- name: oauthrelay-config
+  configMap:
+    name: dex-oauthrelay-config
+```
 
-A policy rejection happens in step 4. oauthrelay answers the token request with `invalid_grant`
-and returns no tokens, so Dex cannot complete the connector login and shows an error page for the
-failed sign-in. The application only sees what Dex reports for a failed login. Enable
-`OAUTHRELAY_LOG=info,oauthrelay::id_token_policy=debug` to see which matcher failed and why.
+A Service exposes the sidecar's port, selecting Dex's existing Pod labels. Adjust the selector to
+match your Deployment:
 
-## Limitations
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex-oauthrelay
+spec:
+  selector:
+    app.kubernetes.io/name: dex
+    app.kubernetes.io/instance: dex
+  ports:
+    - name: http
+      port: 8080
+      targetPort: oauthrelay
+```
 
-- **Admission happens at sign-in only.** Refresh grants do not evaluate the policy. Dex holds the
-  IdP refresh token and uses it to refresh the user's claims, so a user who loses the
-  required claim keeps their session until Dex's refresh-token lifetime ends. Bound it with
-  `expiry.refreshTokens.absoluteLifetime` in the Dex configuration.
-- **Dex before 2.46.0 only advises.** Without `allowedConnectors` enforcement, nothing stops a
-  client from selecting another connector and its more permissive policy.
-- **Group-only filtering.** If the policy is only about groups, Dex's own connector option
-  `allowedGroups` does it without oauthrelay, together with `insecureEnableGroups` and the `groups`
-  scope. oauthrelay adds typed rules on any claim and combinations of them, per client.
-- **IdP claims only.** The policy sees the IdP's ID token, not UserInfo and not claims Dex adds or
-  maps afterwards.
+On the existing TLS Ingress for `login.example.com`, route these paths to the two Services:
 
-## Alternative: oauthrelay in front of Dex
+```yaml
+paths:
+  - path: /oauthrelay
+    pathType: Prefix
+    backend:
+      service:
+        name: dex-oauthrelay
+        port: {name: http}
+  - path: /
+    pathType: Prefix
+    backend:
+      service:
+        name: dex
+        port: {number: 5556}
+```
 
-The reverse layout is `Client → oauthrelay relay → Dex → IdP`. The relay's `Upstream` is Dex, with
-one Dex client and Dex's callback pointing at the oauthrelay upstream callback. There is no Dex
-version requirement and a single Dex client suffices. In exchange, every application is re-pointed
-at a relay and must support manual OIDC endpoint configuration: relay metadata advertises Dex's
-issuer, so `iss` and `aud` are Dex's and the Dex client's, as described in the
-[relay trust model](/oauthrelay/relay-model/). Policies can use only the claims Dex itself emits.
+**Preserve the `/oauthrelay` prefix.** It is part of `OAUTHRELAY_PUBLIC_URL` and oauthrelay serves
+its routes there. Health probes use the sidecar's port directly, outside that prefix. Keep
+`OAUTHRELAY_PROVIDER_KUBERNETES` unset: Kubernetes is the transient store, while the File provider
+supplies configuration. Dex installs its storage CRDs; oauthrelay's startup check waits for them
+by failing and restarting until they exist.
 
-Choose it when Dex cannot be upgraded, or when an application wants oauthrelay's own features
-directly: redirect policies, `PrivateKeyJwt` client authentication, or sealed and rotating refresh
-tokens. Browser clients use `Public` relays, which accept only rotating refresh tokens.
+## Verification and policy scope
 
-See [Configuration](/oauthrelay/configuration/) for the complete `Upstream` and `Relay` field
-reference, and the [Dex OIDC connector documentation](https://dexidp.io/docs/connectors/oidc/) for
-the connector options used here.
+Check Dex's `/.well-known/openid-configuration` and oauthrelay's
+`/oauthrelay/relay/google/.well-known/openid-configuration`. The first must name Dex as issuer;
+the second must retain Google as issuer and advertise authorization and token URLs below
+`/oauthrelay`. Complete a fresh sign-in through an application.
+
+A rejected policy returns `invalid_grant` to Dex without tokens; Dex shows a failed sign-in.
+Set `OAUTHRELAY_LOG=info,oauthrelay::id_token_policy=debug` to see matcher results without claim
+values or tokens. Test an allowed Workspace account, an explicit guest and an unlisted account.
+
+Admission applies only at sign-in. Refresh grants do not re-evaluate the policy; bound session
+lifetime with Dex's `expiry.refreshTokens.absoluteLifetime`. Application authorization is separate.
+
+## Per-client policies
+
+For different application policies, create one relay and Dex OIDC connector per policy. Each
+connector uses the corresponding relay's authorization and token URLs. Bind each Dex client to
+its intended connector with `allowedConnectors: [connector-id]` (Dex 2.46.0 or later); otherwise a
+client can select another connector and bypass its intended policy. All relays can share this
+sidecar and the same Google `Upstream` and callback.
