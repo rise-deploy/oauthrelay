@@ -226,8 +226,71 @@ lifetime with Dex's `expiry.refreshTokens.absoluteLifetime`. Application authori
 
 ## Per-client policies
 
-For different application policies, create one relay and Dex OIDC connector per policy. Each
-connector uses the corresponding relay's authorization and token URLs. Bind each Dex client to
-its intended connector with `allowedConnectors: [connector-id]` (Dex 2.46.0 or later); otherwise a
-client can select another connector and bypass its intended policy. All relays can share this
-sidecar and the same Google `Upstream` and callback.
+Each policy needs its own relay and Dex OIDC connector, while all relays reference the same
+Google `Upstream`. For example, keep the `google` relay above for Workspace users and the explicit
+guest, and append a second relay that admits only verified Workspace users:
+
+```yaml
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: google-workspace
+spec:
+  upstreamRef:
+    name: google
+  scopes:
+    allowed: [openid, profile, email, offline_access]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    - uri: https://login.example.com/callback
+  idTokenPolicy:
+    required:
+      email_verified:
+        booleanEquals: true
+      hd:
+        stringEquals: example.com
+```
+
+Add this connector alongside the existing `google` connector, and bind each application's Dex
+client to its intended connector:
+
+```yaml
+connectors:
+  - type: oidc
+    id: google-workspace
+    name: Google Workspace
+    config:
+      issuer: https://accounts.google.com
+      clientID: example.apps.googleusercontent.com
+      clientSecret: $GOOGLE_CLIENT_SECRET
+      redirectURI: https://login.example.com/callback
+      scopes: [profile, email]
+      providerDiscoveryOverrides:
+        authURL: https://login.example.com/oauthrelay/relay/google-workspace/authorize
+        tokenURL: https://login.example.com/oauthrelay/relay/google-workspace/token
+
+staticClients:
+  - id: workspace-app
+    name: Workspace app
+    secretEnv: WORKSPACE_APP_CLIENT_SECRET
+    redirectURIs:
+      - https://workspace.example.com/oauth2/callback
+    allowedConnectors: [google-workspace]
+  - id: shared-app
+    name: Shared app
+    secretEnv: SHARED_APP_CLIENT_SECRET
+    redirectURIs:
+      - https://shared.example.com/oauth2/callback
+    allowedConnectors: [google]
+```
+
+`workspace-app` can sign in only through the Workspace policy; `shared-app` can also admit the
+listed guest. **Set `allowedConnectors` on every client whose policy must be enforced**
+(Dex 2.46.0 or later). A client without this restriction can select another connector and bypass
+its intended policy.
+
+Both connectors use the same Google client ID and secret. The applications have their own Dex
+client IDs and secrets; these are separate from the Google OAuth client. The sidecar, ServiceAccount,
+store, and registered Google callback `/oauthrelay/upstream/google/callback` are shared. Each relay
+returns to the same Dex `/callback`.
