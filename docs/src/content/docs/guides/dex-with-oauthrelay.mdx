@@ -5,17 +5,49 @@ sidebar:
   order: 3
 ---
 
-Applications continue to use Dex's issuer, clients and tokens. oauthrelay runs beside Dex and
-filters the upstream identity before Dex completes a sign-in:
+import Mermaid from '../../../components/Mermaid.astro';
 
-```text
-Application → Dex → oauthrelay → Google
-```
+Applications continue to use Dex's issuer, clients and tokens. oauthrelay runs beside Dex and
+filters the upstream identity before Dex completes a sign-in.
 
 This example serves Dex at `https://login.example.com` and oauthrelay below `/oauthrelay` on the
 same hostname. Both containers share Dex's Kubernetes ServiceAccount. oauthrelay reads a mounted
 configuration file and reuses Dex's `AuthCode` resource for shared replay protection; no oauthrelay
 configuration or storage CRDs are required.
+
+The Workspace app admits verified `example.com` Workspace users. The shared app also admits
+`guest@gmail.com`. Both policies use one Google OAuth client. The diagram shows configuration
+references; each application uses its own Dex client credentials.
+
+<Mermaid
+  label="Two applications use separate Dex clients, each restricted to one OIDC connector. Each connector routes through a relay with its own policy. Both relays reference the same Google Upstream and Google OAuth client. Dex and oauthrelay share a Kubernetes Pod."
+  chart={`flowchart TB
+    WA["Workspace app"]
+    SA["Shared app"]
+    subgraph Pod["Kubernetes Pod"]
+      subgraph Dex["Dex container: config.yaml"]
+        WC["Dex client: workspace-app"]
+        SC["Dex client: shared-app"]
+        WCon["OIDC connector: google-workspace"]
+        GCon["OIDC connector: google"]
+      end
+      subgraph Relay["oauthrelay container: config.yaml"]
+        WR["Relay: google-workspace<br/>Verified Workspace users"]
+        GR["Relay: google<br/>Verified Workspace users or listed guest"]
+        U["Upstream: google<br/>Google client ID and secret"]
+      end
+    end
+    G["Google OAuth client<br/>One callback URI"]
+    WA --> WC
+    SA --> SC
+    WC -->|allowedConnectors| WCon
+    SC -->|allowedConnectors| GCon
+    WCon -->|endpoint overrides| WR
+    GCon -->|endpoint overrides| GR
+    WR -->|upstreamRef| U
+    GR -->|upstreamRef| U
+    U -->|OAuth client credentials| G`}
+/>
 
 ## Requirements
 
@@ -38,7 +70,7 @@ URI on the Google Web OAuth client. Gmail guests require an External OAuth audie
 is in Testing, add the guests as test users.
 
 Store this YAML stream in ConfigMap `dex-oauthrelay-config`, key `config.yaml`. Replace the client
-ID, Workspace domain and guest addresses. The client ID must also match Dex's connector below;
+ID, Workspace domain and guest addresses. The client ID must also match both Dex connectors below;
 the signed ID token's audience names that Google client. Place the ConfigMap, Secrets and sidecar
 Service in Dex's namespace.
 
@@ -78,19 +110,42 @@ spec:
           stringEquals: example.com
       - email:
           stringIn: [guest@gmail.com]
+---
+apiVersion: oauthrelay.dev/v1alpha1
+kind: Relay
+metadata:
+  name: google-workspace
+spec:
+  upstreamRef:
+    name: google
+  scopes:
+    allowed: [openid, profile, email, offline_access]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    - uri: https://login.example.com/callback
+  idTokenPolicy:
+    required:
+      email_verified:
+        booleanEquals: true
+      hd:
+        stringEquals: example.com
 ```
 
-`required` must pass together with at least one `anyOf` branch: a verified Workspace user or an
-explicit Gmail guest. The matchers read Google's signed ID token, not UserInfo or claims Dex adds.
+The `google` relay requires a verified email and at least one `anyOf` branch: a Workspace user
+or the explicit Gmail guest. The `google-workspace` relay requires both a verified email and the
+Workspace domain. Both relays reference `upstreamRef.name: google`. Matchers read Google's signed
+ID token, not UserInfo or claims Dex adds.
 `UpstreamClient` accepts Dex's Google client credentials, including its default HTTP Basic token
 request. Leave `refreshTokens.mode` at `passthrough`; Dex holds the upstream refresh token on the
 server side. See [admission policies](/oauthrelay/configuration/#id-token-admission-policy) for other
 matchers, including `stringLike` and array membership.
 
-## Dex connector
+## Dex connectors and clients
 
 Keep the existing Dex issuer, clients and connector ID when configuring an existing installation.
-Use Google's issuer with explicit authorization and token overrides:
+Use Google's issuer with explicit authorization and token overrides. Each connector points at
+one relay, and each application client is restricted to its intended connector:
 
 ```yaml
 connectors:
@@ -106,6 +161,32 @@ connectors:
       providerDiscoveryOverrides:
         authURL: https://login.example.com/oauthrelay/relay/google/authorize
         tokenURL: https://login.example.com/oauthrelay/relay/google/token
+  - type: oidc
+    id: google-workspace
+    name: Google Workspace
+    config:
+      issuer: https://accounts.google.com
+      clientID: example.apps.googleusercontent.com
+      clientSecret: $GOOGLE_CLIENT_SECRET
+      redirectURI: https://login.example.com/callback
+      scopes: [profile, email]
+      providerDiscoveryOverrides:
+        authURL: https://login.example.com/oauthrelay/relay/google-workspace/authorize
+        tokenURL: https://login.example.com/oauthrelay/relay/google-workspace/token
+
+staticClients:
+  - id: workspace-app
+    name: Workspace app
+    secretEnv: WORKSPACE_APP_CLIENT_SECRET
+    redirectURIs:
+      - https://workspace.example.com/oauth2/callback
+    allowedConnectors: [google-workspace]
+  - id: shared-app
+    name: Shared app
+    secretEnv: SHARED_APP_CLIENT_SECRET
+    redirectURIs:
+      - https://shared.example.com/oauth2/callback
+    allowedConnectors: [google]
 ```
 
 Dex still verifies Google's issuer, audience and JWKS. Endpoint overrides also avoid making Dex's
@@ -225,65 +306,6 @@ Admission applies only at sign-in. Refresh grants do not re-evaluate the policy;
 lifetime with Dex's `expiry.refreshTokens.absoluteLifetime`. Application authorization is separate.
 
 ## Per-client policies
-
-Each policy needs its own relay and Dex OIDC connector, while all relays reference the same
-Google `Upstream`. For example, keep the `google` relay above for Workspace users and the explicit
-guest, and append a second relay that admits only verified Workspace users:
-
-```yaml
-apiVersion: oauthrelay.dev/v1alpha1
-kind: Relay
-metadata:
-  name: google-workspace
-spec:
-  upstreamRef:
-    name: google
-  scopes:
-    allowed: [openid, profile, email, offline_access]
-  clientAuthentication:
-    type: UpstreamClient
-  redirectPolicy:
-    - uri: https://login.example.com/callback
-  idTokenPolicy:
-    required:
-      email_verified:
-        booleanEquals: true
-      hd:
-        stringEquals: example.com
-```
-
-Add this connector alongside the existing `google` connector, and bind each application's Dex
-client to its intended connector:
-
-```yaml
-connectors:
-  - type: oidc
-    id: google-workspace
-    name: Google Workspace
-    config:
-      issuer: https://accounts.google.com
-      clientID: example.apps.googleusercontent.com
-      clientSecret: $GOOGLE_CLIENT_SECRET
-      redirectURI: https://login.example.com/callback
-      scopes: [profile, email]
-      providerDiscoveryOverrides:
-        authURL: https://login.example.com/oauthrelay/relay/google-workspace/authorize
-        tokenURL: https://login.example.com/oauthrelay/relay/google-workspace/token
-
-staticClients:
-  - id: workspace-app
-    name: Workspace app
-    secretEnv: WORKSPACE_APP_CLIENT_SECRET
-    redirectURIs:
-      - https://workspace.example.com/oauth2/callback
-    allowedConnectors: [google-workspace]
-  - id: shared-app
-    name: Shared app
-    secretEnv: SHARED_APP_CLIENT_SECRET
-    redirectURIs:
-      - https://shared.example.com/oauth2/callback
-    allowedConnectors: [google]
-```
 
 `workspace-app` can sign in only through the Workspace policy; `shared-app` can also admit the
 listed guest. **Set `allowedConnectors` on every client whose policy must be enforced**
